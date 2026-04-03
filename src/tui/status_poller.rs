@@ -196,6 +196,14 @@ impl Default for StatusPoller {
 mod tests {
     use super::*;
 
+    fn is_due(cycle: u64, tier: u64) -> bool {
+        if tier == 1 {
+            true
+        } else {
+            cycle % tier == 0
+        }
+    }
+
     #[test]
     fn test_polling_tier_hot() {
         assert_eq!(polling_tier(Status::Running), TIER_HOT);
@@ -224,25 +232,25 @@ mod tests {
     fn test_tier_cycle_alignment() {
         // Hot sessions are polled every cycle
         for cycle in 1..=10u64 {
-            assert_eq!(cycle % TIER_HOT, 0);
+            assert!(is_due(cycle, TIER_HOT));
         }
         // Warm sessions are polled every 5 cycles
-        assert_ne!(1u64 % TIER_WARM, 0);
-        assert_ne!(2u64 % TIER_WARM, 0);
-        assert_eq!(5u64 % TIER_WARM, 0);
-        assert_eq!(10u64 % TIER_WARM, 0);
+        assert!(!is_due(1, TIER_WARM));
+        assert!(!is_due(2, TIER_WARM));
+        assert!(is_due(5, TIER_WARM));
+        assert!(is_due(10, TIER_WARM));
         // Cold sessions are polled every 60 cycles
-        assert_ne!(1u64 % TIER_COLD, 0);
-        assert_eq!(60u64 % TIER_COLD, 0);
-        assert_eq!(120u64 % TIER_COLD, 0);
+        assert!(!is_due(1, TIER_COLD));
+        assert!(is_due(60, TIER_COLD));
+        assert!(is_due(120, TIER_COLD));
     }
 
     #[test]
     fn test_first_cycle_polls_all_tiers() {
         // cycle_count starts at TIER_COLD - 1, first cycle wraps to TIER_COLD
         let first_cycle = (TIER_COLD - 1).wrapping_add(1);
-        assert_eq!(first_cycle % TIER_HOT, 0, "first cycle must poll hot");
-        assert_eq!(first_cycle % TIER_WARM, 0, "first cycle must poll warm");
-        assert_eq!(first_cycle % TIER_COLD, 0, "first cycle must poll cold");
+        assert!(is_due(first_cycle, TIER_HOT), "first cycle must poll hot");
+        assert!(is_due(first_cycle, TIER_WARM), "first cycle must poll warm");
+        assert!(is_due(first_cycle, TIER_COLD), "first cycle must poll cold");
     }
 }

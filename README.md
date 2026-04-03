@@ -17,6 +17,8 @@ A session manager for AI coding agents on Linux and macOS. Use it from the termi
 
 Run multiple AI agents in parallel across different branches of your codebase, each in its own isolated session with optional Docker sandboxing. Access your agents from your laptop, phone, or tablet.
 
+This repository tracks upstream [njbrake/agent-of-empires](https://github.com/njbrake/agent-of-empires) and keeps fork-specific behavior documented in [docs/fork-features/](docs/fork-features/index.md).
+
 ## Why AoE?
 
 Running one AI agent is easy. Running five of them across different branches, keeping track of which is stuck, which is waiting on input, and which just made a mess of your working tree, becomes a part-time job. AoE makes it a glance: one dashboard, one status column, git worktrees and Docker sandboxes set up for you, and sessions that outlive your terminal.
@@ -136,10 +138,10 @@ This is a known Claude Code issue, not an aoe problem: https://github.com/anthro
 ## Development
 
 ```bash
-cargo check          # Type-check
-cargo test           # Run tests
-cargo fmt            # Format
-cargo clippy         # Lint
+cargo check            # Type-check
+cargo test             # Run tests
+cargo fmt              # Format
+cargo clippy           # Lint
 cargo build --release  # Release build
 
 # Debug logging (writes to debug.log in app data dir)
