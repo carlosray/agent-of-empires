@@ -12,6 +12,7 @@
 //! `remote` and `worktree` were extracted from a single 1,797-line `mod.rs`;
 //! `diff`, `cleanup`, and `template` predate the split.
 
+use anyhow::{anyhow, Context};
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -36,4 +37,43 @@ pub(crate) fn open_repo_at(path: &Path) -> std::result::Result<git2::Repository,
         git2::RepositoryOpenFlags::NO_SEARCH,
         std::iter::empty::<&OsStr>(),
     )
+}
+
+pub fn resolve_display_branch(
+    path: &Path,
+    branch_command: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if !GitWorktree::is_git_repo(path) {
+        return Ok(None);
+    }
+
+    if let Some(command) = branch_command {
+        let shell = crate::session::user_shell();
+        let output = std::process::Command::new(&shell)
+            .args(["-lc", command])
+            .current_dir(path)
+            .output()
+            .with_context(|| {
+                format!("failed to run branch display command in {}", path.display())
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(anyhow!("branch display command failed: {}", detail));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(stdout
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(ToString::to_string));
+    }
+
+    Ok(Some(GitWorktree::get_current_branch(path)?))
 }

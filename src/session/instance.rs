@@ -219,6 +219,9 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idle_entered_at: Option<DateTime<Utc>>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_branch: Option<String>,
+
     // Git worktree integration
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_info: Option<WorktreeInfo>,
@@ -471,6 +474,7 @@ impl Instance {
             created_at: Utc::now(),
             last_accessed_at: None,
             idle_entered_at: None,
+            display_branch: None,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
@@ -521,6 +525,33 @@ impl Instance {
     /// when `source_profile` was never populated (e.g. legacy callers).
     pub fn effective_profile(&self) -> String {
         super::config::effective_profile(&self.source_profile)
+    }
+
+    pub fn branch_display_path(&self) -> &Path {
+        self.workspace_info
+            .as_ref()
+            .and_then(|workspace| workspace.repos.first())
+            .map(|repo| Path::new(&repo.worktree_path))
+            .unwrap_or_else(|| Path::new(&self.project_path))
+    }
+
+    pub fn resolve_display_branch(&self) -> Result<Option<String>> {
+        let branch_repo_path = self.branch_display_path();
+        let profile = self.effective_profile();
+        let branch_command =
+            match super::repo_config::resolve_config_with_repo(&profile, branch_repo_path) {
+                Ok(config) => config.worktree.branch_command,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve config for branch display in {}: {}",
+                        branch_repo_path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+
+        crate::git::resolve_display_branch(branch_repo_path, branch_command.as_deref())
     }
 
     /// Resolve the effective `environment` list for this session's profile,
@@ -932,6 +963,17 @@ impl Instance {
 
         if session.exists() {
             return Ok(());
+        }
+
+        match self.resolve_display_branch() {
+            Ok(branch) => self.display_branch = branch,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to resolve branch display for session '{}': {}",
+                    self.title,
+                    e
+                );
+            }
         }
 
         let profile = self.effective_profile();

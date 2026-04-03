@@ -705,6 +705,9 @@ pub struct WorktreeConfig {
     #[serde(default = "default_true")]
     pub show_branch_in_tui: bool,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_command: Option<String>,
+
     /// When deleting a worktree, also delete the associated git branch.
     /// Default: false (unchecked in delete dialog)
     #[serde(default)]
@@ -733,6 +736,7 @@ impl Default for WorktreeConfig {
             bare_repo_path_template: default_bare_repo_template(),
             auto_cleanup: true,
             show_branch_in_tui: true,
+            branch_command: None,
             delete_branch_on_cleanup: false,
             workspace_path_template: default_workspace_template(),
             init_submodules: true,
@@ -1247,6 +1251,7 @@ mod tests {
         assert_eq!(wt.path_template, "../{repo-name}-worktrees/{branch}");
         assert!(wt.auto_cleanup);
         assert!(wt.show_branch_in_tui);
+        assert!(wt.branch_command.is_none());
         assert!(
             wt.init_submodules,
             "init_submodules must default to true to preserve #942 behavior"
@@ -1260,6 +1265,7 @@ mod tests {
             path_template = "/custom/{branch}"
             auto_cleanup = false
             show_branch_in_tui = false
+            branch_command = "git rev-parse --abbrev-ref HEAD"
             init_submodules = false
         "#;
         let wt: WorktreeConfig = toml::from_str(toml).unwrap();
@@ -1267,6 +1273,10 @@ mod tests {
         assert_eq!(wt.path_template, "/custom/{branch}");
         assert!(!wt.auto_cleanup);
         assert!(!wt.show_branch_in_tui);
+        assert_eq!(
+            wt.branch_command.as_deref(),
+            Some("git rev-parse --abbrev-ref HEAD")
+        );
         assert!(!wt.init_submodules);
     }
 

@@ -668,6 +668,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             .iter()
             .position(|i| i.id == instance.id)
             .expect("just added instance");
+        instances[idx].source_profile = profile.to_string();
         instances[idx].start_with_size(crate::terminal::get_size())?;
         storage.save_with_groups(&instances, &group_tree)?;
 

@@ -150,6 +150,25 @@ fn test_all_worktree_config_fields_accessible() {
     let _ = config.path_template.as_str();
     let _ = config.auto_cleanup;
     let _ = config.show_branch_in_tui;
+    let _ = config.branch_command.as_deref();
+}
+
+#[test]
+#[serial]
+fn test_config_roundtrip_preserves_worktree_branch_settings() {
+    let _temp = setup_temp_home();
+
+    let mut config = Config::default();
+    config.worktree.show_branch_in_tui = false;
+    config.worktree.branch_command = Some("git branch --show-current".to_string());
+    save_config(&config).unwrap();
+
+    let loaded = Config::load().unwrap();
+    assert!(!loaded.worktree.show_branch_in_tui);
+    assert_eq!(
+        loaded.worktree.branch_command.as_deref(),
+        Some("git branch --show-current")
+    );
 }
 
 #[test]

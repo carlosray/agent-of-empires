@@ -148,6 +148,7 @@ impl Preview {
         theme: &Theme,
         idle_decay_window: Duration,
         compact: bool,
+        show_branch_in_tui: bool,
     ) {
         if compact {
             Self::render_output_cached(
@@ -164,13 +165,16 @@ impl Preview {
 
         // 3 base lines (profile+tool / path / status) + optional sandbox + optional worktree block
         let base = 3;
-        let sandbox_lines = if instance.is_sandboxed() { 1 } else { 0 };
+        let sandbox_lines = usize::from(instance.is_sandboxed());
+        let branch_lines = usize::from(show_branch_in_tui && instance.display_branch.is_some());
         let info_height = if let Some(wt) = instance.worktree_info.as_ref() {
             let base_branch_line = if wt.base_branch.is_some() { 1 } else { 0 };
-            base + sandbox_lines + 4 + base_branch_line // blank + header + branch + main (+ optional base)
+            base + sandbox_lines + 3 + branch_lines + base_branch_line // blank + header + optional branch + main (+ optional base)
+        } else if branch_lines > 0 {
+            base + sandbox_lines + 2 + branch_lines // blank + header + branch
         } else {
             base + sandbox_lines
-        };
+        } as u16;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -180,7 +184,14 @@ impl Preview {
             ])
             .split(area);
 
-        Self::render_info(frame, chunks[0], instance, theme, idle_decay_window);
+        Self::render_info(
+            frame,
+            chunks[0],
+            instance,
+            theme,
+            idle_decay_window,
+            show_branch_in_tui,
+        );
         Self::render_output_cached(
             frame,
             chunks[1],
@@ -198,6 +209,7 @@ impl Preview {
         instance: &Instance,
         theme: &Theme,
         idle_decay_window: Duration,
+        show_branch_in_tui: bool,
     ) {
         let mut info_lines = Vec::new();
 
@@ -265,10 +277,14 @@ impl Preview {
                 Span::styled(" Worktree ", Style::default().fg(theme.dimmed)),
                 Span::styled("─", Style::default().fg(theme.border)),
             ]));
-            info_lines.push(Line::from(vec![
-                Span::styled("Branch:  ", Style::default().fg(theme.dimmed)),
-                Span::styled(&wt_info.branch, Style::default().fg(theme.branch)),
-            ]));
+            if show_branch_in_tui {
+                if let Some(branch) = &instance.display_branch {
+                    info_lines.push(Line::from(vec![
+                        Span::styled("Branch:  ", Style::default().fg(theme.dimmed)),
+                        Span::styled(branch, Style::default().fg(theme.branch)),
+                    ]));
+                }
+            }
             info_lines.push(Line::from(vec![
                 Span::styled("Main:    ", Style::default().fg(theme.dimmed)),
                 Span::styled(
@@ -280,6 +296,19 @@ impl Preview {
                 info_lines.push(Line::from(vec![
                     Span::styled("Base:    ", Style::default().fg(theme.dimmed)),
                     Span::styled(base, Style::default().fg(theme.branch)),
+                ]));
+            }
+        } else if show_branch_in_tui {
+            if let Some(branch) = &instance.display_branch {
+                info_lines.push(Line::from(""));
+                info_lines.push(Line::from(vec![
+                    Span::styled("─", Style::default().fg(theme.border)),
+                    Span::styled(" Git ", Style::default().fg(theme.dimmed)),
+                    Span::styled("─", Style::default().fg(theme.border)),
+                ]));
+                info_lines.push(Line::from(vec![
+                    Span::styled("Branch:  ", Style::default().fg(theme.dimmed)),
+                    Span::styled(branch, Style::default().fg(theme.branch)),
                 ]));
             }
         }

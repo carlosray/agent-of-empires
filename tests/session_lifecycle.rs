@@ -155,6 +155,26 @@ fn test_source_profile_not_serialized() {
 
 #[test]
 #[serial]
+fn test_display_branch_persists_across_save_load() -> Result<()> {
+    let _temp = setup_temp_home();
+
+    let storage = Storage::new("default")?;
+    let mut instance = Instance::new("Git Session", "/path/repo");
+    instance.display_branch = Some("feature/persisted".to_string());
+
+    storage.save(std::slice::from_ref(&instance))?;
+
+    let loaded = storage.load()?;
+    assert_eq!(
+        loaded[0].display_branch.as_deref(),
+        Some("feature/persisted")
+    );
+
+    Ok(())
+}
+
+#[test]
+#[serial]
 fn test_storage_defaults_to_default_profile() -> Result<()> {
     let _temp = setup_temp_home();
 

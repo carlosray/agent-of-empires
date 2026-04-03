@@ -130,6 +130,7 @@ path_template = "../{repo-name}-worktrees/{branch}"
 bare_repo_path_template = "./{branch}"
 auto_cleanup = true
 show_branch_in_tui = true
+branch_command = "git rev-parse --abbrev-ref HEAD"
 delete_branch_on_cleanup = false
 init_submodules = true
 ```
@@ -140,7 +141,8 @@ init_submodules = true
 | `path_template` | `../{repo-name}-worktrees/{branch}` | Path template for worktrees in regular repos |
 | `bare_repo_path_template` | `./{branch}` | Path template for worktrees in bare repos |
 | `auto_cleanup` | `true` | Prompt to remove worktree when deleting a session |
-| `show_branch_in_tui` | `true` | Display branch name in the TUI session list |
+| `show_branch_in_tui` | `true` | Display each session's persisted git branch in the TUI list and preview |
+| `branch_command` | unset | Optional command used to resolve the branch label shown in the TUI. Runs in the session repo and should print the desired branch name on stdout. |
 | `delete_branch_on_cleanup` | `false` | Also delete the git branch when removing a worktree |
 | `init_submodules` | `true` | Run `git submodule update --init --recursive` after creating a worktree; set to `false` (or pass `--no-submodules` to `aoe add`) to skip submodule init for repos with large or deeply-nested submodule trees |
 

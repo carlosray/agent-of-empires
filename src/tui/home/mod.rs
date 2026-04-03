@@ -62,6 +62,11 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+pub(super) struct BranchRefreshContext {
+    pub(super) session_id: String,
+    pub(super) new_branch: String,
+}
+
 /// View mode for the home screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -192,6 +197,8 @@ pub struct HomeView {
     pub(super) pending_stop_session: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
+    /// Branch refresh to apply after the confirmation dialog is accepted
+    pub(super) pending_branch_refresh: Option<BranchRefreshContext>,
     // Search
     pub(super) search_active: bool,
     pub(super) search_query: Input,
@@ -244,6 +251,7 @@ pub struct HomeView {
     /// drive the breathe rattle and fresh-idle color, and by the `w`
     /// keybind to gate which Idle sessions are still "actionable".
     pub(super) idle_decay_window: std::time::Duration,
+    pub(super) show_branch_in_tui: bool,
 
     // When true, letter-based action hotkeys require SHIFT (guard against
     // dictation / stray keystrokes triggering destructive actions).
@@ -305,6 +313,7 @@ impl HomeView {
         let strict_hotkeys = resolved.session.strict_hotkeys;
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
+        let show_branch_in_tui = resolved.worktree.show_branch_in_tui;
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -369,6 +378,7 @@ impl HomeView {
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_force_remove_session: None,
+            pending_branch_refresh: None,
             search_active: false,
             search_query: Input::default(),
             search_matches: Vec::new(),
@@ -393,6 +403,7 @@ impl HomeView {
             sound_config,
             strict_hotkeys,
             idle_decay_window,
+            show_branch_in_tui,
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
@@ -1594,6 +1605,7 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
+        self.show_branch_in_tui = config.worktree.show_branch_in_tui;
     }
 
     /// Toggle terminal mode between Container and Host for a session

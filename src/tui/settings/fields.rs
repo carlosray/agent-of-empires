@@ -62,6 +62,8 @@ pub enum FieldKey {
     PathTemplate,
     BareRepoPathTemplate,
     WorktreeAutoCleanup,
+    ShowBranchInTui,
+    BranchCommand,
     DeleteBranchOnCleanup,
     WorkspacePathTemplate,
     InitSubmodules,
@@ -849,17 +851,28 @@ fn build_worktree_fields(
         global.worktree.auto_cleanup,
         wt.and_then(|w| w.auto_cleanup),
     );
-    let (delete_branch_on_cleanup, o4) = resolve_value(
+    let (show_branch_in_tui, o4) = resolve_value(
+        scope,
+        global.worktree.show_branch_in_tui,
+        wt.and_then(|w| w.show_branch_in_tui),
+    );
+    let (branch_command, o5) = resolve_optional(
+        scope,
+        global.worktree.branch_command.clone(),
+        wt.and_then(|w| w.branch_command.clone()),
+        wt.map(|w| w.branch_command.is_some()).unwrap_or(false),
+    );
+    let (delete_branch_on_cleanup, o6) = resolve_value(
         scope,
         global.worktree.delete_branch_on_cleanup,
         wt.and_then(|w| w.delete_branch_on_cleanup),
     );
-    let (workspace_path_template, o5) = resolve_value(
+    let (workspace_path_template, o7) = resolve_value(
         scope,
         global.worktree.workspace_path_template.clone(),
         wt.and_then(|w| w.workspace_path_template.clone()),
     );
-    let (init_submodules, o6) = resolve_value(
+    let (init_submodules, o8) = resolve_value(
         scope,
         global.worktree.init_submodules,
         wt.and_then(|w| w.init_submodules),
@@ -909,14 +922,38 @@ fn build_worktree_fields(
             inherited_display: inherited_if(o3, FieldValue::Bool(global.worktree.auto_cleanup)),
         },
         SettingField {
+            key: FieldKey::ShowBranchInTui,
+            label: "Show Branch in TUI",
+            description: "Display each session's persisted git branch in the session list and preview",
+            value: FieldValue::Bool(show_branch_in_tui),
+            category: SettingsCategory::Worktree,
+            has_override: o4,
+            inherited_display: inherited_if(
+                o4,
+                FieldValue::Bool(global.worktree.show_branch_in_tui),
+            ),
+        },
+        SettingField {
+            key: FieldKey::BranchCommand,
+            label: "Branch Command",
+            description: "Optional command for resolving the branch label shown in the TUI",
+            value: FieldValue::OptionalText(branch_command),
+            category: SettingsCategory::Worktree,
+            has_override: o5,
+            inherited_display: inherited_if(
+                o5,
+                FieldValue::OptionalText(global.worktree.branch_command.clone()),
+            ),
+        },
+        SettingField {
             key: FieldKey::DeleteBranchOnCleanup,
             label: "Delete Branch on Cleanup",
             description: "Also delete the git branch when deleting a worktree",
             value: FieldValue::Bool(delete_branch_on_cleanup),
             category: SettingsCategory::Worktree,
-            has_override: o4,
+            has_override: o6,
             inherited_display: inherited_if(
-                o4,
+                o6,
                 FieldValue::Bool(global.worktree.delete_branch_on_cleanup),
             ),
         },
@@ -926,9 +963,9 @@ fn build_worktree_fields(
             description: "Template for multi-repo workspace directories ({branch}, {session-id})",
             value: FieldValue::Text(workspace_path_template),
             category: SettingsCategory::Worktree,
-            has_override: o5,
+            has_override: o7,
             inherited_display: inherited_if(
-                o5,
+                o7,
                 FieldValue::Text(global.worktree.workspace_path_template.clone()),
             ),
         },
@@ -938,8 +975,8 @@ fn build_worktree_fields(
             description: "Run `git submodule update --init --recursive` after creating a worktree",
             value: FieldValue::Bool(init_submodules),
             category: SettingsCategory::Worktree,
-            has_override: o6,
-            inherited_display: inherited_if(o6, FieldValue::Bool(global.worktree.init_submodules)),
+            has_override: o8,
+            inherited_display: inherited_if(o8, FieldValue::Bool(global.worktree.init_submodules)),
         },
     ]
 }
@@ -1871,6 +1908,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.worktree.bare_repo_path_template = v.clone()
         }
         (FieldKey::WorktreeAutoCleanup, FieldValue::Bool(v)) => config.worktree.auto_cleanup = *v,
+        (FieldKey::ShowBranchInTui, FieldValue::Bool(v)) => {
+            config.worktree.show_branch_in_tui = *v
+        }
+        (FieldKey::BranchCommand, FieldValue::OptionalText(v)) => {
+            config.worktree.branch_command = v.clone()
+        }
         (FieldKey::DeleteBranchOnCleanup, FieldValue::Bool(v)) => {
             config.worktree.delete_branch_on_cleanup = *v
         }
@@ -2153,6 +2196,18 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::WorktreeAutoCleanup, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.worktree, |s, val| s.auto_cleanup = val);
+        }
+        (FieldKey::ShowBranchInTui, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.worktree, |s, val| {
+                s.show_branch_in_tui = val
+            });
+        }
+        (FieldKey::BranchCommand, FieldValue::OptionalText(v)) => {
+            use crate::session::WorktreeConfigOverride;
+            let s = config
+                .worktree
+                .get_or_insert_with(WorktreeConfigOverride::default);
+            s.branch_command = v.clone();
         }
         (FieldKey::DeleteBranchOnCleanup, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.worktree, |s, val| {
