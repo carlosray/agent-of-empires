@@ -89,6 +89,9 @@ pub struct WorktreeConfigOverride {
     pub show_branch_in_tui: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_command: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_branch_on_cleanup: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,6 +319,9 @@ pub fn apply_worktree_overrides(
     }
     if let Some(show_branch_in_tui) = source.show_branch_in_tui {
         target.show_branch_in_tui = show_branch_in_tui;
+    }
+    if let Some(ref branch_command) = source.branch_command {
+        target.branch_command = Some(branch_command.clone());
     }
     if let Some(delete_branch_on_cleanup) = source.delete_branch_on_cleanup {
         target.delete_branch_on_cleanup = delete_branch_on_cleanup;

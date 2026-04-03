@@ -153,6 +153,25 @@ fn test_all_worktree_config_fields_accessible() {
     let _ = config.path_template.as_str();
     let _ = config.auto_cleanup;
     let _ = config.show_branch_in_tui;
+    let _ = config.branch_command.as_deref();
+}
+
+#[test]
+#[serial]
+fn test_config_roundtrip_preserves_worktree_branch_settings() {
+    let _temp = setup_temp_home();
+
+    let mut config = Config::default();
+    config.worktree.show_branch_in_tui = false;
+    config.worktree.branch_command = Some("git branch --show-current".to_string());
+    save_config(&config).unwrap();
+
+    let loaded = Config::load().unwrap();
+    assert!(!loaded.worktree.show_branch_in_tui);
+    assert_eq!(
+        loaded.worktree.branch_command.as_deref(),
+        Some("git branch --show-current")
+    );
 }
 
 #[test]
@@ -202,7 +221,7 @@ fn test_parse_key_value_list_via_field_apply() {
     let mut config = Config::default();
 
     // Simulate what apply_field_to_global does for AgentCommandOverride
-    let list_items = vec!["claude=my-wrapper".to_string()];
+    let list_items = ["claude=my-wrapper".to_string()];
     let map: HashMap<String, String> = list_items
         .iter()
         .filter_map(|item| {
@@ -218,7 +237,7 @@ fn test_parse_key_value_list_via_field_apply() {
     );
 
     // Verify entries WITHOUT '=' are silently dropped (the root cause of the bug)
-    let bad_items = vec!["just-a-command".to_string()];
+    let bad_items = ["just-a-command".to_string()];
     let bad_map: HashMap<String, String> = bad_items
         .iter()
         .filter_map(|item| {
