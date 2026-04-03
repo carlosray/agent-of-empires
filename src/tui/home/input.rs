@@ -272,6 +272,7 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
+                    self.pending_branch_refresh = None;
                 }
                 DialogResult::Submit(_) => {
                     let action = dialog.action().to_string();
@@ -283,6 +284,25 @@ impl HomeView {
                     } else if action == "stop_session" {
                         if let Some(session_id) = self.pending_stop_session.take() {
                             return Some(Action::StopSession(session_id));
+                        }
+                    } else if action == "refresh_branch" {
+                        if let Some(refresh) = self.pending_branch_refresh.take() {
+                            self.mutate_instance(&refresh.session_id, |inst| {
+                                inst.display_branch = Some(refresh.new_branch.clone());
+                            });
+                            if let Err(e) = self.save() {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Branch Refresh",
+                                    &format!("Failed to save refreshed branch: {}", e),
+                                ));
+                            } else if let Err(e) = self.reload() {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Branch Refresh",
+                                    &format!("Failed to reload refreshed branch: {}", e),
+                                ));
+                            } else {
+                                self.select_session_by_id(&refresh.session_id);
+                            }
                         }
                     }
                 }
@@ -688,6 +708,9 @@ impl HomeView {
                     }
                 }
             }
+            KeyCode::Char('B') => {
+                self.refresh_selected_branch();
+            }
             KeyCode::Char('d') => {
                 // Deletion only allowed in Agent View
                 if self.view_mode == ViewMode::Terminal {
@@ -902,6 +925,73 @@ impl HomeView {
         }
 
         None
+    }
+
+    fn refresh_selected_branch(&mut self) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+
+        let Some(inst) = self.get_instance(&session_id).cloned() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Branch Refresh",
+                "Could not find session data.",
+            ));
+            return;
+        };
+
+        if inst.status == Status::Deleting {
+            return;
+        }
+
+        let branch_path = inst.branch_display_path().to_path_buf();
+        let current_branch = inst.display_branch.clone();
+        let is_git_repo = crate::git::GitWorktree::is_git_repo(&branch_path);
+
+        match inst.resolve_display_branch() {
+            Ok(Some(new_branch)) => {
+                if current_branch.as_deref() == Some(new_branch.as_str()) {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Branch Refresh",
+                        "Branch is already up to date.",
+                    ));
+                    return;
+                }
+
+                let old_label = current_branch.as_deref().unwrap_or("(not set)");
+                let message = format!(
+                    "Replace the stored branch name for '{}'?\n\nOld: {}\nNew: {}",
+                    inst.title, old_label, new_branch
+                );
+                self.pending_branch_refresh = Some(super::BranchRefreshContext {
+                    session_id,
+                    new_branch,
+                });
+                self.confirm_dialog = Some(ConfirmDialog::new(
+                    "Refresh Branch",
+                    &message,
+                    "refresh_branch",
+                ));
+            }
+            Ok(None) if !is_git_repo => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Branch Refresh",
+                    "This session does not point at a git repository.",
+                ));
+            }
+            Ok(None) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Branch Refresh",
+                    "Could not determine a branch name for this session.",
+                ));
+            }
+            Err(e) => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Branch Refresh",
+                    &format!("Failed to refresh branch: {}", e),
+                ));
+            }
+        }
     }
 
     pub(super) fn move_cursor(&mut self, delta: i32) {

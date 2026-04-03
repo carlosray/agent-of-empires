@@ -108,7 +108,10 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_accessed_at: Option<DateTime<Utc>>,
 
-    // Git worktree integration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_branch: Option<String>,
+
+    // Worktree/workspace metadata
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_info: Option<WorktreeInfo>,
 
@@ -152,6 +155,7 @@ impl Instance {
             status: Status::Idle,
             created_at: Utc::now(),
             last_accessed_at: None,
+            display_branch: None,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
@@ -225,6 +229,41 @@ impl Instance {
             .as_ref()
             .map(|t| t.created)
             .unwrap_or(false)
+    }
+
+    pub fn branch_display_path(&self) -> &Path {
+        self.workspace_info
+            .as_ref()
+            .and_then(|workspace| workspace.repos.first())
+            .map(|repo| Path::new(&repo.worktree_path))
+            .unwrap_or_else(|| Path::new(&self.project_path))
+    }
+
+    fn branch_display_profile(&self) -> String {
+        if self.source_profile.is_empty() {
+            super::config::resolve_default_profile()
+        } else {
+            self.source_profile.clone()
+        }
+    }
+
+    pub fn resolve_display_branch(&self) -> Result<Option<String>> {
+        let branch_repo_path = self.branch_display_path();
+        let profile = self.branch_display_profile();
+        let branch_command =
+            match super::repo_config::resolve_config_with_repo(&profile, branch_repo_path) {
+                Ok(config) => config.worktree.branch_command,
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve config for branch display in {}: {}",
+                        branch_repo_path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+
+        crate::git::resolve_display_branch(branch_repo_path, branch_command.as_deref())
     }
 
     pub fn start_terminal(&mut self) -> Result<()> {
@@ -363,6 +402,17 @@ impl Instance {
 
         if session.exists() {
             return Ok(());
+        }
+
+        match self.resolve_display_branch() {
+            Ok(branch) => self.display_branch = branch,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to resolve branch display for session '{}': {}",
+                    self.title,
+                    e
+                );
+            }
         }
 
         // Resolve on_launch hooks from the full config chain (global > profile > repo).
@@ -1033,6 +1083,7 @@ mod tests {
         inst.tool = "claude".to_string();
         inst.group_path = "work/clients".to_string();
         inst.command = "claude --resume xyz".to_string();
+        inst.display_branch = Some("feature/ui".to_string());
 
         let json = serde_json::to_string(&inst).unwrap();
         let deserialized: Instance = serde_json::from_str(&json).unwrap();
@@ -1043,6 +1094,7 @@ mod tests {
         assert_eq!(inst.group_path, deserialized.group_path);
         assert_eq!(inst.tool, deserialized.tool);
         assert_eq!(inst.command, deserialized.command);
+        assert_eq!(inst.display_branch, deserialized.display_branch);
     }
 
     #[test]
