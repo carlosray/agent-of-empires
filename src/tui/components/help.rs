@@ -35,6 +35,7 @@ fn shortcuts() -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
                 ("T", "Attach to terminal"),
                 ("n", "New session"),
                 ("N", "New from selection"),
+                ("B", "Refresh branch"),
                 ("x", "Stop session"),
                 ("d", "Delete session/group"),
                 ("r", "Rename session/group"),

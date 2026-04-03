@@ -570,6 +570,16 @@ impl SettingsView {
                     w.auto_cleanup = None;
                 }
             }
+            FieldKey::ShowBranchInTui => {
+                if let Some(ref mut w) = config.worktree {
+                    w.show_branch_in_tui = None;
+                }
+            }
+            FieldKey::BranchCommand => {
+                if let Some(ref mut w) = config.worktree {
+                    w.branch_command = None;
+                }
+            }
             FieldKey::DeleteBranchOnCleanup => {
                 if let Some(ref mut w) = config.worktree {
                     w.delete_branch_on_cleanup = None;

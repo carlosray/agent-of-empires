@@ -116,15 +116,19 @@ impl Preview {
         instance: &Instance,
         cached_output: &str,
         theme: &Theme,
+        show_branch_in_tui: bool,
     ) {
-        // 3 base lines (profile+tool / path / status) + optional sandbox + optional worktree block
         let base = 3;
-        let sandbox_lines = if instance.is_sandboxed() { 1 } else { 0 };
-        let info_height = if instance.worktree_info.is_some() {
-            base + sandbox_lines + 4 // blank + header + branch + main
+        let sandbox_lines = usize::from(instance.is_sandboxed());
+        let branch_lines = usize::from(show_branch_in_tui && instance.display_branch.is_some());
+        let section_lines = if instance.worktree_info.is_some() {
+            2 + branch_lines + 1 // blank + header + optional branch + main
+        } else if branch_lines > 0 {
+            2 + branch_lines // blank + header + branch
         } else {
-            base + sandbox_lines
+            0
         };
+        let info_height = base + sandbox_lines as u16 + section_lines as u16;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -134,11 +138,17 @@ impl Preview {
             ])
             .split(area);
 
-        Self::render_info(frame, chunks[0], instance, theme);
+        Self::render_info(frame, chunks[0], instance, theme, show_branch_in_tui);
         Self::render_output_cached(frame, chunks[1], instance, cached_output, theme);
     }
 
-    fn render_info(frame: &mut Frame, area: Rect, instance: &Instance, theme: &Theme) {
+    fn render_info(
+        frame: &mut Frame,
+        area: Rect,
+        instance: &Instance,
+        theme: &Theme,
+        show_branch_in_tui: bool,
+    ) {
         let mut info_lines = Vec::new();
 
         // Profile and Tool on the same row to save vertical space
@@ -185,7 +195,6 @@ impl Preview {
             ]),
         ]);
 
-        // Add sandbox information if present
         if let Some(sandbox) = &instance.sandbox_info {
             if sandbox.enabled {
                 info_lines.push(Line::from(vec![
@@ -194,8 +203,6 @@ impl Preview {
                 ]));
             }
         }
-
-        // Add worktree information if present
         if let Some(wt_info) = &instance.worktree_info {
             info_lines.push(Line::from(""));
             info_lines.push(Line::from(vec![
@@ -203,10 +210,14 @@ impl Preview {
                 Span::styled(" Worktree ", Style::default().fg(theme.dimmed)),
                 Span::styled("─", Style::default().fg(theme.border)),
             ]));
-            info_lines.push(Line::from(vec![
-                Span::styled("Branch:  ", Style::default().fg(theme.dimmed)),
-                Span::styled(&wt_info.branch, Style::default().fg(theme.branch)),
-            ]));
+            if show_branch_in_tui {
+                if let Some(branch) = &instance.display_branch {
+                    info_lines.push(Line::from(vec![
+                        Span::styled("Branch:  ", Style::default().fg(theme.dimmed)),
+                        Span::styled(branch, Style::default().fg(theme.branch)),
+                    ]));
+                }
+            }
             info_lines.push(Line::from(vec![
                 Span::styled("Main:    ", Style::default().fg(theme.dimmed)),
                 Span::styled(
@@ -214,6 +225,19 @@ impl Preview {
                     Style::default().fg(theme.text),
                 ),
             ]));
+        } else if show_branch_in_tui {
+            if let Some(branch) = &instance.display_branch {
+                info_lines.push(Line::from(""));
+                info_lines.push(Line::from(vec![
+                    Span::styled("─", Style::default().fg(theme.border)),
+                    Span::styled(" Git ", Style::default().fg(theme.dimmed)),
+                    Span::styled("─", Style::default().fg(theme.border)),
+                ]));
+                info_lines.push(Line::from(vec![
+                    Span::styled("Branch:  ", Style::default().fg(theme.dimmed)),
+                    Span::styled(branch, Style::default().fg(theme.branch)),
+                ]));
+            }
         }
 
         let paragraph = Paragraph::new(info_lines);

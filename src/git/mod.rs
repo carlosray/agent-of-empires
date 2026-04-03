@@ -1,5 +1,6 @@
 // Git worktree operations module
 
+use anyhow::{anyhow, Context};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -408,6 +409,47 @@ impl GitWorktree {
     }
 }
 
+pub fn resolve_display_branch(
+    path: &Path,
+    branch_command: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if !GitWorktree::is_git_repo(path) {
+        return Ok(None);
+    }
+
+    if let Some(command) = branch_command {
+        let shell = crate::session::user_shell();
+        let output = std::process::Command::new(&shell)
+            .args(["-lc", command])
+            .current_dir(path)
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to execute branch command in git repo at {}",
+                    path.display()
+                )
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                format!("exit status {}", output.status)
+            } else {
+                stderr
+            };
+            return Err(anyhow!("Branch command failed: {}", detail));
+        }
+
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .map(|line| line.to_string()));
+    }
+
+    Ok(Some(GitWorktree::get_current_branch(path)?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -441,6 +483,47 @@ mod tests {
     fn test_is_git_repo_returns_false_for_non_git_directory() {
         let dir = TempDir::new().unwrap();
         assert!(!GitWorktree::is_git_repo(dir.path()));
+    }
+
+    #[test]
+    fn test_resolve_display_branch_returns_current_branch_for_git_repo() {
+        let (_dir, repo) = setup_test_repo();
+        let repo_path = repo.path().parent().unwrap();
+
+        let head = repo.head().unwrap();
+        let commit = head.peel_to_commit().unwrap();
+        repo.branch("feature/display", &commit, false).unwrap();
+        repo.set_head("refs/heads/feature/display").unwrap();
+
+        let branch = resolve_display_branch(repo_path, None).unwrap();
+        assert_eq!(branch.as_deref(), Some("feature/display"));
+    }
+
+    #[test]
+    fn test_resolve_display_branch_returns_none_for_non_git_directory() {
+        let dir = TempDir::new().unwrap();
+        let branch = resolve_display_branch(dir.path(), None).unwrap();
+        assert_eq!(branch, None);
+    }
+
+    #[test]
+    fn test_resolve_display_branch_uses_custom_command_and_trims_output() {
+        let (_dir, repo) = setup_test_repo();
+        let repo_path = repo.path().parent().unwrap();
+
+        let branch =
+            resolve_display_branch(repo_path, Some("printf '\\n trimmed-branch \\nignored\\n'"))
+                .unwrap();
+        assert_eq!(branch.as_deref(), Some("trimmed-branch"));
+    }
+
+    #[test]
+    fn test_resolve_display_branch_custom_command_failure_returns_error() {
+        let (_dir, repo) = setup_test_repo();
+        let repo_path = repo.path().parent().unwrap();
+
+        let result = resolve_display_branch(repo_path, Some("exit 1"));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -859,6 +942,15 @@ mod tests {
         let result = git_wt.delete_branch("nonexistent");
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_display_branch_returns_none_on_empty_custom_output() {
+        let (_dir, repo) = setup_test_repo();
+        let repo_path = repo.path().parent().unwrap();
+
+        let branch = resolve_display_branch(repo_path, Some("printf '\\n\\n'")).unwrap();
+        assert!(branch.is_none());
     }
 
     #[test]

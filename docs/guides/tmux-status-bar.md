@@ -119,7 +119,7 @@ The tmux user options are set when the session starts. If you rename a session i
 
 ### Branch not showing
 
-Branch is only displayed for worktree sessions (sessions created with `aoe add --worktree`). Regular sessions don't have a fixed branch.
+The tmux status bar only shows branches for worktree or workspace sessions. The TUI session list and preview can show a persisted branch label for any git-backed session when `worktree.show_branch_in_tui = true`, but tmux status bar data still comes from worktree/workspace metadata captured at session start.
 
 ### Container not showing
 

@@ -60,6 +60,11 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+pub(super) struct BranchRefreshContext {
+    pub(super) session_id: String,
+    pub(super) new_branch: String,
+}
+
 /// View mode for the home screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -175,6 +180,8 @@ pub struct HomeView {
     pub(super) pending_stop_session: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
+    /// Session branch change pending user confirmation
+    pub(super) pending_branch_refresh: Option<BranchRefreshContext>,
     // Search
     pub(super) search_active: bool,
     pub(super) search_query: Input,
@@ -212,6 +219,8 @@ pub struct HomeView {
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
     // Default terminal mode from config
     pub(super) default_terminal_mode: TerminalMode,
+    // Whether to show persisted git branches in the TUI list and preview
+    pub(super) show_branch_in_tui: bool,
 
     // Sound config for state transition sounds
     pub(super) sound_config: crate::sound::SoundConfig,
@@ -275,6 +284,10 @@ impl HomeView {
             .as_ref()
             .map(|config| config.sound.clone())
             .unwrap_or_default();
+        let show_branch_in_tui = resolved
+            .as_ref()
+            .map(|config| config.worktree.show_branch_in_tui)
+            .unwrap_or(true);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -334,6 +347,7 @@ impl HomeView {
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_force_remove_session: None,
+            pending_branch_refresh: None,
             search_active: false,
             search_query: Input::default(),
             search_matches: Vec::new(),
@@ -352,6 +366,7 @@ impl HomeView {
             container_terminal_preview_cache: PreviewCache::default(),
             terminal_modes: HashMap::new(),
             default_terminal_mode,
+            show_branch_in_tui,
             sound_config,
             settings_view: None,
             settings_close_confirm: false,
@@ -1236,6 +1251,8 @@ impl HomeView {
                 DefaultTerminalMode::Host => TerminalMode::Host,
                 DefaultTerminalMode::Container => TerminalMode::Container,
             };
+
+            self.show_branch_in_tui = config.worktree.show_branch_in_tui;
 
             // Refresh sound config
             self.sound_config = config.sound.clone();

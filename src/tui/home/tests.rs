@@ -6,7 +6,7 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{HomeView, ViewMode};
-use crate::session::{Instance, Item, Storage};
+use crate::session::{save_config, Config, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
 use crate::tui::dialogs::{InfoDialog, NewSessionDialog};
@@ -87,6 +87,20 @@ fn create_test_env_with_groups() -> TestEnv {
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv { _temp: temp, view }
+}
+
+fn init_git_repo(path: &std::path::Path) {
+    let repo = git2::Repository::init(path).unwrap();
+    let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+    let tree_id = {
+        let mut index = repo.index().unwrap();
+        std::fs::write(path.join("README.md"), "hello\n").unwrap();
+        index.add_path(std::path::Path::new("README.md")).unwrap();
+        index.write_tree().unwrap()
+    };
+    let tree = repo.find_tree(tree_id).unwrap();
+    repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+        .unwrap();
 }
 
 fn create_test_env_with_mixed_sessions() -> TestEnv {
@@ -898,6 +912,50 @@ fn test_d_shows_info_dialog_in_terminal_view() {
 
 #[test]
 #[serial]
+fn test_uppercase_b_on_non_git_session_shows_info_dialog() {
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+
+    assert!(view.info_dialog.is_none());
+    view.handle_key(key(KeyCode::Char('B')));
+    assert!(view.info_dialog.is_some());
+    assert!(view.confirm_dialog.is_none());
+}
+
+#[test]
+#[serial]
+fn test_uppercase_b_on_changed_branch_opens_confirm_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    init_git_repo(&repo_path);
+
+    let mut config = Config::default();
+    config.worktree.branch_command = Some("printf 'feature/new\\n'".to_string());
+    save_config(&config).unwrap();
+
+    let storage = Storage::new("test").unwrap();
+    let mut instance = Instance::new("repo", repo_path.to_str().unwrap());
+    instance.display_branch = Some("feature/old".to_string());
+    storage.save(std::slice::from_ref(&instance)).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    view.update_selected();
+
+    view.handle_key(key(KeyCode::Char('B')));
+
+    let dialog = view
+        .confirm_dialog
+        .as_ref()
+        .expect("expected branch refresh confirmation dialog");
+    assert_eq!(dialog.action(), "refresh_branch");
+}
+
+#[test]
+#[serial]
 fn test_has_dialog_includes_info_dialog() {
     let env = create_test_env_empty();
     let mut view = env.view;
@@ -929,6 +987,24 @@ fn test_s_opens_settings_view() {
     assert!(env.view.settings_view.is_none());
     env.view.handle_key(key(KeyCode::Char('s')));
     assert!(env.view.settings_view.is_some());
+}
+
+#[test]
+#[serial]
+fn test_refresh_from_config_updates_show_branch_toggle() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    assert!(view.show_branch_in_tui);
+
+    let mut config = Config::default();
+    config.worktree.show_branch_in_tui = false;
+    save_config(&config).unwrap();
+
+    view.refresh_from_config();
+    assert!(!view.show_branch_in_tui);
 }
 
 // Group deletion tests

@@ -424,16 +424,45 @@ impl HomeView {
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_instance(id) {
                 if let Some(ws_info) = &inst.workspace_info {
-                    line_spans.push(Span::styled(
-                        format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
-                        Style::default().fg(theme.branch),
-                    ));
-                } else if let Some(wt_info) = &inst.worktree_info {
-                    if wt_info.branch != inst.title {
+                    let suffix = if self.show_branch_in_tui {
+                        inst.display_branch
+                            .as_ref()
+                            .map(|branch| format!("  {} [{} repos]", branch, ws_info.repos.len()))
+                            .unwrap_or_else(|| format!("  [{} repos]", ws_info.repos.len()))
+                    } else {
+                        format!("  [{} repos]", ws_info.repos.len())
+                    };
+                    let suffix_color = if self.show_branch_in_tui && inst.display_branch.is_some() {
+                        theme.branch
+                    } else {
+                        theme.dimmed
+                    };
+                    line_spans.push(Span::styled(suffix, Style::default().fg(suffix_color)));
+                } else if self.show_branch_in_tui {
+                    if let Some(branch) = &inst.display_branch {
                         line_spans.push(Span::styled(
-                            format!("  {}", wt_info.branch),
+                            format!("  {}", branch),
                             Style::default().fg(theme.branch),
                         ));
+                    }
+                }
+                if inst.is_sandboxed() {
+                    match self.view_mode {
+                        ViewMode::Agent => {
+                            line_spans.push(Span::styled(
+                                " [sandbox]",
+                                Style::default().fg(theme.sandbox),
+                            ));
+                        }
+                        ViewMode::Terminal => {
+                            let mode = self.get_terminal_mode(id);
+                            let mode_text = match mode {
+                                TerminalMode::Container => " [container]",
+                                TerminalMode::Host => " [host]",
+                            };
+                            line_spans
+                                .push(Span::styled(mode_text, Style::default().fg(theme.sandbox)));
+                        }
                     }
                 }
             }
@@ -580,6 +609,7 @@ impl HomeView {
                                 inst,
                                 &self.preview_cache.content,
                                 theme,
+                                self.show_branch_in_tui,
                             );
                         }
                     } else {

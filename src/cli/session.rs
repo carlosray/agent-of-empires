@@ -142,6 +142,7 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         })
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
 
+    instances[idx].source_profile = profile.to_string();
     instances[idx].start_with_size(crate::terminal::get_size())?;
     let title = instances[idx].title.clone();
 
@@ -202,6 +203,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         })
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
 
+    instances[idx].source_profile = profile.to_string();
     instances[idx].restart_with_size(crate::terminal::get_size())?;
     let title = instances[idx].title.clone();
 

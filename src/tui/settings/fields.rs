@@ -52,6 +52,8 @@ pub enum FieldKey {
     PathTemplate,
     BareRepoPathTemplate,
     WorktreeAutoCleanup,
+    ShowBranchInTui,
+    BranchCommand,
     DeleteBranchOnCleanup,
     WorkspacePathTemplate,
     // Sandbox
@@ -373,12 +375,23 @@ fn build_worktree_fields(
         global.worktree.auto_cleanup,
         wt.and_then(|w| w.auto_cleanup),
     );
-    let (delete_branch_on_cleanup, o4) = resolve_value(
+    let (show_branch_in_tui, o4) = resolve_value(
+        scope,
+        global.worktree.show_branch_in_tui,
+        wt.and_then(|w| w.show_branch_in_tui),
+    );
+    let (branch_command, o5) = resolve_optional(
+        scope,
+        global.worktree.branch_command.clone(),
+        wt.and_then(|w| w.branch_command.clone()),
+        wt.map(|w| w.branch_command.is_some()).unwrap_or(false),
+    );
+    let (delete_branch_on_cleanup, o6) = resolve_value(
         scope,
         global.worktree.delete_branch_on_cleanup,
         wt.and_then(|w| w.delete_branch_on_cleanup),
     );
-    let (workspace_path_template, o5) = resolve_value(
+    let (workspace_path_template, o7) = resolve_value(
         scope,
         global.worktree.workspace_path_template.clone(),
         wt.and_then(|w| w.workspace_path_template.clone()),
@@ -419,14 +432,38 @@ fn build_worktree_fields(
             inherited_display: inherited_if(o3, FieldValue::Bool(global.worktree.auto_cleanup)),
         },
         SettingField {
+            key: FieldKey::ShowBranchInTui,
+            label: "Show Branch in TUI",
+            description: "Show the stored git branch in the session list and preview",
+            value: FieldValue::Bool(show_branch_in_tui),
+            category: SettingsCategory::Worktree,
+            has_override: o4,
+            inherited_display: inherited_if(
+                o4,
+                FieldValue::Bool(global.worktree.show_branch_in_tui),
+            ),
+        },
+        SettingField {
+            key: FieldKey::BranchCommand,
+            label: "Branch Command",
+            description: "Optional command used to resolve the branch name shown in the TUI",
+            value: FieldValue::OptionalText(branch_command),
+            category: SettingsCategory::Worktree,
+            has_override: o5,
+            inherited_display: inherited_if(
+                o5,
+                FieldValue::OptionalText(global.worktree.branch_command.clone()),
+            ),
+        },
+        SettingField {
             key: FieldKey::DeleteBranchOnCleanup,
             label: "Delete Branch on Cleanup",
             description: "Also delete the git branch when deleting a worktree",
             value: FieldValue::Bool(delete_branch_on_cleanup),
             category: SettingsCategory::Worktree,
-            has_override: o4,
+            has_override: o6,
             inherited_display: inherited_if(
-                o4,
+                o6,
                 FieldValue::Bool(global.worktree.delete_branch_on_cleanup),
             ),
         },
@@ -436,9 +473,9 @@ fn build_worktree_fields(
             description: "Template for multi-repo workspace directories ({branch}, {session-id})",
             value: FieldValue::Text(workspace_path_template),
             category: SettingsCategory::Worktree,
-            has_override: o5,
+            has_override: o7,
             inherited_display: inherited_if(
-                o5,
+                o7,
                 FieldValue::Text(global.worktree.workspace_path_template.clone()),
             ),
         },
@@ -1287,6 +1324,10 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.worktree.bare_repo_path_template = v.clone()
         }
         (FieldKey::WorktreeAutoCleanup, FieldValue::Bool(v)) => config.worktree.auto_cleanup = *v,
+        (FieldKey::ShowBranchInTui, FieldValue::Bool(v)) => config.worktree.show_branch_in_tui = *v,
+        (FieldKey::BranchCommand, FieldValue::OptionalText(v)) => {
+            config.worktree.branch_command = v.clone()
+        }
         (FieldKey::DeleteBranchOnCleanup, FieldValue::Bool(v)) => {
             config.worktree.delete_branch_on_cleanup = *v
         }
@@ -1435,6 +1476,18 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::WorktreeAutoCleanup, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.worktree, |s, val| s.auto_cleanup = val);
+        }
+        (FieldKey::ShowBranchInTui, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.worktree, |s, val| {
+                s.show_branch_in_tui = val
+            });
+        }
+        (FieldKey::BranchCommand, FieldValue::OptionalText(v)) => {
+            use crate::session::WorktreeConfigOverride;
+            let s = config
+                .worktree
+                .get_or_insert_with(WorktreeConfigOverride::default);
+            s.branch_command = v.clone();
         }
         (FieldKey::DeleteBranchOnCleanup, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.worktree, |s, val| {
@@ -1854,6 +1907,53 @@ mod tests {
             profile.updates.as_ref().unwrap().check_enabled,
             Some(original),
             "Override value should match what was set"
+        );
+    }
+
+    #[test]
+    fn test_worktree_settings_include_branch_fields() {
+        let global = Config::default();
+        let profile = ProfileConfig::default();
+
+        let fields = build_fields_for_category(
+            SettingsCategory::Worktree,
+            SettingsScope::Global,
+            &global,
+            &profile,
+        );
+
+        assert!(
+            fields.iter().any(|f| f.key == FieldKey::ShowBranchInTui),
+            "Worktree settings should include the branch display toggle"
+        );
+        assert!(
+            fields.iter().any(|f| f.key == FieldKey::BranchCommand),
+            "Worktree settings should include the custom branch command"
+        );
+    }
+
+    #[test]
+    fn test_apply_worktree_branch_command_profile_override() {
+        let global = Config::default();
+        let mut profile = ProfileConfig::default();
+        let field = SettingField {
+            key: FieldKey::BranchCommand,
+            label: "Branch Command",
+            description: "",
+            value: FieldValue::OptionalText(Some("git rev-parse --abbrev-ref HEAD".to_string())),
+            category: SettingsCategory::Worktree,
+            has_override: false,
+            inherited_display: None,
+        };
+
+        apply_field_to_profile(&field, &global, &mut profile);
+
+        assert_eq!(
+            profile
+                .worktree
+                .as_ref()
+                .and_then(|w| w.branch_command.as_deref()),
+            Some("git rev-parse --abbrev-ref HEAD")
         );
     }
 }

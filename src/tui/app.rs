@@ -577,6 +577,11 @@ impl App {
                     .set_instance_status(session_id, crate::session::Status::Error);
                 return Ok(());
             }
+            self.home.try_mutate_instance(session_id, |current| {
+                *current = inst.clone();
+                Ok(())
+            })?;
+            self.home.save()?;
             self.home.set_instance_error(session_id, None);
         }
 
