@@ -463,7 +463,31 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         storage.save_with_groups(&instances, &group_tree)?;
 
         let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-        tmux_session.attach()?;
+        let tmux_config = crate::terminal::resolved_tmux_config(
+            profile,
+            std::path::Path::new(&instances[idx].project_path),
+        );
+        if let Some(title) = crate::terminal::session_attach_title(&tmux_config, &instance.title) {
+            if let Err(e) = crate::terminal::set_title(&title) {
+                tracing::warn!(
+                    "Failed to update terminal title before CLI launch attach: {}",
+                    e
+                );
+            }
+        }
+
+        let attach_result = tmux_session.attach();
+
+        if let Some(title) = crate::terminal::dashboard_title(&tmux_config) {
+            if let Err(e) = crate::terminal::set_title(&title) {
+                tracing::warn!(
+                    "Failed to restore terminal title after CLI launch attach: {}",
+                    e
+                );
+            }
+        }
+
+        attach_result?;
     } else {
         println!();
         println!("Next steps:");

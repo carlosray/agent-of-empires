@@ -504,6 +504,14 @@ pub struct TmuxConfig {
     /// Mouse support mode (auto, enabled, disabled)
     #[serde(default)]
     pub mouse: TmuxMouseMode,
+
+    /// Rename the outer terminal tab/window title when attaching to a session.
+    #[serde(default)]
+    pub rename_terminal_tab_on_attach: bool,
+
+    /// Static terminal title restored when AoE regains control after attach.
+    #[serde(default = "default_dashboard_tab_title")]
+    pub dashboard_tab_title: String,
 }
 
 impl Default for TmuxConfig {
@@ -511,8 +519,14 @@ impl Default for TmuxConfig {
         Self {
             status_bar: TmuxStatusBarMode::Auto,
             mouse: TmuxMouseMode::Auto,
+            rename_terminal_tab_on_attach: false,
+            dashboard_tab_title: default_dashboard_tab_title(),
         }
     }
+}
+
+fn default_dashboard_tab_title() -> String {
+    "AoE".to_string()
 }
 
 /// Check if user has a tmux configuration file.
@@ -931,6 +945,8 @@ mod tests {
         let tmux = TmuxConfig::default();
         assert_eq!(tmux.status_bar, TmuxStatusBarMode::Auto);
         assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
+        assert!(!tmux.rename_terminal_tab_on_attach);
+        assert_eq!(tmux.dashboard_tab_title, "AoE");
     }
 
     #[test]
@@ -1014,10 +1030,14 @@ mod tests {
         let toml = r#"
             status_bar = "enabled"
             mouse = "enabled"
+            rename_terminal_tab_on_attach = true
+            dashboard_tab_title = "Empire"
         "#;
         let tmux: TmuxConfig = toml::from_str(toml).unwrap();
         assert_eq!(tmux.status_bar, TmuxStatusBarMode::Enabled);
         assert_eq!(tmux.mouse, TmuxMouseMode::Enabled);
+        assert!(tmux.rename_terminal_tab_on_attach);
+        assert_eq!(tmux.dashboard_tab_title, "Empire");
     }
 
     #[test]
@@ -1026,10 +1046,14 @@ mod tests {
             [tmux]
             status_bar = "enabled"
             mouse = "enabled"
+            rename_terminal_tab_on_attach = true
+            dashboard_tab_title = "Empire"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.tmux.status_bar, TmuxStatusBarMode::Enabled);
         assert_eq!(config.tmux.mouse, TmuxMouseMode::Enabled);
+        assert!(config.tmux.rename_terminal_tab_on_attach);
+        assert_eq!(config.tmux.dashboard_tab_title, "Empire");
     }
 
     // Tests for DiffConfig

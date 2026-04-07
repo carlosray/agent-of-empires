@@ -617,6 +617,16 @@ impl SettingsView {
                     t.mouse = None;
                 }
             }
+            FieldKey::RenameTerminalTabOnAttach => {
+                if let Some(ref mut t) = config.tmux {
+                    t.rename_terminal_tab_on_attach = None;
+                }
+            }
+            FieldKey::DashboardTabTitle => {
+                if let Some(ref mut t) = config.tmux {
+                    t.dashboard_tab_title = None;
+                }
+            }
             // Session
             FieldKey::DefaultTool => {
                 if let Some(ref mut s) = config.session {
