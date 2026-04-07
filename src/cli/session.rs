@@ -450,7 +450,23 @@ async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         );
     }
 
-    tmux_session.attach()?;
+    let tmux_config =
+        crate::terminal::resolved_tmux_config(profile, std::path::Path::new(&inst.project_path));
+    if let Some(title) = crate::terminal::session_attach_title(&tmux_config, &inst.title) {
+        if let Err(e) = crate::terminal::set_title(&title) {
+            tracing::warn!("Failed to update terminal title before CLI attach: {}", e);
+        }
+    }
+
+    let attach_result = tmux_session.attach();
+
+    if let Some(title) = crate::terminal::dashboard_title(&tmux_config) {
+        if let Err(e) = crate::terminal::set_title(&title) {
+            tracing::warn!("Failed to restore terminal title after CLI attach: {}", e);
+        }
+    }
+
+    attach_result?;
     Ok(())
 }
 

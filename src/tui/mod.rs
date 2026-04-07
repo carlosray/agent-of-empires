@@ -119,6 +119,11 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+    if let Some(title) = crate::terminal::dashboard_title_for_profile(profile) {
+        if let Err(e) = crate::terminal::write_title_sequence(terminal.backend_mut(), &title) {
+            tracing::warn!("Failed to update terminal title on TUI startup: {}", e);
+        }
+    }
 
     // Combine the caller-supplied startup warning (e.g. debug-log file
     // failures) with any config-parse failures we detect at startup.

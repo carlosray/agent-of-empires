@@ -38,6 +38,8 @@ Configure the status bar behavior in `~/.agent-of-empires/config.toml`:
 status_bar = "auto"
 mouse = "auto"     # Same modes: auto, enabled, disabled
 clipboard = "auto" # Same modes: auto, enabled, disabled
+rename_terminal_tab_on_attach = false
+dashboard_tab_title = "AoE"
 ```
 
 ### Values
@@ -73,6 +75,13 @@ set -g allow-passthrough on
 ```
 
 Some terminal emulators also need clipboard write permission enabled on their side (Ghostty's `clipboard-write = allow`, etc.).
+
+### Terminal Tab Title
+
+AoE can also rename the outer terminal tab or window title while you are attached to a session. This is separate from tmux status bar integration and is best-effort because terminals differ in how they handle title escape sequences.
+
+- `rename_terminal_tab_on_attach = true` sets the terminal tab title to the session title before attach
+- `dashboard_tab_title = "AoE"` restores a static title when control returns to the AoE dashboard
 
 ## Custom Integration
 

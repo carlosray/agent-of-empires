@@ -198,6 +198,8 @@ Bare `KEY` and `KEY=$VAR` entries use Docker's `-e KEY` (key-only) form so the v
 status_bar = "auto"
 mouse = "auto"
 clipboard = "auto"
+rename_terminal_tab_on_attach = false
+dashboard_tab_title = "AoE"
 ```
 
 | Option | Default | Description |
@@ -205,6 +207,8 @@ clipboard = "auto"
 | `status_bar` | `"auto"` | `"auto"`: apply if no `~/.tmux.conf`; `"enabled"`: always apply; `"disabled"`: never apply |
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
 | `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) through tmux to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session. |
+| `rename_terminal_tab_on_attach` | `false` | Best-effort terminal tab/window rename when AoE attaches to a session or terminal view |
+| `dashboard_tab_title` | `"AoE"` | Title to restore when AoE returns to the dashboard after attach. Blank values fall back to `"AoE"`. |
 
 ## Diff
 

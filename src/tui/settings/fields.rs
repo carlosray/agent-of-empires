@@ -86,6 +86,8 @@ pub enum FieldKey {
     StatusBar,
     Mouse,
     Clipboard,
+    RenameTerminalTabOnAttach,
+    DashboardTabTitle,
     // Session
     DefaultTool,
     StrictHotkeys,
@@ -1263,6 +1265,16 @@ fn build_tmux_fields(
 
     let (mouse, mouse_override) =
         resolve_value(scope, global.tmux.mouse, tmux.and_then(|t| t.mouse));
+    let (rename_terminal_tab_on_attach, rename_terminal_tab_override) = resolve_value(
+        scope,
+        global.tmux.rename_terminal_tab_on_attach,
+        tmux.and_then(|t| t.rename_terminal_tab_on_attach),
+    );
+    let (dashboard_tab_title, dashboard_tab_title_override) = resolve_value(
+        scope,
+        global.tmux.dashboard_tab_title.clone(),
+        tmux.and_then(|t| t.dashboard_tab_title.clone()),
+    );
 
     let (clipboard, clipboard_override) =
         resolve_value(scope, global.tmux.clipboard, tmux.and_then(|t| t.clipboard));
@@ -1355,6 +1367,30 @@ fn build_tmux_fields(
                     selected: global_clipboard_selected,
                     options: tmux_options,
                 },
+            ),
+        },
+        SettingField {
+            key: FieldKey::RenameTerminalTabOnAttach,
+            label: "Rename Terminal Tab",
+            description: "Rename the outer terminal tab/window title while attached to a session",
+            value: FieldValue::Bool(rename_terminal_tab_on_attach),
+            category: SettingsCategory::Tmux,
+            has_override: rename_terminal_tab_override,
+            inherited_display: inherited_if(
+                rename_terminal_tab_override,
+                FieldValue::Bool(global.tmux.rename_terminal_tab_on_attach),
+            ),
+        },
+        SettingField {
+            key: FieldKey::DashboardTabTitle,
+            label: "Dashboard Tab Title",
+            description: "Static title restored when AoE regains control after attach",
+            value: FieldValue::Text(dashboard_tab_title),
+            category: SettingsCategory::Tmux,
+            has_override: dashboard_tab_title_override,
+            inherited_display: inherited_if(
+                dashboard_tab_title_override,
+                FieldValue::Text(global.tmux.dashboard_tab_title.clone()),
             ),
         },
     ]
@@ -1981,6 +2017,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
                 _ => TmuxClipboardMode::Disabled,
             };
         }
+        (FieldKey::RenameTerminalTabOnAttach, FieldValue::Bool(v)) => {
+            config.tmux.rename_terminal_tab_on_attach = *v;
+        }
+        (FieldKey::DashboardTabTitle, FieldValue::Text(v)) => {
+            config.tmux.dashboard_tab_title = v.clone();
+        }
         // Session
         (FieldKey::DefaultTool, FieldValue::Select { selected, .. }) => {
             config.session.default_tool =
@@ -2319,6 +2361,16 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 _ => TmuxClipboardMode::Disabled,
             };
             set_profile_override(mode, &mut config.tmux, |s, val| s.clipboard = val);
+        }
+        (FieldKey::RenameTerminalTabOnAttach, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.tmux, |s, val| {
+                s.rename_terminal_tab_on_attach = val
+            });
+        }
+        (FieldKey::DashboardTabTitle, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.tmux, |s, val| {
+                s.dashboard_tab_title = val
+            });
         }
         // Session
         (FieldKey::DefaultTool, FieldValue::Select { selected, .. }) => {
@@ -2754,5 +2806,54 @@ mod tests {
 
         assert!(field.has_override);
         assert!(matches!(field.value, FieldValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_tmux_settings_include_terminal_title_fields() {
+        let global = Config::default();
+        let profile = ProfileConfig::default();
+
+        let fields = build_fields_for_category(
+            SettingsCategory::Tmux,
+            SettingsScope::Global,
+            &global,
+            &profile,
+        );
+
+        assert!(
+            fields
+                .iter()
+                .any(|f| f.key == FieldKey::RenameTerminalTabOnAttach),
+            "Tmux settings should include the tab rename toggle"
+        );
+        assert!(
+            fields.iter().any(|f| f.key == FieldKey::DashboardTabTitle),
+            "Tmux settings should include the dashboard tab title"
+        );
+    }
+
+    #[test]
+    fn test_apply_tmux_dashboard_title_profile_override() {
+        let global = Config::default();
+        let mut profile = ProfileConfig::default();
+        let field = SettingField {
+            key: FieldKey::DashboardTabTitle,
+            label: "Dashboard Tab Title",
+            description: "",
+            value: FieldValue::Text("Empire".to_string()),
+            category: SettingsCategory::Tmux,
+            has_override: false,
+            inherited_display: None,
+        };
+
+        apply_field_to_profile(&field, &global, &mut profile);
+
+        assert_eq!(
+            profile
+                .tmux
+                .as_ref()
+                .and_then(|t| t.dashboard_tab_title.as_deref()),
+            Some("Empire")
+        );
     }
 }

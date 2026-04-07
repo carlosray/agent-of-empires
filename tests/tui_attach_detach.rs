@@ -223,3 +223,83 @@ fn test_attach_restart_failure_emits_transient_toast() {
          is recognizable in the bar."
     );
 }
+
+#[test]
+fn test_tui_attach_paths_apply_terminal_title_helper() {
+    let source = std::fs::read_to_string("src/tui/app.rs").expect("Failed to read app.rs");
+
+    let attach_session_start = source
+        .find("fn attach_session(")
+        .expect("attach_session function not found");
+    let attach_session_section = &source[attach_session_start..];
+    let attach_session_end = attach_session_section
+        .find("\n    fn ")
+        .unwrap_or(attach_session_section.len());
+    let attach_session_body = &attach_session_section[..attach_session_end];
+
+    assert!(
+        attach_session_body.contains("crate::terminal::session_attach_title"),
+        "attach_session should compute a session tab title before attaching"
+    );
+    assert!(
+        attach_session_body.contains("crate::terminal::dashboard_title"),
+        "attach_session should restore the dashboard tab title after returning"
+    );
+
+    let attach_terminal_start = source
+        .find("fn attach_terminal(")
+        .expect("attach_terminal function not found");
+    let attach_terminal_section = &source[attach_terminal_start..];
+    let attach_terminal_end = attach_terminal_section
+        .find("\n    fn ")
+        .unwrap_or(attach_terminal_section.len());
+    let attach_terminal_body = &attach_terminal_section[..attach_terminal_end];
+
+    assert!(
+        attach_terminal_body.contains("crate::terminal::session_attach_title"),
+        "attach_terminal should compute a session tab title before attaching"
+    );
+    assert!(
+        attach_terminal_body.contains("crate::terminal::dashboard_title"),
+        "attach_terminal should restore the dashboard tab title after returning"
+    );
+}
+
+#[test]
+fn test_cli_attach_paths_apply_terminal_title_helper() {
+    let session_source =
+        std::fs::read_to_string("src/cli/session.rs").expect("Failed to read session.rs");
+    assert!(
+        session_source.contains("crate::terminal::session_attach_title"),
+        "CLI session attach should compute a session tab title before attaching"
+    );
+    assert!(
+        session_source.contains("crate::terminal::dashboard_title"),
+        "CLI session attach should restore the dashboard title after attaching"
+    );
+
+    let add_source = std::fs::read_to_string("src/cli/add.rs").expect("Failed to read add.rs");
+    assert!(
+        add_source.contains("crate::terminal::session_attach_title"),
+        "CLI add --launch should compute a session tab title before attaching"
+    );
+    assert!(
+        add_source.contains("crate::terminal::dashboard_title"),
+        "CLI add --launch should restore the dashboard title after attaching"
+    );
+}
+
+#[test]
+fn test_tui_startup_applies_dashboard_title_helper() {
+    let source = std::fs::read_to_string("src/tui/mod.rs").expect("Failed to read mod.rs");
+
+    assert!(
+        source.contains("crate::terminal::dashboard_title"),
+        "TUI startup should compute the dashboard tab title on initial launch"
+    );
+    assert!(
+        source.contains("crate::terminal::write_title_sequence")
+            || source.contains("crate::terminal::set_title"),
+        "TUI startup should apply the dashboard tab title on initial launch"
+    );
+}

@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
@@ -59,6 +59,20 @@ impl UpdateStatus {
     }
 }
 
+fn warn_if_title_update_fails(context: &str, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        tracing::warn!("Failed to update terminal title ({}): {}", context, e);
+    }
+}
+
+fn tmux_config_for_instance(instance: &crate::session::Instance) -> crate::session::TmuxConfig {
+    let profile = if instance.source_profile.is_empty() {
+        crate::session::DEFAULT_PROFILE
+    } else {
+        &instance.source_profile
+    };
+    crate::terminal::resolved_tmux_config(profile, std::path::Path::new(&instance.project_path))
+}
 pub struct App {
     home: HomeView,
     should_quit: bool,
@@ -236,12 +250,13 @@ impl App {
         f: F,
     ) -> Result<R>
     where
-        F: FnOnce() -> R,
+        F: FnOnce(&mut CrosstermBackend<std::io::Stdout>) -> R,
     {
         crossterm::terminal::disable_raw_mode()?;
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
+            crossterm::event::DisableMouseCapture,
             DisableBracketedPaste,
             DisableMouseCapture,
             crossterm::cursor::Show
@@ -254,7 +269,7 @@ impl App {
         // reader thread competes for stdin reads.
         self.event_stream.take();
 
-        let result = f();
+        let result = f(terminal.backend_mut());
 
         // Recreate the event stream with a fresh reader before re-entering
         // the event loop.
@@ -264,6 +279,7 @@ impl App {
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::EnterAlternateScreen,
+            crossterm::event::EnableMouseCapture,
             EnableBracketedPaste,
             crossterm::cursor::Hide
         )?;
@@ -272,6 +288,10 @@ impl App {
         // to the serve view.
         self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
+
+        while event::poll(Duration::from_millis(0))? {
+            let _ = event::read();
+        }
 
         terminal.clear()?;
 
@@ -779,7 +799,7 @@ impl App {
             self.update_status = Some(UpdateStatus::transient(format!("updating to v{version}…")));
             let method_clone = method.clone();
             let version_clone = version.clone();
-            let result = self.with_raw_mode_disabled(terminal, move || {
+            let result = self.with_raw_mode_disabled(terminal, move |_| {
                 tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(async {
                         crate::update::install::perform_update(&method_clone, &version_clone, None)
@@ -1136,11 +1156,27 @@ impl App {
             self.home.set_instance_error(session_id, None);
         }
 
-        let tmux_session = match self.home.get_instance(session_id) {
-            Some(inst) => inst.tmux_session()?,
-            None => return Ok(()),
-        };
-        let attach_result = self.with_raw_mode_disabled(terminal, || tmux_session.attach())?;
+        let tmux_config = tmux_config_for_instance(&instance);
+        let session_tab_title =
+            crate::terminal::session_attach_title(&tmux_config, &instance.title);
+        let dashboard_tab_title = crate::terminal::dashboard_title(&tmux_config);
+
+        let attach_result = self.with_raw_mode_disabled(terminal, |backend| {
+            if let Some(title) = session_tab_title.as_deref() {
+                warn_if_title_update_fails(
+                    "session attach",
+                    crate::terminal::write_title_sequence(backend, title),
+                );
+            }
+            tmux_session.attach()
+        })?;
+
+        if let Some(title) = dashboard_tab_title.as_deref() {
+            warn_if_title_update_fails(
+                "dashboard return",
+                crate::terminal::write_title_sequence(terminal.backend_mut(), title),
+            );
+        }
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
@@ -1207,7 +1243,27 @@ impl App {
             }
         };
 
-        let attach_result = self.with_raw_mode_disabled(terminal, attach_fn)?;
+        let tmux_config = tmux_config_for_instance(&instance);
+        let session_tab_title =
+            crate::terminal::session_attach_title(&tmux_config, &instance.title);
+        let dashboard_tab_title = crate::terminal::dashboard_title(&tmux_config);
+
+        let attach_result = self.with_raw_mode_disabled(terminal, |backend| {
+            if let Some(title) = session_tab_title.as_deref() {
+                warn_if_title_update_fails(
+                    "terminal attach",
+                    crate::terminal::write_title_sequence(backend, title),
+                );
+            }
+            attach_fn()
+        })?;
+
+        if let Some(title) = dashboard_tab_title.as_deref() {
+            warn_if_title_update_fails(
+                "dashboard return",
+                crate::terminal::write_title_sequence(terminal.backend_mut(), title),
+            );
+        }
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
@@ -1255,7 +1311,7 @@ impl App {
 
         let path = path.to_owned();
         let editor_clone = editor.clone();
-        let status = self.with_raw_mode_disabled(terminal, move || {
+        let status = self.with_raw_mode_disabled(terminal, move |_backend| {
             std::process::Command::new(&editor_clone)
                 .arg(&path)
                 .status()
