@@ -133,6 +133,8 @@ The public website (agent-of-empires.com) is an Astro static site in `website/`.
 
 The CI workflow (`.github/workflows/docs.yml`) triggers on changes to `docs/**`, `website/**`, and other relevant paths.
 
+- Before finishing any feature request, clean up any test or debug `aoe` processes or tmux sessions you started. Verify with `ps aux | grep '[a]oe'` and remove only the leftovers you created.
+
 ## Design System
 
 Read `DESIGN.md` before any visual/UI change — fonts, colors, spacing, and aesthetic direction are defined there. Don't deviate without explicit approval; in QA mode, flag code that doesn't match.
