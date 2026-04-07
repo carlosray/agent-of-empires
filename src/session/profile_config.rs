@@ -163,6 +163,12 @@ pub struct TmuxConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<TmuxMouseMode>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rename_terminal_tab_on_attach: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_tab_title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -376,6 +382,12 @@ pub fn apply_tmux_overrides(target: &mut super::config::TmuxConfig, source: &Tmu
     }
     if let Some(mouse) = source.mouse {
         target.mouse = mouse;
+    }
+    if let Some(rename_terminal_tab_on_attach) = source.rename_terminal_tab_on_attach {
+        target.rename_terminal_tab_on_attach = rename_terminal_tab_on_attach;
+    }
+    if let Some(ref dashboard_tab_title) = source.dashboard_tab_title {
+        target.dashboard_tab_title = dashboard_tab_title.clone();
     }
 }
 
@@ -662,6 +674,7 @@ mod tests {
             tmux: Some(TmuxConfigOverride {
                 status_bar: Some(TmuxStatusBarMode::Enabled),
                 mouse: None,
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -686,6 +699,24 @@ mod tests {
 
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.tmux.mouse, TmuxMouseMode::Disabled);
+    }
+
+    #[test]
+    fn test_merge_configs_with_tmux_terminal_title_overrides() {
+        let global = Config::default();
+
+        let profile = ProfileConfig {
+            tmux: Some(TmuxConfigOverride {
+                rename_terminal_tab_on_attach: Some(true),
+                dashboard_tab_title: Some("Empire".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert!(merged.tmux.rename_terminal_tab_on_attach);
+        assert_eq!(merged.tmux.dashboard_tab_title, "Empire");
     }
 
     #[test]
@@ -753,6 +784,8 @@ mod tests {
             tmux: Some(TmuxConfigOverride {
                 status_bar: Some(TmuxStatusBarMode::Enabled),
                 mouse: Some(TmuxMouseMode::Enabled),
+                rename_terminal_tab_on_attach: Some(true),
+                dashboard_tab_title: Some("Empire".to_string()),
             }),
             ..Default::default()
         };
@@ -765,6 +798,23 @@ mod tests {
         assert_eq!(
             deserialized.tmux.as_ref().unwrap().mouse,
             Some(TmuxMouseMode::Enabled)
+        );
+        assert_eq!(
+            deserialized
+                .tmux
+                .as_ref()
+                .unwrap()
+                .rename_terminal_tab_on_attach,
+            Some(true)
+        );
+        assert_eq!(
+            deserialized
+                .tmux
+                .as_ref()
+                .unwrap()
+                .dashboard_tab_title
+                .as_deref(),
+            Some("Empire")
         );
     }
 

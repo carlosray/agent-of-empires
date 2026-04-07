@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use agent_of_empires::session::{save_config, Config, SandboxConfig, WorktreeConfig};
+use agent_of_empires::session::{save_config, Config, SandboxConfig, TmuxConfig, WorktreeConfig};
 use agent_of_empires::tui::dialogs::{DeleteDialogConfig, UnifiedDeleteDialog};
 use serial_test::serial;
 
@@ -172,6 +172,30 @@ fn test_config_roundtrip_preserves_worktree_branch_settings() {
         loaded.worktree.branch_command.as_deref(),
         Some("git branch --show-current")
     );
+}
+
+#[test]
+fn test_all_tmux_config_fields_accessible() {
+    let config = TmuxConfig::default();
+    let _ = config.status_bar;
+    let _ = config.mouse;
+    let _ = config.rename_terminal_tab_on_attach;
+    let _ = config.dashboard_tab_title.as_str();
+}
+
+#[test]
+#[serial]
+fn test_config_roundtrip_preserves_tmux_title_settings() {
+    let _temp = setup_temp_home();
+
+    let mut config = Config::default();
+    config.tmux.rename_terminal_tab_on_attach = true;
+    config.tmux.dashboard_tab_title = "Empire".to_string();
+    save_config(&config).unwrap();
+
+    let loaded = Config::load().unwrap();
+    assert!(loaded.tmux.rename_terminal_tab_on_attach);
+    assert_eq!(loaded.tmux.dashboard_tab_title, "Empire");
 }
 
 #[test]

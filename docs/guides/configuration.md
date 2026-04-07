@@ -133,12 +133,16 @@ Each entry in the `environment` list can be:
 [tmux]
 status_bar = "auto"
 mouse = "auto"
+rename_terminal_tab_on_attach = false
+dashboard_tab_title = "AoE"
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `status_bar` | `"auto"` | `"auto"`: apply if no `~/.tmux.conf`; `"enabled"`: always apply; `"disabled"`: never apply |
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
+| `rename_terminal_tab_on_attach` | `false` | Best-effort terminal tab/window rename when AoE attaches to a session or terminal view |
+| `dashboard_tab_title` | `"AoE"` | Title to restore when AoE returns to the dashboard after attach. Blank values fall back to `"AoE"`. |
 
 ## Diff
 
