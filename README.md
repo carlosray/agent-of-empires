@@ -2,6 +2,8 @@
 
 This repository is a fork of [njbrake/agent-of-empires](https://github.com/njbrake/agent-of-empires).
 
+This fork is kept current with upstream and documents every fork-only feature or fix separately. See [Fork Features](docs/fork-features/index.md) for the current delta from upstream and the running history of additions that may later move upstream.
+
 ## 1. Test and run locally
 
 Prerequisites:

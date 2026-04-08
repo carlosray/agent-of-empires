@@ -42,6 +42,15 @@
   4. Add a `clear_profile_override()` case in `src/tui/settings/input.rs`
 - Profile overrides (`*ConfigOverride` structs in `profile_config.rs`) must also include the new field with merge logic in `merge_configs()`.
 
+## Fork Feature Documentation
+
+- This fork keeps all fork-only product behavior documented in `docs/fork-features/`.
+- Every fork-only feature or fix on top of upstream must get its own page in `docs/fork-features/`.
+- Mirror each fork feature page into `website/src/pages/docs/fork-features/` so the public docs stay in sync with the repo docs.
+- Update both `docs/fork-features/index.md` and `website/src/pages/docs/fork-features/index.md` when adding a new entry.
+- Add each new page to `website/src/data/docsNav.ts` so the section is visible in the docs sidebar.
+- Keep `README.md` aligned with the fork-docs section so it stays clear that this repo tracks upstream and carries documented fork additions.
+
 ## Coding Style & Naming Conventions
 
 - Prefer "let the tools decide": keep code `cargo fmt`-clean and `cargo clippy`-clean.

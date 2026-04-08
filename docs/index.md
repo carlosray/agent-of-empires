@@ -6,6 +6,10 @@ A terminal session manager for AI coding agents on Linux and macOS, built on tmu
 
 AoE lets you run multiple AI agents in parallel -- each in its own tmux session, optionally on its own git branch, optionally inside a Docker container. A TUI dashboard shows you what every agent is doing at a glance.
 
+## Fork Features
+
+This repository is also maintained as a current fork of upstream AoE. Fork-only behavior is documented in [Fork Features](fork-features/index.md) so the difference from upstream stays explicit and easy to extend over time.
+
 ## See it in action
 
 <iframe
