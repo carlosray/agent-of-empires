@@ -167,6 +167,27 @@ const PAGES = [
     description:
       "REST endpoints for driving Agent of Empires sessions from external orchestrators.",
   },
+  {
+    source: "docs/fork-features/index.md",
+    dest: "docs/fork-features/index.md",
+    title: "Fork Features",
+    description:
+      "Fork-only behavior and product differences carried on top of upstream Agent of Empires.",
+  },
+  {
+    source: "docs/fork-features/git-branch-display.md",
+    dest: "docs/fork-features/git-branch-display.md",
+    title: "Git Branch Labels for All Git Sessions",
+    description:
+      "Show persisted git branch labels in the TUI for any git-backed session, not only worktrees.",
+  },
+  {
+    source: "docs/fork-features/terminal-tab-title.md",
+    dest: "docs/fork-features/terminal-tab-title.md",
+    title: "Terminal Tab Titles on Attach",
+    description:
+      "Rename the outer terminal tab on attach and restore a dashboard title when returning to AoE.",
+  },
 ];
 
 // Every known docs path → website URL, used for link rewriting.
@@ -183,6 +204,9 @@ const URL_MAP = {
   "docs/cli/reference.md": "/docs/cli/reference/",
   "docs/cockpit.md": "/docs/cockpit/",
   "docs/api.md": "/docs/api/",
+  "docs/fork-features/index.md": "/docs/fork-features/",
+  "docs/fork-features/git-branch-display.md": "/docs/fork-features/git-branch-display/",
+  "docs/fork-features/terminal-tab-title.md": "/docs/fork-features/terminal-tab-title/",
   // Guides
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
