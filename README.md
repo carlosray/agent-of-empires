@@ -17,7 +17,7 @@ A session manager for AI coding agents on Linux and macOS. Use it from the termi
 
 Run multiple AI agents in parallel across different branches of your codebase, each in its own isolated session with optional Docker sandboxing. Access your agents from your laptop, phone, or tablet.
 
-This repository tracks upstream [njbrake/agent-of-empires](https://github.com/njbrake/agent-of-empires) and keeps fork-specific behavior documented in [docs/fork-features/](docs/fork-features/index.md).
+This repository tracks upstream [njbrake/agent-of-empires](https://github.com/njbrake/agent-of-empires) and keeps fork-specific behavior documented in [docs/fork-features/](docs/fork-features/index.md), so the current delta from upstream stays explicit.
 
 ## Why AoE?
 

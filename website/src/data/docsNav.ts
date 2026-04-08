@@ -31,6 +31,14 @@ export const docsNav: NavSection[] = [
     ],
   },
   {
+    title: "Fork Features",
+    items: [
+      { title: "Overview", href: "/docs/fork-features/" },
+      { title: "Git Branch Labels", href: "/docs/fork-features/git-branch-display/" },
+      { title: "Terminal Tab Titles", href: "/docs/fork-features/terminal-tab-title/" },
+    ],
+  },
+  {
     title: "Reference",
     items: [
       { title: "CLI Reference", href: "/docs/cli/reference/" },

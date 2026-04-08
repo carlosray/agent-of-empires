@@ -49,6 +49,15 @@ Behind the `serve` feature flag; experimental, subject to change.
 
 Every configurable field must be editable in the settings TUI. When adding one to `SandboxConfig`, `WorktreeConfig`, etc., also: add a `FieldKey` in `src/tui/settings/fields.rs`; add a `SettingField` entry in the matching `build_*_fields()`; wire `apply_field_to_global()` + `apply_field_to_profile()`; add a `clear_profile_override()` case in `src/tui/settings/input.rs`; include the field in the `*ConfigOverride` struct in `profile_config.rs` with merge logic in `merge_configs()`.
 
+## Fork Feature Documentation
+
+- This fork keeps all fork-only product behavior documented in `docs/fork-features/`.
+- Every fork-only feature or fix on top of upstream must get its own page in `docs/fork-features/`.
+- Add each fork feature page to `website/scripts/sync-docs.mjs` so the public docs pages are generated from the repo docs.
+- Update `docs/fork-features/index.md` when adding a new entry.
+- Add each new page to `website/src/data/docsNav.ts` so the section is visible in the docs sidebar.
+- Keep `README.md` aligned with the fork-docs section so it stays clear that this repo tracks upstream and carries documented fork additions.
+
 ## Coding Style & Naming Conventions
 
 - Let `cargo fmt` + `cargo clippy` decide; fix warnings.
