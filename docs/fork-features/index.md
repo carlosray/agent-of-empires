@@ -19,7 +19,7 @@ When this fork adds another feature or behavior change on top of upstream:
 
 1. Create a new page in `docs/fork-features/`
 2. Add the entry to this index
-3. Mirror the page into `website/src/pages/docs/fork-features/`
+3. Add the page to `website/scripts/sync-docs.mjs`
 4. Add the page to `website/src/data/docsNav.ts`
 
 The goal is simple: if a behavior differs from upstream, it should be documented here.

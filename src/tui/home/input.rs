@@ -1,11 +1,11 @@
 //! Input handling for HomeView
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
 use super::{HomeView, TerminalMode, ViewMode};
-use crate::session::config::{load_config, save_config, SortOrder};
+use crate::session::config::{load_config, save_config, GroupByMode, SortOrder};
 use crate::session::{list_profiles, repo_config, resolve_config, Item, Status};
 use crate::tui::app::Action;
 use crate::tui::dialogs::{
@@ -201,11 +201,12 @@ impl HomeView {
                                     tracing::error!("Failed to trust repo: {}", e);
                                 }
                                 let merged =
-                                    self.merge_repo_hooks_onto_config_for(&data.profile, hooks);
+                                    repo_config::merge_hooks_with_config(&data.profile, hooks);
                                 return self.create_session_with_hooks(data, merged);
                             }
                             HookTrustAction::Skip => {
-                                let fallback = self.resolve_global_profile_hooks_for(&data.profile);
+                                let fallback =
+                                    repo_config::resolve_global_profile_hooks(&data.profile);
                                 return self.create_session_with_hooks(data, fallback);
                             }
                         }
@@ -272,6 +273,7 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
+                    self.pending_force_remove_session = None;
                     self.pending_branch_refresh = None;
                 }
                 DialogResult::Submit(_) => {
@@ -285,6 +287,14 @@ impl HomeView {
                         if let Some(session_id) = self.pending_stop_session.take() {
                             return Some(Action::StopSession(session_id));
                         }
+                    } else if action == "force_remove_session" {
+                        if let Some(session_id) = self.pending_force_remove_session.take() {
+                            if let Err(e) = self.force_remove_session(&session_id) {
+                                tracing::error!("Failed to force remove session: {}", e);
+                            }
+                        }
+                    } else if action == "quit_during_creation" {
+                        return Some(Action::Quit);
                     } else if action == "refresh_branch" {
                         if let Some(refresh) = self.pending_branch_refresh.take() {
                             self.mutate_instance(&refresh.session_id, |inst| {
@@ -435,6 +445,19 @@ impl HomeView {
             return None;
         }
 
+        // Serve dialog (serve feature only)
+        #[cfg(feature = "serve")]
+        if let Some(dialog) = &mut self.serve_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(_) => {
+                    // Dropping the dialog kills the subprocess via kill_on_drop.
+                    self.serve_dialog = None;
+                }
+            }
+            return None;
+        }
+
         // Send message dialog
         if let Some(dialog) = &mut self.send_message_dialog {
             match dialog.handle_key(key) {
@@ -510,6 +533,25 @@ impl HomeView {
             KeyCode::Char('P') => {
                 self.show_profile_picker();
             }
+            #[cfg(feature = "serve")]
+            KeyCode::Char('R') => {
+                self.serve_dialog = Some(crate::tui::dialogs::ServeDialog::new());
+            }
+            #[cfg(not(feature = "serve"))]
+            KeyCode::Char('R') => {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Serve unavailable",
+                    "This `aoe` binary was built without the `serve` feature, \
+                     so the web dashboard, local network serving, and \
+                     Cloudflare Tunnel integration are not included.\n\n\
+                     To serve to your phone (LAN / Tailscale / tunnel):\n\
+                       \u{2022} Install a release build from GitHub Releases, or\n\
+                       \u{2022} Build from source with:\n\
+                         cargo build --release --features serve\n\n\
+                     Once you have a `serve`-enabled binary, press R again to \
+                     open the serve dialog.",
+                ));
+            }
             KeyCode::Char('t') => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Agent => ViewMode::Terminal,
@@ -520,7 +562,7 @@ impl HomeView {
                 // Quick-attach to paired terminal from any view
                 if let Some(id) = &self.selected_session {
                     if let Some(inst) = self.get_instance(id) {
-                        if inst.status == Status::Deleting {
+                        if matches!(inst.status, Status::Deleting | Status::Creating) {
                             return None;
                         }
                     }
@@ -564,9 +606,12 @@ impl HomeView {
                         (self.search_match_index + 1) % self.search_matches.len();
                     self.cursor = self.search_matches[self.search_match_index];
                     self.update_selected();
+                } else if self.creating_stub_id.is_some() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Please Wait",
+                        "A session is already being created. Wait for it to finish or press Ctrl+C to cancel.",
+                    ));
                 } else {
-                    let existing_titles: Vec<String> =
-                        self.instances().iter().map(|i| i.title.clone()).collect();
                     let existing_groups: Vec<String> =
                         self.all_groups().iter().map(|g| g.path.clone()).collect();
                     let current_profile = self
@@ -577,7 +622,6 @@ impl HomeView {
                         list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
                     self.new_dialog = Some(NewSessionDialog::new(
                         self.available_tools.clone(),
-                        existing_titles,
                         existing_groups,
                         &current_profile,
                         profiles,
@@ -593,6 +637,11 @@ impl HomeView {
                     };
                     self.cursor = self.search_matches[self.search_match_index];
                     self.update_selected();
+                } else if self.creating_stub_id.is_some() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        "Please Wait",
+                        "A session is already being created. Wait for it to finish or press Ctrl+C to cancel.",
+                    ));
                 } else {
                     // Pre-filled new session from selection
                     let prefill_path = self
@@ -619,8 +668,6 @@ impl HomeView {
                         .or_else(|| self.selected_group.clone());
 
                     if prefill_path.is_some() || prefill_group.is_some() {
-                        let existing_titles: Vec<String> =
-                            self.instances().iter().map(|i| i.title.clone()).collect();
                         let existing_groups: Vec<String> =
                             self.all_groups().iter().map(|g| g.path.clone()).collect();
                         let current_profile = self
@@ -631,7 +678,6 @@ impl HomeView {
                             list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
                         let mut dialog = NewSessionDialog::new(
                             self.available_tools.clone(),
-                            existing_titles,
                             existing_groups,
                             &current_profile,
                             profiles,
@@ -698,7 +744,10 @@ impl HomeView {
             KeyCode::Char('x') => {
                 if let Some(session_id) = &self.selected_session {
                     if let Some(inst) = self.get_instance(session_id) {
-                        if inst.status == Status::Stopped || inst.status == Status::Deleting {
+                        if matches!(
+                            inst.status,
+                            Status::Stopped | Status::Deleting | Status::Creating
+                        ) {
                             return None;
                         }
                         let message = format!("Are you sure you want to stop '{}'?", inst.title);
@@ -722,7 +771,21 @@ impl HomeView {
                 }
                 if let Some(session_id) = &self.selected_session {
                     if let Some(inst) = self.get_instance(session_id) {
+                        if inst.status == Status::Creating {
+                            return None;
+                        }
                         if inst.status == Status::Deleting {
+                            let message = format!(
+                                "'{}' is stuck deleting. Force remove it from the session list? \
+                                 (worktrees, branches, and containers will not be cleaned up)",
+                                inst.title
+                            );
+                            self.pending_force_remove_session = Some(session_id.clone());
+                            self.confirm_dialog = Some(ConfirmDialog::new(
+                                "Force Remove",
+                                &message,
+                                "force_remove_session",
+                            ));
                             return None;
                         }
 
@@ -752,6 +815,13 @@ impl HomeView {
                         ));
                     }
                 } else if let Some(group_path) = &self.selected_group {
+                    if self.group_by == GroupByMode::Project {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Cannot Modify Project Groups",
+                            "Project groups are automatic. Press 'g' to switch to manual grouping to manage groups.",
+                        ));
+                        return None;
+                    }
                     let prefix = format!("{}/", group_path);
                     let session_count = self
                         .instances
@@ -782,7 +852,7 @@ impl HomeView {
             KeyCode::Char('r') => {
                 if let Some(id) = &self.selected_session {
                     if let Some(inst) = self.get_instance(id) {
-                        if inst.status == Status::Deleting {
+                        if matches!(inst.status, Status::Deleting | Status::Creating) {
                             return None;
                         }
                         let current_profile = self
@@ -802,6 +872,13 @@ impl HomeView {
                         ));
                     }
                 } else if let Some(group_path) = &self.selected_group {
+                    if self.group_by == GroupByMode::Project {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Cannot Modify Project Groups",
+                            "Project groups are automatic. Press 'g' to switch to manual grouping to manage groups.",
+                        ));
+                        return None;
+                    }
                     let group_path = group_path.clone();
                     let current_profile = self
                         .selected_group_profile
@@ -827,6 +904,9 @@ impl HomeView {
             KeyCode::Char('m') => {
                 if let Some(id) = self.selected_session.clone() {
                     if let Some(inst) = self.get_instance(&id) {
+                        if inst.status == Status::Creating {
+                            return None;
+                        }
                         let title = inst.title.clone();
                         let inst_id = inst.id.clone();
                         let tmux_session = crate::tmux::Session::new(&inst_id, &title).ok();
@@ -856,9 +936,12 @@ impl HomeView {
             KeyCode::PageDown => {
                 self.move_cursor(10);
             }
-            KeyCode::Home | KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::NONE) => {
+            KeyCode::Home => {
                 self.cursor = 0;
                 self.update_selected();
+            }
+            KeyCode::Char('g') => {
+                self.apply_group_by(self.group_by.cycle());
             }
             KeyCode::End | KeyCode::Char('G') => {
                 if !self.flat_items.is_empty() {
@@ -869,7 +952,7 @@ impl HomeView {
             KeyCode::Enter => {
                 if let Some(id) = &self.selected_session {
                     if let Some(inst) = self.get_instance(id) {
-                        if inst.status == Status::Deleting {
+                        if matches!(inst.status, Status::Deleting | Status::Creating) {
                             return None;
                         }
                     }
@@ -1043,7 +1126,36 @@ impl HomeView {
         }
     }
 
+    fn apply_group_by(&mut self, new_mode: GroupByMode) {
+        self.group_by = new_mode;
+        self.flat_items = self.build_flat_items();
+        self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+        self.update_selected();
+        match load_config().map(|c| c.unwrap_or_default()) {
+            Ok(mut config) => {
+                config.app_state.group_by = Some(self.group_by);
+                if let Err(e) = save_config(&config) {
+                    tracing::warn!("Failed to save group_by mode: {}", e);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to load config for group_by save: {}", e);
+            }
+        }
+    }
+
     fn toggle_group_collapsed(&mut self, path: &str) {
+        if self.group_by == GroupByMode::Project {
+            let collapsed = self
+                .project_group_collapsed
+                .get(path)
+                .copied()
+                .unwrap_or(false);
+            self.project_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.flat_items = self.build_flat_items();
+            return;
+        }
         // Route to the correct profile's GroupTree
         let profile = self.profile_for_cursor(self.cursor);
         if let Some(profile) = profile {
@@ -1195,16 +1307,16 @@ impl HomeView {
                 None
             }
             Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                let merged = self.merge_repo_hooks_onto_config_for(&data.profile, repo_hooks);
+                let merged = repo_config::merge_hooks_with_config(&data.profile, repo_hooks);
                 self.create_session_with_hooks(data, merged)
             }
             Ok(repo_config::HookTrustStatus::NoHooks) => {
-                let fallback = self.resolve_global_profile_hooks_for(&data.profile);
+                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
                 self.create_session_with_hooks(data, fallback)
             }
             Err(e) => {
                 tracing::warn!("Failed to check repo hooks: {}", e);
-                let fallback = self.resolve_global_profile_hooks_for(&data.profile);
+                let fallback = repo_config::resolve_global_profile_hooks(&data.profile);
                 self.create_session_with_hooks(data, fallback)
             }
         }
@@ -1239,61 +1351,6 @@ impl HomeView {
                 }
                 None
             }
-        }
-    }
-
-    /// Handle a mouse event
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) -> Option<Action> {
-        // Pass mouse events to diff view if active
-        if let Some(ref mut diff_view) = self.diff_view {
-            match diff_view.handle_mouse(mouse) {
-                DiffAction::Continue => return None,
-                DiffAction::Close => {
-                    self.diff_view = None;
-                    return None;
-                }
-                DiffAction::EditFile(path) => {
-                    return Some(Action::EditFile(path));
-                }
-            }
-        }
-
-        // No mouse handling for other views currently
-        None
-    }
-
-    /// Resolve hooks from global+profile config for the given profile.
-    fn resolve_global_profile_hooks_for(
-        &self,
-        profile: &str,
-    ) -> Option<crate::session::HooksConfig> {
-        let config = resolve_config(profile).ok()?;
-        if config.hooks.on_create.is_empty() && config.hooks.on_launch.is_empty() {
-            None
-        } else {
-            Some(config.hooks)
-        }
-    }
-
-    /// Merge trusted repo hooks onto the resolved config for the given profile.
-    fn merge_repo_hooks_onto_config_for(
-        &self,
-        profile: &str,
-        repo_hooks: crate::session::HooksConfig,
-    ) -> Option<crate::session::HooksConfig> {
-        let mut base = resolve_config(profile).map(|c| c.hooks).unwrap_or_default();
-
-        if !repo_hooks.on_create.is_empty() {
-            base.on_create = repo_hooks.on_create;
-        }
-        if !repo_hooks.on_launch.is_empty() {
-            base.on_launch = repo_hooks.on_launch;
-        }
-
-        if base.on_create.is_empty() && base.on_launch.is_empty() {
-            None
-        } else {
-            Some(base)
         }
     }
 }

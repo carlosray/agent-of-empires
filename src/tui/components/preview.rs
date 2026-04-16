@@ -119,6 +119,7 @@ impl Preview {
         show_branch_in_tui: bool,
     ) {
         let base = 3;
+        let sandbox_lines = usize::from(instance.is_sandboxed());
         let branch_lines = usize::from(show_branch_in_tui && instance.display_branch.is_some());
         let section_lines = if instance.worktree_info.is_some() {
             2 + branch_lines + 1 // blank + header + optional branch + main
@@ -127,7 +128,7 @@ impl Preview {
         } else {
             0
         };
-        let info_height = base + section_lines as u16;
+        let info_height = base + sandbox_lines as u16 + section_lines as u16;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -188,11 +189,20 @@ impl Preview {
                         crate::session::Status::Error => theme.error,
                         crate::session::Status::Starting => theme.dimmed,
                         crate::session::Status::Deleting => theme.waiting,
+                        crate::session::Status::Creating => theme.accent,
                     }),
                 ),
             ]),
         ]);
 
+        if let Some(sandbox) = &instance.sandbox_info {
+            if sandbox.enabled {
+                info_lines.push(Line::from(vec![
+                    Span::styled("Sandbox: ", Style::default().fg(theme.dimmed)),
+                    Span::styled(&sandbox.container_name, Style::default().fg(theme.sandbox)),
+                ]));
+            }
+        }
         if let Some(wt_info) = &instance.worktree_info {
             info_lines.push(Line::from(""));
             info_lines.push(Line::from(vec![
