@@ -943,6 +943,8 @@ fn test_uppercase_b_on_changed_branch_opens_confirm_dialog() {
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
     view.update_selected();
 
     view.handle_key(key(KeyCode::Char('B')));
@@ -2611,7 +2613,7 @@ fn test_apply_creation_results_returns_session_id() {
 fn test_project_group_name_uses_last_path_segment() {
     use super::project_group_name;
 
-    let mut inst = Instance::new("test", "/home/user/my-project");
+    let inst = Instance::new("test", "/home/user/my-project");
     assert_eq!(project_group_name(&inst), "my-project");
 }
 
