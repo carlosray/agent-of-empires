@@ -13,7 +13,8 @@ use super::{
 };
 use crate::tmux;
 
-const INITIAL_BIND_GRACE: i64 = 5;
+// Allow 30s grace to tolerate artifact-write latency from tools like codex, opencode, and pi.
+const INITIAL_BIND_GRACE: i64 = 30;
 const SUPPORTED_TOOLS: &[&str] = &["claude", "codex", "opencode", "pi"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1273,6 +1274,59 @@ mod tests {
         } else {
             rows
         }
+    }
+
+    #[test]
+    #[allow(clippy::assertions_on_constants)]
+    fn test_initial_bind_grace_is_at_least_thirty_seconds() {
+        assert!(super::INITIAL_BIND_GRACE >= 30, "INITIAL_BIND_GRACE must be at least 30 seconds to tolerate artifact-write latency from real tools");
+    }
+
+    #[test]
+    fn test_select_initial_tool_session_binds_candidate_created_after_launch_with_longer_grace() {
+        let launch_started_at = Utc::now();
+        let delayed_candidate = ToolSessionCandidate {
+            display_id: "delayed-session".to_string(),
+            resume_target: "delayed-session".to_string(),
+            source_ref: "delayed-ref".to_string(),
+            created_at: launch_started_at + Duration::seconds(20),
+            updated_at: launch_started_at + Duration::seconds(20),
+        };
+
+        let selected = select_initial_tool_session(
+            &[],
+            launch_started_at,
+            std::slice::from_ref(&delayed_candidate),
+            Duration::seconds(30),
+        )
+        .expect("should bind candidate created +20s after launch when grace is 30s");
+
+        assert_eq!(selected.display_id, delayed_candidate.display_id);
+        assert_eq!(selected.source_ref, delayed_candidate.source_ref);
+    }
+
+    #[test]
+    fn test_select_initial_tool_session_rebinds_baseline_candidate_updated_within_longer_window() {
+        let launch_started_at = Utc::now();
+        let baseline = vec!["baseline-ref".to_string()];
+        let updated_baseline = ToolSessionCandidate {
+            display_id: "baseline-session".to_string(),
+            resume_target: "baseline-session".to_string(),
+            source_ref: "baseline-ref".to_string(),
+            created_at: launch_started_at - Duration::days(1),
+            updated_at: launch_started_at + Duration::seconds(25),
+        };
+
+        let selected = select_initial_tool_session(
+            &baseline,
+            launch_started_at,
+            std::slice::from_ref(&updated_baseline),
+            Duration::seconds(30),
+        )
+        .expect("should rebind baseline candidate updated +25s after launch when grace is 30s");
+
+        assert_eq!(selected.display_id, updated_baseline.display_id);
+        assert_eq!(selected.source_ref, updated_baseline.source_ref);
     }
 
     #[test]
