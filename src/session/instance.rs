@@ -86,6 +86,29 @@ pub struct SandboxInfo {
     pub custom_instruction: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSession {
+    pub display_id: String,
+    pub resume_target: String,
+    pub source_ref: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolSessionProbeState {
+    Pending,
+    Resolved,
+    Ambiguous,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSessionProbe {
+    pub launch_started_at: DateTime<Utc>,
+    pub baseline_source_refs: Vec<String>,
+    pub state: ToolSessionProbeState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
     pub id: String,
@@ -132,6 +155,9 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_info: Option<TerminalInfo>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_session: Option<ToolSession>,
+
     /// Runtime-only: which profile this instance was loaded from. Not persisted to disk.
     #[serde(default, skip_serializing)]
     pub source_profile: String,
@@ -143,6 +169,8 @@ pub struct Instance {
     pub last_start_time: Option<std::time::Instant>,
     #[serde(skip)]
     pub last_error: Option<String>,
+    #[serde(skip)]
+    pub tool_session_probe: Option<ToolSessionProbe>,
 }
 
 impl Instance {
@@ -166,10 +194,12 @@ impl Instance {
             workspace_info: None,
             sandbox_info: None,
             terminal_info: None,
+            tool_session: None,
             source_profile: String::new(),
             last_error_check: None,
             last_start_time: None,
             last_error: None,
+            tool_session_probe: None,
         }
     }
 
@@ -464,6 +494,25 @@ impl Instance {
         let hooks_enabled = crate::session::config::Config::load()
             .map(|c| c.session.agent_status_hooks)
             .unwrap_or(true);
+        let injected_host_command = if self.is_sandboxed() {
+            None
+        } else {
+            let base_command = if self.command.is_empty() {
+                agent
+                    .map(|a| a.binary.to_string())
+                    .unwrap_or_else(|| self.get_tool_command().to_string())
+            } else {
+                self.command.clone()
+            };
+            crate::session::tool_session::build_start_command(self, &base_command, &self.extra_args)
+        };
+
+        self.tool_session_probe = if injected_host_command.is_some() {
+            None
+        } else {
+            crate::session::tool_session::build_probe(self)
+        };
+
         if hooks_enabled {
             if self.tool == "settl" {
                 // settl uses TOML config, not JSON settings
@@ -571,7 +620,9 @@ impl Instance {
                 String::new()
             };
 
-            if self.command.is_empty() {
+            if let Some(cmd) = injected_host_command {
+                Some(wrap_command_ignore_suspend(&format!("{env_prefix}{cmd}")))
+            } else if self.command.is_empty() {
                 crate::agents::get_agent(&self.tool).map(|a| {
                     let mut cmd = a.binary.to_string();
                     if !self.extra_args.is_empty() {
@@ -1544,5 +1595,39 @@ mod tests {
 
         // Longer names like "opencode" should still match.
         assert!(pane_has_agent_content("OpenCode v1.0", "opencode"));
+    }
+
+    #[test]
+    fn test_instance_tool_session_serialization_roundtrip() {
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool_session = Some(ToolSession {
+            display_id: "session-123".to_string(),
+            resume_target: "session-123".to_string(),
+            source_ref: "source-ref".to_string(),
+            updated_at: Utc::now(),
+        });
+
+        let json = serde_json::to_string(&inst).unwrap();
+        let deserialized: Instance = serde_json::from_str(&json).unwrap();
+
+        let tool_session = deserialized.tool_session.unwrap();
+        assert_eq!(tool_session.display_id, "session-123");
+        assert_eq!(tool_session.resume_target, "session-123");
+        assert_eq!(tool_session.source_ref, "source-ref");
+    }
+
+    #[test]
+    fn test_instance_serialization_skips_tool_session_probe() {
+        let mut inst = Instance::new("Test", "/tmp/test");
+        inst.tool_session_probe = Some(ToolSessionProbe {
+            launch_started_at: Utc::now(),
+            baseline_source_refs: vec!["baseline".to_string()],
+            state: ToolSessionProbeState::Pending,
+        });
+
+        let json = serde_json::to_string(&inst).unwrap();
+
+        assert!(!json.contains("tool_session_probe"));
+        assert!(!json.contains("baseline_source_refs"));
     }
 }
