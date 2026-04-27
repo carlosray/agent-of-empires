@@ -635,11 +635,17 @@ impl HomeView {
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
         if let Some(updates) = self.status_poller.try_recv_updates() {
+            let mut any_change = false;
             for update in updates {
-                self.apply_one_status_update(update);
+                if self.apply_one_status_update(update.clone()) {
+                    any_change = true;
+                }
+                if self.apply_tool_session_update(&update) {
+                    any_change = true;
+                }
             }
             self.pending_status_refresh = false;
-            return true;
+            return any_change;
         }
         false
     }
@@ -648,7 +654,7 @@ impl HomeView {
     /// channel-pulling loop in `apply_status_updates` so tests can drive
     /// the apply path directly without having to push through the
     /// background polling thread.
-    pub(super) fn apply_one_status_update(&mut self, update: StatusUpdate) {
+    pub(super) fn apply_one_status_update(&mut self, update: StatusUpdate) -> bool {
         use crate::session::Status;
 
         let old_status = self.get_instance(&update.id).map(|i| i.status);
@@ -659,7 +665,7 @@ impl HomeView {
                 && update.status != Status::Stopped
         });
         if !should_update {
-            return;
+            return false;
         }
 
         let new_status = update.status;
@@ -679,6 +685,37 @@ impl HomeView {
                 crate::sound::play_for_transition(old, new_status, &self.sound_config);
             }
         }
+
+        true
+    }
+
+    /// Applies a tool_session update from the status poller to the in-memory
+    /// instance, and persists to disk when the resolved tool_session actually
+    /// changed. Returns true iff the tool_session value changed (probe-only
+    /// updates return false and do not trigger a save).
+    pub(crate) fn apply_tool_session_update(
+        &mut self,
+        update: &super::status_poller::StatusUpdate,
+    ) -> bool {
+        if !update.tool_session_changed {
+            return false;
+        }
+        let new_ts = update.tool_session.clone();
+        let new_probe = update.tool_session_probe.clone();
+        let mut changed = false;
+        self.mutate_instance(&update.id, |inst| {
+            if inst.tool_session != new_ts {
+                inst.tool_session = new_ts.clone();
+                changed = true;
+            }
+            inst.tool_session_probe = new_probe.clone();
+        });
+        if changed {
+            if let Err(e) = self.save() {
+                tracing::error!("Failed to save after tool_session update: {e}");
+            }
+        }
+        changed
     }
 
     pub fn apply_deletion_results(&mut self) -> bool {

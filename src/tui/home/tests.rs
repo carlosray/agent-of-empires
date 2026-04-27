@@ -3009,3 +3009,66 @@ fn wants_paste_burst_only_for_paste_aware_dialogs() {
         "burst should re-enable after dialog closes"
     );
 }
+
+#[test]
+#[serial]
+fn test_apply_status_updates_persists_tool_session_to_storage() {
+    use crate::session::Status;
+    use crate::session::ToolSessionProbeState;
+    use crate::session::{ToolSession, ToolSessionProbe};
+    use crate::tui::status_poller::StatusUpdate;
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let mut inst = Instance::new("persist-test", "/tmp/persist-test");
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    let inst_id = inst.id.clone();
+
+    let storage = Storage::new("test").unwrap();
+    storage.save(&[inst]).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+
+    let tool_session = ToolSession {
+        display_id: "sess-abc123".to_string(),
+        resume_target: "sess-abc123".to_string(),
+        source_ref: "ref-xyz".to_string(),
+        updated_at: Utc::now(),
+    };
+
+    let update = StatusUpdate {
+        id: inst_id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: None,
+        tool_session: Some(tool_session.clone()),
+        tool_session_probe: Some(ToolSessionProbe {
+            launch_started_at: Utc::now(),
+            baseline_source_refs: vec!["ref-xyz".to_string()],
+            state: ToolSessionProbeState::Resolved,
+        }),
+        tool_session_changed: true,
+    };
+
+    let changed = view.apply_tool_session_update(&update);
+    assert!(
+        changed,
+        "helper should return true when tool_session actually changed"
+    );
+
+    let storage2 = Storage::new("test").unwrap();
+    let (reloaded, _) = storage2.load_with_groups().unwrap();
+    let persisted = reloaded.iter().find(|i| i.id == inst_id).unwrap();
+    assert_eq!(
+        persisted
+            .tool_session
+            .as_ref()
+            .map(|ts| ts.display_id.as_str()),
+        Some("sess-abc123"),
+        "tool_session should be persisted to disk after apply_tool_session_update"
+    );
+}
