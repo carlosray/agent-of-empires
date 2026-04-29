@@ -457,6 +457,17 @@ fn discover_codex_candidates(project_path: &Path) -> Result<Vec<ToolSessionCandi
     Ok(candidates)
 }
 
+pub(crate) fn project_path_matches(opencode_directory: &str, project_path: &Path) -> bool {
+    let opencode = PathBuf::from(opencode_directory);
+    if opencode == project_path {
+        return true;
+    }
+    let opencode_canon = std::fs::canonicalize(&opencode).unwrap_or(opencode);
+    let project_canon =
+        std::fs::canonicalize(project_path).unwrap_or_else(|_| project_path.to_path_buf());
+    opencode_canon == project_canon
+}
+
 fn discover_opencode_candidates(project_path: &Path) -> Result<Vec<ToolSessionCandidate>> {
     let Some(home) = dirs::home_dir() else {
         return Ok(Vec::new());
@@ -470,10 +481,7 @@ fn discover_opencode_candidates(project_path: &Path) -> Result<Vec<ToolSessionCa
         return Ok(Vec::new());
     }
 
-    let project = project_path.to_string_lossy().replace('\'', "''");
-    let query = format!(
-        "select id, time_created, time_updated from session where directory = '{project}' order by time_updated desc;"
-    );
+    let query = "select id, directory, time_created, time_updated from session order by time_updated desc limit 200;";
     let output = Command::new("sqlite3").arg(&db_path).arg(query).output();
     let Ok(output) = output else {
         return Ok(Vec::new());
@@ -482,10 +490,18 @@ fn discover_opencode_candidates(project_path: &Path) -> Result<Vec<ToolSessionCa
         return Ok(Vec::new());
     }
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_opencode_rows(&stdout, project_path))
+}
+
+fn parse_opencode_rows(stdout: &str, project_path: &Path) -> Vec<ToolSessionCandidate> {
     let mut candidates = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    for line in stdout.lines() {
         let mut parts = line.split('|');
         let Some(id) = parts.next() else {
+            continue;
+        };
+        let Some(directory) = parts.next() else {
             continue;
         };
         let Some(created_at_raw) = parts.next() else {
@@ -494,6 +510,9 @@ fn discover_opencode_candidates(project_path: &Path) -> Result<Vec<ToolSessionCa
         let Some(updated_at_raw) = parts.next() else {
             continue;
         };
+        if !project_path_matches(directory, project_path) {
+            continue;
+        }
         let Some(created_at_ms) = created_at_raw.parse::<i64>().ok() else {
             continue;
         };
@@ -514,8 +533,7 @@ fn discover_opencode_candidates(project_path: &Path) -> Result<Vec<ToolSessionCa
             updated_at,
         });
     }
-
-    Ok(candidates)
+    candidates
 }
 
 fn discover_pi_candidates(project_path: &Path) -> Result<Vec<ToolSessionCandidate>> {
@@ -709,8 +727,9 @@ mod tests {
 
     use super::{
         build_probe, build_start_command, has_explicit_resume_target, inject_resume_args,
-        read_codex_rollout_header, select_initial_tool_session, select_refreshed_tool_session,
-        RefreshDecision, ToolSessionCandidate,
+        parse_opencode_rows, project_path_matches, read_codex_rollout_header,
+        select_initial_tool_session, select_refreshed_tool_session, RefreshDecision,
+        ToolSessionCandidate,
     };
     use crate::session::{
         save_repo_config, Instance, RepoConfig, SandboxInfo, SessionConfigOverride, ToolSession,
@@ -1327,6 +1346,63 @@ mod tests {
 
         assert_eq!(selected.display_id, updated_baseline.display_id);
         assert_eq!(selected.source_ref, updated_baseline.source_ref);
+    }
+
+    #[test]
+    fn test_project_path_matches_canonical_and_raw_forms() {
+        let temp = tempdir().unwrap();
+        let raw = temp.path().to_str().unwrap();
+        assert!(
+            project_path_matches(raw, temp.path()),
+            "raw path should match"
+        );
+        let canon = std::fs::canonicalize(temp.path()).unwrap();
+        assert!(
+            project_path_matches(canon.to_str().unwrap(), temp.path()),
+            "canonicalized path should match"
+        );
+    }
+
+    #[test]
+    fn test_project_path_matches_returns_false_for_unrelated_paths() {
+        let temp_a = tempdir().unwrap();
+        let temp_b = tempdir().unwrap();
+        assert!(
+            !project_path_matches(temp_a.path().to_str().unwrap(), temp_b.path()),
+            "unrelated paths should not match"
+        );
+        assert!(
+            !project_path_matches("/no/such/path", temp_a.path()),
+            "non-existent path should not match a different real path"
+        );
+    }
+
+    #[test]
+    fn test_parse_opencode_rows_filters_by_project_path_and_handles_tmp_vs_private_tmp() {
+        let temp = tempdir().unwrap();
+        let project_path = temp.path();
+        let project_str = project_path.to_str().unwrap();
+
+        let ts_created = 1_700_000_000_000i64;
+        let ts_updated = 1_700_000_001_000i64;
+
+        let stdout = format!(
+            "ses_aaa|{project_str}|{ts_created}|{ts_updated}\nses_bbb|/unrelated/path|{ts_created}|{ts_updated}\n"
+        );
+        let rows = parse_opencode_rows(&stdout, project_path);
+        assert_eq!(
+            rows.len(),
+            1,
+            "only the row for the project path should match"
+        );
+        assert_eq!(rows[0].display_id, "ses_aaa");
+
+        let bad_stdout = format!("ses_ccc|/unrelated|{ts_created}|{ts_updated}\n");
+        let no_rows = parse_opencode_rows(&bad_stdout, project_path);
+        assert!(
+            no_rows.is_empty(),
+            "unrelated directory row should be excluded"
+        );
     }
 
     #[test]
