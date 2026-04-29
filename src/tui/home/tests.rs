@@ -2702,3 +2702,120 @@ fn test_apply_status_updates_persists_tool_session_to_storage() {
         "tool_session should be persisted to disk after apply_tool_session_update"
     );
 }
+
+#[test]
+#[serial]
+fn test_backfill_tool_sessions_is_noop_for_session_with_existing_mapping() {
+    use crate::session::{save_repo_config, RepoConfig, SessionConfigOverride, ToolSession};
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let project_path = temp.path().join("proj");
+    std::fs::create_dir_all(&project_path).unwrap();
+
+    // Enable tracking via repo config so is_eligible returns true.
+    save_repo_config(
+        &project_path,
+        &RepoConfig {
+            session: Some(SessionConfigOverride {
+                tool_session_tracking: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut inst = Instance::new("already-mapped", project_path.to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    inst.tool_session = Some(ToolSession {
+        display_id: "existing-session".to_string(),
+        resume_target: "existing-session".to_string(),
+        source_ref: "existing-ref".to_string(),
+        updated_at: Utc::now(),
+    });
+
+    let storage = Storage::new("test").unwrap();
+    storage.save(&[inst]).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+
+    let result = view.backfill_tool_sessions().unwrap();
+    assert!(
+        !result,
+        "backfill should return false when all instances already have a tool_session"
+    );
+}
+
+#[test]
+#[serial]
+fn test_backfill_tool_sessions_is_noop_when_tracking_disabled() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let project_path = temp.path().join("proj");
+    std::fs::create_dir_all(&project_path).unwrap();
+
+    // Tracking is disabled by default (no repo config written).
+    let mut inst = Instance::new("no-tracking", project_path.to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    // tool_session is None, so it would be a candidate if eligible.
+
+    let storage = Storage::new("test").unwrap();
+    storage.save(&[inst]).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+
+    let result = view.backfill_tool_sessions().unwrap();
+    assert!(
+        !result,
+        "backfill should return false when tracking is disabled (is_eligible returns false)"
+    );
+}
+
+#[test]
+#[serial]
+fn test_backfill_tool_sessions_is_noop_for_unsupported_tool() {
+    use crate::session::{save_repo_config, RepoConfig, SessionConfigOverride};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let project_path = temp.path().join("proj");
+    std::fs::create_dir_all(&project_path).unwrap();
+
+    // Enable tracking, but use an unsupported tool.
+    save_repo_config(
+        &project_path,
+        &RepoConfig {
+            session: Some(SessionConfigOverride {
+                tool_session_tracking: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let mut inst = Instance::new("vibe-session", project_path.to_str().unwrap());
+    inst.tool = "vibe".to_string();
+    inst.source_profile = "test".to_string();
+
+    let storage = Storage::new("test").unwrap();
+    storage.save(&[inst]).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+
+    let result = view.backfill_tool_sessions().unwrap();
+    assert!(
+        !result,
+        "backfill should return false for unsupported tools (is_eligible returns false)"
+    );
+}

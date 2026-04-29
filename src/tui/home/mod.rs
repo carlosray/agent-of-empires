@@ -393,6 +393,7 @@ impl HomeView {
 
         view.flat_items = view.build_flat_items();
         view.update_selected();
+        let _ = view.backfill_tool_sessions();
         Ok(view)
     }
 
@@ -471,6 +472,7 @@ impl HomeView {
         }
 
         self.update_selected();
+        let _ = self.backfill_tool_sessions();
         Ok(())
     }
 
@@ -1310,5 +1312,49 @@ impl HomeView {
         size: Option<(u16, u16)>,
     ) -> anyhow::Result<()> {
         self.try_mutate_instance(id, |inst| inst.start_container_terminal_with_size(size))
+    }
+
+    /// Attempt to fill in `tool_session` for instances that pre-date the
+    /// feature. Only instances where `tool_session::is_eligible` returns true
+    /// and `tool_session` is `None` are candidates. Per-instance errors are
+    /// suppressed; the method is best-effort. Returns `true` iff at least one
+    /// instance was updated and persisted.
+    pub fn backfill_tool_sessions(&mut self) -> anyhow::Result<bool> {
+        use crate::session::tool_session;
+
+        let target_ids: Vec<String> = self
+            .instances
+            .iter()
+            .filter(|inst| tool_session::is_eligible(inst) && inst.tool_session.is_none())
+            .map(|inst| inst.id.clone())
+            .collect();
+
+        let mut any_changed = false;
+        for id in target_ids {
+            let id_for_log = id.clone();
+            let mut did_change = false;
+            let result = self.try_mutate_instance(&id, |inst| match tool_session::refresh(inst) {
+                Ok(Some(change)) => {
+                    inst.tool_session = change.tool_session;
+                    inst.tool_session_probe = change.tool_session_probe;
+                    did_change = true;
+                    Ok(())
+                }
+                Ok(None) => Ok(()),
+                Err(e) => {
+                    tracing::debug!("backfill refresh failed for {id_for_log}: {e}");
+                    Ok(())
+                }
+            });
+            if let Err(e) = result {
+                tracing::debug!("backfill mutate failed for {id}: {e}");
+            }
+            any_changed |= did_change;
+        }
+
+        if any_changed {
+            self.save()?;
+        }
+        Ok(any_changed)
     }
 }
