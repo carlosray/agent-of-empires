@@ -1406,6 +1406,36 @@ mod tests {
     }
 
     #[test]
+    fn test_build_start_command_injects_resume_target_for_each_supported_tool() {
+        let temp = tempdir().unwrap();
+        write_tracking_repo_config(temp.path(), true);
+
+        for (tool, extra, expected) in [
+            ("claude", "", "claude --resume resume-123"),
+            ("codex", "", "codex resume resume-123"),
+            ("opencode", "", "opencode --session resume-123"),
+            ("pi", "", "pi --resume --session resume-123"),
+            (
+                "claude",
+                "--model opus",
+                "claude --resume resume-123 --model opus",
+            ),
+            (
+                "codex",
+                "--model gpt-5",
+                "codex resume resume-123 --model gpt-5",
+            ),
+        ] {
+            let instance = tracked_instance(temp.path(), tool);
+            assert_eq!(
+                build_start_command(&instance, tool, extra),
+                Some(expected.to_string()),
+                "{tool} restart should inject resume target",
+            );
+        }
+    }
+
+    #[test]
     #[ignore = "live test that starts real codex/claude/opencode/pi sessions"]
     #[serial]
     fn live_resolves_supported_tool_sessions() -> Result<()> {
