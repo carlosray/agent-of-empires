@@ -1066,6 +1066,11 @@ mod tests {
 
     fn live_resolution_result(tool: &str) -> Result<String> {
         let project_path = std::env::current_dir()?;
+
+        // Enable tool session tracking in the repo config so is_eligible() returns true.
+        // The .agent-of-empires/ directory is gitignored; we clean up after the test.
+        write_tracking_repo_config(&project_path, true);
+
         let mut instance = Instance::new(
             &format!("live-tool-session-{tool}-{}", std::process::id()),
             project_path.to_str().unwrap(),
@@ -1076,11 +1081,16 @@ mod tests {
         instance.start_with_size_opts(Some((120, 40)), false)?;
 
         let result = (|| -> Result<String> {
-            for _ in 0..30 {
+            let mut probe_sent = false;
+            for iter in 0..120 {
                 if let Ok(session) = instance.tmux_session() {
                     if let Ok(pane) = session.capture_pane(20) {
                         if pane.contains("Do you trust the contents of this directory?") {
                             let _ = session.send_keys("Enter");
+                        } else if !probe_sent && iter > 6 {
+                            let _ = session.send_keys("hi");
+                            let _ = session.send_keys("Enter");
+                            probe_sent = true;
                         }
                     }
                 }
@@ -1161,6 +1171,10 @@ mod tests {
         })();
 
         let _ = instance.stop();
+        // Remove the tracking repo config written above. Ignore errors; the file
+        // is gitignored and the directory may already be absent.
+        let repo_config_path = project_path.join(".agent-of-empires").join("config.toml");
+        let _ = std::fs::remove_file(&repo_config_path);
         result
     }
 
@@ -1447,6 +1461,8 @@ mod tests {
                         !display_id.is_empty(),
                         "resolved display_id for {tool} should not be empty"
                     );
+                    // Restore-roundtrip contract: a future restart would re-inject this id.
+                    // We do not actually restart the instance here to avoid real API calls.
                     eprintln!("{tool}: resolved {display_id}");
                 }
                 Err(error) => failures.push(format!("{tool}: {error:#}")),
