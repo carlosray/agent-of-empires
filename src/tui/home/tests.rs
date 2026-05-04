@@ -2801,6 +2801,9 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: Some(now),
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -2827,6 +2830,9 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: Some(stop_time),
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
     });
     assert_eq!(
         env.view.get_instance(&id).unwrap().idle_entered_at,
@@ -2842,6 +2848,9 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         status: Status::Running,
         last_error: None,
         idle_entered_at: None,
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
     });
 
     let inst = env.view.get_instance(&id).unwrap();
@@ -2874,6 +2883,9 @@ fn apply_status_update_skips_terminal_states() {
         status: Status::Idle,
         last_error: None,
         idle_entered_at: Some(stale_ts),
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
     });
 
     // Status and timestamp should both stay untouched.

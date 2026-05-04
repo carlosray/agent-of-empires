@@ -113,6 +113,7 @@ In the TUI, press `?` for help. The bottom information bar shows all available k
 - **[Agent Command Overrides](https://www.agent-of-empires.com/guides/agent-override/)**: custom scripts or sandboxed wrappers per agent
 - **[tmux Status Bar](https://www.agent-of-empires.com/guides/tmux-status-bar/)**: integrated session monitoring
 - **[Sound Effects](https://www.agent-of-empires.com/docs/sounds/)**: audible agent status notifications
+- **[Fork Features](https://www.agent-of-empires.com/docs/fork-features/)**: fork-only behavior carried on top of upstream AoE
 - **[Configuration Reference](https://www.agent-of-empires.com/docs/guides/configuration/)**: all config options
 - **[CLI Reference](https://www.agent-of-empires.com/docs/cli/reference/)**: complete command documentation
 - **[HTTP API Reference](https://www.agent-of-empires.com/docs/api/)**: REST endpoints for external orchestrators

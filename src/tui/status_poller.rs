@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::session::{Instance, Status};
+use crate::session::{Instance, Status, ToolSession, ToolSessionProbe};
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
 const TIER_HOT: u64 = 1;
@@ -37,7 +37,7 @@ fn polling_tier(status: Status) -> u64 {
 }
 
 /// Result of a status check for a single session
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct StatusUpdate {
     pub id: String,
     pub status: Status,
@@ -48,6 +48,9 @@ pub struct StatusUpdate {
     /// wrapper's timestamp write lives only on the polling clone and is
     /// lost when we project the result back into a `StatusUpdate`.
     pub idle_entered_at: Option<DateTime<Utc>>,
+    pub tool_session: Option<ToolSession>,
+    pub tool_session_probe: Option<ToolSessionProbe>,
+    pub tool_session_changed: bool,
 }
 
 /// Background thread that polls session status without blocking the UI
@@ -157,6 +160,9 @@ impl StatusPoller {
                                         status: Status::Error,
                                         last_error: Some("Container is not running".to_string()),
                                         idle_entered_at: None,
+                                        tool_session: None,
+                                        tool_session_probe: None,
+                                        tool_session_changed: false,
                                     });
                                 }
                             }
@@ -169,11 +175,21 @@ impl StatusPoller {
 
                     inst.update_status_with_metadata(metadata);
 
+                    let tool_session_change =
+                        crate::session::tool_session::refresh(&inst).ok().flatten();
+
                     Some(StatusUpdate {
                         id: inst.id,
                         status: inst.status,
                         last_error: inst.last_error,
                         idle_entered_at: inst.idle_entered_at,
+                        tool_session: tool_session_change
+                            .as_ref()
+                            .and_then(|change| change.tool_session.clone()),
+                        tool_session_probe: tool_session_change
+                            .as_ref()
+                            .and_then(|change| change.tool_session_probe.clone()),
+                        tool_session_changed: tool_session_change.is_some(),
                     })
                 })
                 .collect();
@@ -220,6 +236,9 @@ mod tests {
             status: Status::Idle,
             last_error: None,
             idle_entered_at: Some(ts),
+            tool_session: None,
+            tool_session_probe: None,
+            tool_session_changed: false,
         };
         assert_eq!(update.idle_entered_at, Some(ts));
     }

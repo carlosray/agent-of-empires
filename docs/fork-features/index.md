@@ -11,6 +11,7 @@ Treat it as the fork changelog for product behavior:
 ## Current Fork-Only Changes
 
 - [Git branch labels for all git sessions](git-branch-display.md)
+- [Tool session tracking and restore](tool-session-tracking.md)
 - [Terminal tab titles on attach](terminal-tab-title.md)
 
 ## How To Extend This Section

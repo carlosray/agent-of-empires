@@ -701,6 +701,11 @@ impl SettingsView {
                     s.agent_status_hooks = None;
                 }
             }
+            FieldKey::ToolSessionTracking => {
+                if let Some(ref mut s) = config.session {
+                    s.tool_session_tracking = None;
+                }
+            }
             FieldKey::DefaultTerminalMode => {
                 if let Some(ref mut s) = config.sandbox {
                     s.default_terminal_mode = None;

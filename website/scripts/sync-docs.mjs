@@ -182,6 +182,13 @@ const PAGES = [
       "Show persisted git branch labels in the TUI for any git-backed session, not only worktrees.",
   },
   {
+    source: "docs/fork-features/tool-session-tracking.md",
+    dest: "docs/fork-features/tool-session-tracking.md",
+    title: "Tool Session Tracking and Restore",
+    description:
+      "Opt-in tracking of underlying agent sessions so AoE can show the current tool session ID and reuse it when restoring tmux.",
+  },
+  {
     source: "docs/fork-features/terminal-tab-title.md",
     dest: "docs/fork-features/terminal-tab-title.md",
     title: "Terminal Tab Titles on Attach",
@@ -206,6 +213,7 @@ const URL_MAP = {
   "docs/api.md": "/docs/api/",
   "docs/fork-features/index.md": "/docs/fork-features/",
   "docs/fork-features/git-branch-display.md": "/docs/fork-features/git-branch-display/",
+  "docs/fork-features/tool-session-tracking.md": "/docs/fork-features/tool-session-tracking/",
   "docs/fork-features/terminal-tab-title.md": "/docs/fork-features/terminal-tab-title/",
   // Guides
   "docs/guides/diff-view.md": "/guides/diff-view/",

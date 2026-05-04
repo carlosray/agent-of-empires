@@ -58,6 +58,7 @@ name = "empire"   # empire, phosphor, tokyo-night-storm, catppuccin-latte, dracu
 default_tool = "claude"   # any supported agent name
 yolo_mode_default = false
 agent_status_hooks = true
+tool_session_tracking = false
 ```
 
 | Option | Default | Description |
@@ -65,6 +66,7 @@ agent_status_hooks = true
 | `default_tool` | (auto-detect) | Default agent for new sessions. Falls back to the first available tool if unset or unavailable. Can be set to a custom agent name. |
 | `yolo_mode_default` | `false` | Enable YOLO mode by default for new sessions (skip permission prompts). Works with or without sandbox. |
 | `agent_status_hooks` | `true` | Install status-detection hooks into the agent's settings file. When disabled, status detection falls back to tmux pane content parsing. |
+| `tool_session_tracking` | `false` | Track the current underlying tool session for supported host-run agents and reuse it when AoE restores tmux. Disabled by default and available in the settings TUI. |
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |

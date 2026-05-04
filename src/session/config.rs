@@ -436,6 +436,10 @@ pub struct SessionConfig {
     #[serde(default = "default_true")]
     pub agent_status_hooks: bool,
 
+    /// Track underlying tool sessions for supported agents and reuse them on restore.
+    #[serde(default)]
+    pub tool_session_tracking: bool,
+
     /// User-defined custom agents: name -> launch command
     /// (e.g., "lenovo-claude" = "ssh -t lenovo claude").
     /// Custom agent names appear in the TUI agent picker alongside built-in agents.
@@ -1692,6 +1696,23 @@ mod tests {
             Some(&"--port 8080".to_string()),
             "agent_extra_args should survive roundtrip"
         );
+    }
+
+    #[test]
+    fn test_session_config_tool_session_tracking_default_false() {
+        let config = Config::default();
+        assert!(!config.session.tool_session_tracking);
+    }
+
+    #[test]
+    fn test_session_config_tool_session_tracking_roundtrip() {
+        let mut config = Config::default();
+        config.session.tool_session_tracking = true;
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let deserialized: Config = toml::from_str(&serialized).unwrap();
+
+        assert!(deserialized.session.tool_session_tracking);
     }
 
     #[test]

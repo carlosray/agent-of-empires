@@ -164,7 +164,11 @@ impl Preview {
         }
 
         // 3 base lines (profile+tool / path / status) + optional sandbox + optional worktree block
-        let base = 3;
+        let tool_session_lines = usize::from(
+            crate::session::tool_session::tracking_enabled(instance)
+                && instance.tool_session.is_some(),
+        );
+        let base = 3 + tool_session_lines;
         let sandbox_lines = usize::from(instance.is_sandboxed());
         let branch_lines = usize::from(show_branch_in_tui && instance.display_branch.is_some());
         let info_height = if let Some(wt) = instance.worktree_info.as_ref() {
@@ -265,6 +269,14 @@ impl Preview {
                 info_lines.push(Line::from(vec![
                     Span::styled("Sandbox: ", Style::default().fg(theme.dimmed)),
                     Span::styled(&sandbox.container_name, Style::default().fg(theme.sandbox)),
+                ]));
+            }
+        }
+        if crate::session::tool_session::tracking_enabled(instance) {
+            if let Some(tool_session) = &instance.tool_session {
+                info_lines.push(Line::from(vec![
+                    Span::styled("Session ID: ", Style::default().fg(theme.dimmed)),
+                    Span::styled(&tool_session.display_id, Style::default().fg(theme.text)),
                 ]));
             }
         }

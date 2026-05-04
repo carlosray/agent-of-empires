@@ -234,6 +234,9 @@ pub struct SessionConfigOverride {
     pub agent_status_hooks: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_session_tracking: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,6 +448,9 @@ pub fn apply_session_overrides(
     }
     if let Some(agent_status_hooks) = source.agent_status_hooks {
         target.agent_status_hooks = agent_status_hooks;
+    }
+    if let Some(tool_session_tracking) = source.tool_session_tracking {
+        target.tool_session_tracking = tool_session_tracking;
     }
     if let Some(ref custom_agents) = source.custom_agents {
         target.custom_agents = custom_agents.clone();
@@ -706,6 +712,34 @@ mod tests {
         // notify_in_cli should retain global default since not overridden
         assert!(merged.updates.notify_in_cli);
         assert!(merged.worktree.enabled);
+    }
+
+    #[test]
+    fn test_apply_session_overrides_tool_session_tracking() {
+        let mut target = crate::session::SessionConfig::default();
+        let source = SessionConfigOverride {
+            tool_session_tracking: Some(true),
+            ..Default::default()
+        };
+
+        apply_session_overrides(&mut target, &source);
+
+        assert!(target.tool_session_tracking);
+    }
+
+    #[test]
+    fn test_merge_configs_applies_tool_session_tracking_override() {
+        let global = Config::default();
+        let profile = ProfileConfig {
+            session: Some(SessionConfigOverride {
+                tool_session_tracking: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert!(merged.session.tool_session_tracking);
     }
 
     #[test]

@@ -39,6 +39,7 @@ export const docsNav: NavSection[] = [
     items: [
       { title: "Overview", href: "/docs/fork-features/" },
       { title: "Git Branch Labels", href: "/docs/fork-features/git-branch-display/" },
+      { title: "Tool Session Tracking", href: "/docs/fork-features/tool-session-tracking/" },
       { title: "Terminal Tab Titles", href: "/docs/fork-features/terminal-tab-title/" },
     ],
   },
