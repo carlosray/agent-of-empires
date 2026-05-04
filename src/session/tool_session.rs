@@ -1420,6 +1420,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_build_start_command_injects_resume_target_for_each_supported_tool() {
         let temp = tempdir().unwrap();
         write_tracking_repo_config(temp.path(), true);
