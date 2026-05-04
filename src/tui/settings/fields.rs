@@ -81,6 +81,7 @@ pub enum FieldKey {
     AgentExtraArgs,
     AgentCommandOverride,
     AgentStatusHooks,
+    ToolSessionTracking,
     CustomAgents,
     AgentDetectAs,
     // Sound
@@ -893,6 +894,12 @@ fn build_session_fields(
         session.and_then(|s| s.agent_status_hooks),
     );
 
+    let (tool_session_tracking, tool_session_tracking_override) = resolve_value(
+        scope,
+        global.session.tool_session_tracking,
+        session.and_then(|s| s.tool_session_tracking),
+    );
+
     // Agent extra args: HashMap -> Vec<String> of "key=value" items for List field
     let (extra_args_map, extra_args_override) = resolve_value(
         scope,
@@ -1088,6 +1095,19 @@ fn build_session_fields(
             inherited_display: inherited_if(
                 status_hooks_override,
                 FieldValue::Bool(global.session.agent_status_hooks),
+            ),
+        },
+        SettingField {
+            key: FieldKey::ToolSessionTracking,
+            label: "Tool Session Tracking",
+            description:
+                "Track underlying tool sessions and auto-resume them when tmux is restored",
+            value: FieldValue::Bool(tool_session_tracking),
+            category: SettingsCategory::Session,
+            has_override: tool_session_tracking_override,
+            inherited_display: inherited_if(
+                tool_session_tracking_override,
+                FieldValue::Bool(global.session.tool_session_tracking),
             ),
         },
     ]
@@ -1378,6 +1398,9 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             config.session.agent_status_hooks = *v;
         }
+        (FieldKey::ToolSessionTracking, FieldValue::Bool(v)) => {
+            config.session.tool_session_tracking = *v;
+        }
         (FieldKey::DefaultImage, FieldValue::Text(v)) => config.sandbox.default_image = v.clone(),
         (FieldKey::Environment, FieldValue::List(v)) => config.sandbox.environment = v.clone(),
         (FieldKey::ExtraVolumes, FieldValue::List(v)) => config.sandbox.extra_volumes = v.clone(),
@@ -1655,6 +1678,11 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| {
                 s.agent_status_hooks = val;
+            });
+        }
+        (FieldKey::ToolSessionTracking, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.session, |s, val| {
+                s.tool_session_tracking = val;
             });
         }
         (FieldKey::AgentExtraArgs, FieldValue::List(v)) => {
@@ -2055,6 +2083,51 @@ mod tests {
                 .as_ref()
                 .and_then(|t| t.dashboard_tab_title.as_deref()),
             Some("Empire")
+        );
+    }
+
+    #[test]
+    fn test_session_settings_include_tool_session_tracking() {
+        let global = Config::default();
+        let profile = ProfileConfig::default();
+
+        let fields = build_fields_for_category(
+            SettingsCategory::Session,
+            SettingsScope::Global,
+            &global,
+            &profile,
+        );
+
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.key == FieldKey::ToolSessionTracking),
+            "Session settings should include the tool session tracking toggle"
+        );
+    }
+
+    #[test]
+    fn test_apply_tool_session_tracking_profile_override() {
+        let global = Config::default();
+        let mut profile = ProfileConfig::default();
+        let field = SettingField {
+            key: FieldKey::ToolSessionTracking,
+            label: "Tool Session Tracking",
+            description: "",
+            value: FieldValue::Bool(true),
+            category: SettingsCategory::Session,
+            has_override: false,
+            inherited_display: None,
+        };
+
+        apply_field_to_profile(&field, &global, &mut profile);
+
+        assert_eq!(
+            profile
+                .session
+                .as_ref()
+                .and_then(|session| session.tool_session_tracking),
+            Some(true)
         );
     }
 }

@@ -118,7 +118,11 @@ impl Preview {
         theme: &Theme,
         show_branch_in_tui: bool,
     ) {
-        let base = 3;
+        let tool_session_lines = usize::from(
+            crate::session::tool_session::tracking_enabled(instance)
+                && instance.tool_session.is_some(),
+        );
+        let base = 3 + tool_session_lines;
         let sandbox_lines = usize::from(instance.is_sandboxed());
         let branch_lines = usize::from(show_branch_in_tui && instance.display_branch.is_some());
         let section_lines = if instance.worktree_info.is_some() {
@@ -128,7 +132,7 @@ impl Preview {
         } else {
             0
         };
-        let info_height = base + sandbox_lines as u16 + section_lines as u16;
+        let info_height = (base + sandbox_lines + section_lines) as u16;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -200,6 +204,14 @@ impl Preview {
                 info_lines.push(Line::from(vec![
                     Span::styled("Sandbox: ", Style::default().fg(theme.dimmed)),
                     Span::styled(&sandbox.container_name, Style::default().fg(theme.sandbox)),
+                ]));
+            }
+        }
+        if crate::session::tool_session::tracking_enabled(instance) {
+            if let Some(tool_session) = &instance.tool_session {
+                info_lines.push(Line::from(vec![
+                    Span::styled("Session ID: ", Style::default().fg(theme.dimmed)),
+                    Span::styled(&tool_session.display_id, Style::default().fg(theme.text)),
                 ]));
             }
         }

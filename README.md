@@ -92,6 +92,7 @@ In the TUI, press `?` for help. The bottom information bar shows all available k
 - **[Diff View](https://www.agent-of-empires.com/guides/diff-view/)**: review and edit changes in the TUI
 - **[tmux Status Bar](https://www.agent-of-empires.com/guides/tmux-status-bar/)**: integrated session monitoring
 - **[Sound Effects](https://www.agent-of-empires.com/docs/sounds/)**: audible agent status notifications
+- **[Fork Features](https://www.agent-of-empires.com/docs/fork-features/)**: fork-only behavior carried on top of upstream AoE
 - **[Configuration Reference](https://www.agent-of-empires.com/docs/guides/configuration/)**: all config options
 - **[CLI Reference](https://www.agent-of-empires.com/docs/cli/reference/)**: complete command documentation
 - **[Development](https://www.agent-of-empires.com/docs/development/)**: contributing and local setup

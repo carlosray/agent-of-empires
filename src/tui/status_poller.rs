@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::session::{Instance, Status};
+use crate::session::{Instance, Status, ToolSession, ToolSessionProbe};
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
 const TIER_HOT: u64 = 1;
@@ -40,6 +40,9 @@ pub struct StatusUpdate {
     pub id: String,
     pub status: Status,
     pub last_error: Option<String>,
+    pub tool_session: Option<ToolSession>,
+    pub tool_session_probe: Option<ToolSessionProbe>,
+    pub tool_session_changed: bool,
 }
 
 /// Background thread that polls session status without blocking the UI
@@ -148,6 +151,9 @@ impl StatusPoller {
                                         id: inst.id,
                                         status: Status::Error,
                                         last_error: Some("Container is not running".to_string()),
+                                        tool_session: None,
+                                        tool_session_probe: None,
+                                        tool_session_changed: false,
                                     });
                                 }
                             }
@@ -160,10 +166,20 @@ impl StatusPoller {
 
                     inst.update_status_with_metadata(metadata);
 
+                    let tool_session_change =
+                        crate::session::tool_session::refresh(&inst).ok().flatten();
+
                     Some(StatusUpdate {
                         id: inst.id,
                         status: inst.status,
                         last_error: inst.last_error,
+                        tool_session: tool_session_change
+                            .as_ref()
+                            .and_then(|change| change.tool_session.clone()),
+                        tool_session_probe: tool_session_change
+                            .as_ref()
+                            .and_then(|change| change.tool_session_probe.clone()),
+                        tool_session_changed: tool_session_change.is_some(),
                     })
                 })
                 .collect();

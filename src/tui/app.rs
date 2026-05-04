@@ -31,6 +31,24 @@ fn tmux_config_for_instance(instance: &crate::session::Instance) -> crate::sessi
     };
     crate::terminal::resolved_tmux_config(profile, std::path::Path::new(&instance.project_path))
 }
+
+fn restore_runtime_session_state(
+    current: &mut crate::session::Instance,
+    previous: &crate::session::Instance,
+) {
+    current.tool_session_probe = previous.tool_session_probe.clone();
+}
+
+fn refresh_tool_session_state(current: &mut crate::session::Instance) -> anyhow::Result<bool> {
+    let Some(change) = crate::session::tool_session::refresh(current)? else {
+        return Ok(false);
+    };
+
+    current.tool_session = change.tool_session;
+    current.tool_session_probe = change.tool_session_probe;
+    Ok(true)
+}
+
 pub struct App {
     home: HomeView,
     should_quit: bool,
@@ -627,9 +645,28 @@ impl App {
             );
         }
 
+        let runtime_state_before_reload = self.home.get_instance(session_id).cloned();
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();
         self.home.reload()?;
+        if let Some(previous) = runtime_state_before_reload.as_ref() {
+            self.home.try_mutate_instance(session_id, |current| {
+                restore_runtime_session_state(current, previous);
+                Ok(())
+            })?;
+        }
+        let tool_session_changed = {
+            let mut changed = false;
+            self.home.try_mutate_instance(session_id, |current| {
+                changed = refresh_tool_session_state(current)?;
+                Ok(())
+            })?;
+            changed
+        };
+        if tool_session_changed {
+            self.home.save()?;
+        }
+        self.home.request_status_refresh();
         self.home.select_session_by_id(session_id);
 
         if let Err(e) = attach_result {
@@ -796,6 +833,8 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{Instance, ToolSessionProbe, ToolSessionProbeState};
+    use chrono::Utc;
 
     #[test]
     fn test_action_enum() {
@@ -886,5 +925,34 @@ mod tests {
         assert!(info.is_some()); // But existing info is preserved
         assert_eq!(info.as_ref().unwrap().latest_version, "0.5.0");
         assert!(rx_out.is_none());
+    }
+
+    #[test]
+    fn test_restore_runtime_session_state_preserves_tool_session_probe() {
+        let mut current = Instance::new("Current", "/tmp/current");
+        let mut previous = Instance::new("Previous", "/tmp/previous");
+        let probe = ToolSessionProbe {
+            launch_started_at: Utc::now(),
+            baseline_source_refs: vec!["rollout-a".to_string()],
+            state: ToolSessionProbeState::Pending,
+        };
+        previous.tool_session_probe = Some(probe.clone());
+
+        restore_runtime_session_state(&mut current, &previous);
+
+        let restored = current
+            .tool_session_probe
+            .expect("probe should be restored");
+        assert_eq!(restored.baseline_source_refs, probe.baseline_source_refs);
+        assert_eq!(restored.state, probe.state);
+    }
+
+    #[test]
+    fn test_refresh_tool_session_state_returns_false_without_change() {
+        let mut current = Instance::new("Current", "/tmp/current");
+        current.tool = "vibe".to_string();
+
+        assert!(!refresh_tool_session_state(&mut current).unwrap());
+        assert!(current.tool_session.is_none());
     }
 }

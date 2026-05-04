@@ -11,6 +11,7 @@ pub mod profile_config;
 pub mod repo_config;
 pub(crate) mod serde_helpers;
 mod storage;
+pub(crate) mod tool_session;
 
 pub use crate::sound::{SoundConfig, SoundConfigOverride};
 pub use config::{
@@ -22,7 +23,8 @@ pub(crate) use environment::user_shell;
 pub use environment::validate_env_entry;
 pub use groups::{flatten_tree, flatten_tree_all_profiles, Group, GroupTree, Item};
 pub use instance::{
-    Instance, SandboxInfo, Status, TerminalInfo, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    Instance, SandboxInfo, Status, TerminalInfo, ToolSession, ToolSessionProbe,
+    ToolSessionProbeState, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, save_profile_config,
