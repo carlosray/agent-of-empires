@@ -30,7 +30,6 @@ pub struct ToolSessionCandidate {
 pub enum RefreshDecision {
     Keep,
     Update(ToolSessionCandidate),
-    Clear,
 }
 
 #[derive(Debug, Clone)]
@@ -212,22 +211,6 @@ pub fn refresh(instance: &Instance) -> Result<Option<ToolSessionStateChange>> {
                     state: ToolSessionProbeState::Resolved,
                 }),
             })),
-            RefreshDecision::Clear => Ok(Some(ToolSessionStateChange {
-                tool_session: None,
-                tool_session_probe: Some(ToolSessionProbe {
-                    launch_started_at: instance
-                        .tool_session_probe
-                        .as_ref()
-                        .map(|probe| probe.launch_started_at)
-                        .unwrap_or_else(Utc::now),
-                    baseline_source_refs: instance
-                        .tool_session_probe
-                        .as_ref()
-                        .map(|probe| probe.baseline_source_refs.clone())
-                        .unwrap_or_default(),
-                    state: ToolSessionProbeState::Ambiguous,
-                }),
-            })),
         }
     } else if let Some(probe) = &instance.tool_session_probe {
         match probe.state {
@@ -337,9 +320,14 @@ pub fn select_refreshed_tool_session(
         .collect();
     successors.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
 
+    // Never spontaneously clear: an absent source_ref or ambiguous successor
+    // set is far more likely to mean "the discovery snapshot truncated or the
+    // file briefly closed" than "the session is dead". Keep the last-known
+    // mapping until a single clear successor or a PID anchor produces an
+    // authoritative update.
     match successors.len() {
         1 => RefreshDecision::Update(successors.remove(0)),
-        _ => RefreshDecision::Clear,
+        _ => RefreshDecision::Keep,
     }
 }
 
@@ -481,7 +469,21 @@ fn discover_opencode_candidates(project_path: &Path) -> Result<Vec<ToolSessionCa
         return Ok(Vec::new());
     }
 
-    let query = "select id, directory, time_created, time_updated from session order by time_updated desc limit 200;";
+    let mut directories = vec![project_path.to_string_lossy().to_string()];
+    if let Ok(canonical) = std::fs::canonicalize(project_path) {
+        let canonical = canonical.to_string_lossy().to_string();
+        if !directories.contains(&canonical) {
+            directories.push(canonical);
+        }
+    }
+    let in_clause = directories
+        .iter()
+        .map(|d| format!("'{}'", d.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let query = format!(
+        "select id, directory, time_created, time_updated from session where directory in ({in_clause}) order by time_updated desc;"
+    );
     let output = Command::new("sqlite3").arg(&db_path).arg(query).output();
     let Ok(output) = output else {
         return Ok(Vec::new());
@@ -891,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_refreshed_tool_session_clears_when_multiple_successors_exist() {
+    fn test_select_refreshed_tool_session_keeps_current_when_multiple_successors_exist() {
         let now = Utc::now();
         let current = ToolSessionCandidate {
             display_id: "current".to_string(),
@@ -919,7 +921,8 @@ mod tests {
 
         assert_eq!(
             select_refreshed_tool_session(&current, &candidates),
-            RefreshDecision::Clear
+            RefreshDecision::Keep,
+            "ambiguous successors should keep the existing mapping rather than clear it"
         );
     }
 

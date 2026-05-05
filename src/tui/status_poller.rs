@@ -27,6 +27,13 @@ const TIER_HOT: u64 = 1;
 const TIER_WARM: u64 = 5;
 const TIER_COLD: u64 = 60;
 
+/// Re-run `tool_session::refresh` only every Nth poll cycle for instances that
+/// already have a resolved `tool_session`. Refresh is a heavy operation
+/// (subprocess fanout via `lsof`/`sqlite3`); per-cycle invocation across many
+/// sessions blocks the UI. Sessions without a resolved mapping still refresh
+/// every cycle so the initial bind happens promptly.
+const TOOL_SESSION_REFRESH_EVERY: u64 = 12;
+
 fn polling_tier(status: Status) -> u64 {
     match status {
         Status::Running | Status::Waiting | Status::Starting => TIER_HOT,
@@ -175,8 +182,25 @@ impl StatusPoller {
 
                     inst.update_status_with_metadata(metadata);
 
-                    let tool_session_change =
-                        crate::session::tool_session::refresh(&inst).ok().flatten();
+                    // Run tool_session refresh on a slower cadence than the
+                    // status tier. Each refresh fans out to lsof or sqlite3
+                    // subprocesses; running it every cycle multiplies that
+                    // cost by the session count and starves the UI thread.
+                    // Sessions with a Pending probe (the launch grace window)
+                    // still refresh every cycle so the initial bind happens
+                    // promptly.
+                    let in_initial_bind_window = inst.tool_session.is_none()
+                        && matches!(
+                            inst.tool_session_probe.as_ref().map(|p| p.state),
+                            Some(crate::session::ToolSessionProbeState::Pending)
+                        );
+                    let tool_session_change = if in_initial_bind_window
+                        || cycle_count % TOOL_SESSION_REFRESH_EVERY == 0
+                    {
+                        crate::session::tool_session::refresh(&inst).ok().flatten()
+                    } else {
+                        None
+                    };
 
                     Some(StatusUpdate {
                         id: inst.id,

@@ -619,7 +619,6 @@ impl HomeView {
         }
 
         self.update_selected();
-        let _ = self.backfill_tool_sessions();
         Ok(())
     }
 
