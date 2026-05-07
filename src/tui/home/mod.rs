@@ -422,6 +422,9 @@ impl HomeView {
                     inst.last_error = prev.last_error.clone();
                     inst.last_error_check = prev.last_error_check;
                     inst.last_start_time = prev.last_start_time;
+                    inst.tool_session_probe = prev.tool_session_probe.clone();
+                    inst.tool_session =
+                        newest_tool_session(inst.tool_session.clone(), prev.tool_session.clone());
                 }
             }
             // Rebuild this profile's tree from disk, preserving any collapsed
@@ -543,9 +546,11 @@ impl HomeView {
         let new_probe = update.tool_session_probe.clone();
         let mut changed = false;
         self.mutate_instance(&update.id, |inst| {
-            if inst.tool_session != new_ts {
-                inst.tool_session = new_ts.clone();
-                changed = true;
+            if let Some(new_ts) = new_ts.clone() {
+                if inst.tool_session.as_ref() != Some(&new_ts) {
+                    inst.tool_session = Some(new_ts);
+                    changed = true;
+                }
             }
             inst.tool_session_probe = new_probe.clone();
         });
@@ -1355,5 +1360,23 @@ impl HomeView {
             self.save()?;
         }
         Ok(any_changed)
+    }
+}
+
+fn newest_tool_session(
+    loaded: Option<crate::session::ToolSession>,
+    runtime: Option<crate::session::ToolSession>,
+) -> Option<crate::session::ToolSession> {
+    match (loaded, runtime) {
+        (Some(loaded), Some(runtime)) => {
+            if runtime.updated_at > loaded.updated_at {
+                Some(runtime)
+            } else {
+                Some(loaded)
+            }
+        }
+        (Some(loaded), None) => Some(loaded),
+        (None, Some(runtime)) => Some(runtime),
+        (None, None) => None,
     }
 }

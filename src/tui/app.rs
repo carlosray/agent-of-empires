@@ -44,9 +44,22 @@ fn refresh_tool_session_state(current: &mut crate::session::Instance) -> anyhow:
         return Ok(false);
     };
 
-    current.tool_session = change.tool_session;
+    Ok(apply_tool_session_state_change(current, change))
+}
+
+fn apply_tool_session_state_change(
+    current: &mut crate::session::Instance,
+    change: crate::session::tool_session::ToolSessionStateChange,
+) -> bool {
+    let mut changed = false;
+    if let Some(tool_session) = change.tool_session {
+        if current.tool_session.as_ref() != Some(&tool_session) {
+            current.tool_session = Some(tool_session);
+            changed = true;
+        }
+    }
     current.tool_session_probe = change.tool_session_probe;
-    Ok(true)
+    changed
 }
 
 pub struct App {
@@ -954,5 +967,39 @@ mod tests {
 
         assert!(!refresh_tool_session_state(&mut current).unwrap());
         assert!(current.tool_session.is_none());
+    }
+
+    #[test]
+    fn test_apply_tool_session_state_change_does_not_clear_on_probe_only_change() {
+        use crate::session::{tool_session::ToolSessionStateChange, ToolSessionProbeState};
+        use crate::session::{ToolSession, ToolSessionProbe};
+
+        let existing = ToolSession {
+            display_id: "existing".to_string(),
+            resume_target: "existing".to_string(),
+            source_ref: "existing-ref".to_string(),
+            updated_at: Utc::now(),
+        };
+        let mut current = Instance::new("Current", "/tmp/current");
+        current.tool_session = Some(existing.clone());
+
+        let changed = apply_tool_session_state_change(
+            &mut current,
+            ToolSessionStateChange {
+                tool_session: None,
+                tool_session_probe: Some(ToolSessionProbe {
+                    launch_started_at: Utc::now(),
+                    baseline_source_refs: vec!["a".to_string(), "b".to_string()],
+                    state: ToolSessionProbeState::Ambiguous,
+                }),
+            },
+        );
+
+        assert!(!changed);
+        assert_eq!(current.tool_session, Some(existing));
+        assert_eq!(
+            current.tool_session_probe.as_ref().map(|probe| probe.state),
+            Some(ToolSessionProbeState::Ambiguous)
+        );
     }
 }
