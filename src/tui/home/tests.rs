@@ -3087,6 +3087,105 @@ fn test_apply_status_updates_persists_tool_session_to_storage() {
 
 #[test]
 #[serial]
+fn test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_change() {
+    use crate::session::Status;
+    use crate::session::ToolSessionProbeState;
+    use crate::session::{ToolSession, ToolSessionProbe};
+    use crate::tui::status_poller::StatusUpdate;
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let existing = ToolSession {
+        display_id: "sess-existing".to_string(),
+        resume_target: "sess-existing".to_string(),
+        source_ref: "ref-existing".to_string(),
+        updated_at: Utc::now(),
+    };
+
+    let mut inst = Instance::new("probe-only", "/tmp/probe-only");
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    inst.tool_session = Some(existing.clone());
+    let inst_id = inst.id.clone();
+
+    let storage = Storage::new("test").unwrap();
+    storage.save(&[inst]).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+
+    let update = StatusUpdate {
+        id: inst_id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        tool_session: None,
+        tool_session_probe: Some(ToolSessionProbe {
+            launch_started_at: Utc::now(),
+            baseline_source_refs: vec!["ref-a".to_string(), "ref-b".to_string()],
+            state: ToolSessionProbeState::Ambiguous,
+        }),
+        tool_session_changed: true,
+    };
+
+    let changed = view.apply_tool_session_update(&update);
+    assert!(
+        !changed,
+        "probe-only updates must not report a persisted tool_session change"
+    );
+
+    let in_memory = view.get_instance(&inst_id).unwrap();
+    assert_eq!(in_memory.tool_session, Some(existing.clone()));
+
+    let storage2 = Storage::new("test").unwrap();
+    let (reloaded, _) = storage2.load_with_groups().unwrap();
+    let persisted = reloaded.iter().find(|i| i.id == inst_id).unwrap();
+    assert_eq!(persisted.tool_session, Some(existing));
+}
+
+#[test]
+#[serial]
+fn test_reload_preserves_unsaved_runtime_tool_session() {
+    use crate::session::ToolSession;
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let mut inst = Instance::new("reload-runtime", "/tmp/reload-runtime");
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    let inst_id = inst.id.clone();
+
+    let storage = Storage::new("test").unwrap();
+    storage.save(&[inst]).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+
+    let runtime_session = ToolSession {
+        display_id: "runtime-session".to_string(),
+        resume_target: "runtime-session".to_string(),
+        source_ref: "runtime-ref".to_string(),
+        updated_at: Utc::now(),
+    };
+    view.mutate_instance(&inst_id, |inst| {
+        inst.tool_session = Some(runtime_session.clone());
+    });
+
+    view.reload().unwrap();
+
+    let reloaded = view.get_instance(&inst_id).unwrap();
+    assert_eq!(
+        reloaded.tool_session,
+        Some(runtime_session),
+        "reload must not clobber an in-memory mapping with stale disk state"
+    );
+}
+
+#[test]
+#[serial]
 fn test_backfill_tool_sessions_is_noop_for_session_with_existing_mapping() {
     use crate::session::{save_repo_config, RepoConfig, SessionConfigOverride, ToolSession};
     use chrono::Utc;

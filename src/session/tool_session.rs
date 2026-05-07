@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -39,9 +39,21 @@ pub struct ToolSessionStateChange {
 }
 
 pub fn tracking_enabled(instance: &Instance) -> bool {
-    effective_config(instance)
-        .map(|config| config.session.tool_session_tracking)
+    repo_tracking_override(Path::new(&instance.project_path))
+        .or_else(|| {
+            effective_config(instance)
+                .ok()
+                .map(|config| config.session.tool_session_tracking)
+        })
         .unwrap_or(false)
+}
+
+fn repo_tracking_override(project_path: &Path) -> Option<bool> {
+    super::load_repo_config(project_path)
+        .ok()
+        .flatten()
+        .and_then(|config| config.session)
+        .and_then(|session| session.tool_session_tracking)
 }
 
 pub fn is_supported_tool(tool: &str) -> bool {
@@ -361,9 +373,14 @@ fn discover_candidates(instance: &Instance) -> Result<Vec<ToolSessionCandidate>>
 
 fn discover_codex_from_pid(instance: &Instance) -> Option<ToolSessionCandidate> {
     let session = tmux::Session::new(&instance.id, &instance.title).ok()?;
-    let foreground_pid = session.get_foreground_pid()?;
-    let path = find_open_rollout_for_pid(foreground_pid)?;
-    codex_candidate_from_path(&path, Path::new(&instance.project_path))
+    let pane_pid = session.get_pane_pid()?;
+    let pids = candidate_process_pids(pane_pid, session.get_foreground_pid());
+    let project_path = Path::new(&instance.project_path);
+
+    find_open_rollouts_for_pids(&pids)
+        .into_iter()
+        .filter_map(|path| codex_candidate_from_path(&path, project_path))
+        .max_by(|left, right| left.updated_at.cmp(&right.updated_at))
 }
 
 fn discover_claude_from_pid(instance: &Instance) -> Option<ToolSessionCandidate> {
@@ -636,6 +653,13 @@ fn read_codex_rollout_header(path: &Path) -> Option<(PathBuf, String, DateTime<U
             .get("session_meta")
             .and_then(|meta| meta.get("payload"))
     })?;
+    if payload
+        .get("source")
+        .and_then(|source| source.get("subagent"))
+        .is_some()
+    {
+        return None;
+    }
     let cwd = payload.get("cwd")?.as_str()?;
     let id = payload.get("id")?.as_str()?;
     let created_at = parse_timestamp(payload.get("timestamp")?.as_str()?)?;
@@ -696,25 +720,103 @@ fn modified_to_utc(path: &Path) -> Option<DateTime<Utc>> {
     Some(DateTime::<Utc>::from(modified))
 }
 
-fn find_open_rollout_for_pid(pid: u32) -> Option<PathBuf> {
-    let output = Command::new("lsof")
-        .args(["-Fn", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
+fn candidate_process_pids(pane_pid: u32, foreground_pid: Option<u32>) -> Vec<u32> {
+    let output = Command::new("ps").args(["-o", "pid=,ppid=", "-A"]).output();
+    let Ok(output) = output else {
+        return unique_pids([foreground_pid, Some(pane_pid)].into_iter().flatten());
+    };
     if !output.status.success() {
-        return None;
+        return unique_pids([foreground_pid, Some(pane_pid)].into_iter().flatten());
     }
 
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let path = line.strip_prefix('n')?;
+    candidate_process_pids_from_ps(
+        pane_pid,
+        foreground_pid,
+        &String::from_utf8_lossy(&output.stdout),
+    )
+}
+
+pub(crate) fn candidate_process_pids_from_ps(
+    pane_pid: u32,
+    foreground_pid: Option<u32>,
+    ps_stdout: &str,
+) -> Vec<u32> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for line in ps_stdout.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|value| value.parse::<u32>().ok()) else {
+            continue;
+        };
+        children.entry(ppid).or_default().push(pid);
+    }
+
+    let mut pids = unique_pids([foreground_pid, Some(pane_pid)].into_iter().flatten());
+    collect_descendant_pids(pane_pid, &children, &mut pids);
+    pids
+}
+
+fn collect_descendant_pids(pid: u32, children: &HashMap<u32, Vec<u32>>, pids: &mut Vec<u32>) {
+    if let Some(child_pids) = children.get(&pid) {
+        for &child in child_pids {
+            if !pids.contains(&child) {
+                pids.push(child);
+            }
+            collect_descendant_pids(child, children, pids);
+        }
+    }
+}
+
+fn unique_pids(pids: impl Iterator<Item = u32>) -> Vec<u32> {
+    let mut unique = Vec::new();
+    for pid in pids {
+        if !unique.contains(&pid) {
+            unique.push(pid);
+        }
+    }
+    unique
+}
+
+fn find_open_rollouts_for_pids(pids: &[u32]) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for pid in pids {
+        let output = Command::new("lsof")
+            .args(["-Fn", "-p", &pid.to_string()])
+            .output();
+        let Ok(output) = output else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+
+        for path in parse_lsof_rollout_paths(&String::from_utf8_lossy(&output.stdout)) {
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+    }
+    paths
+}
+
+pub(crate) fn parse_lsof_rollout_paths(stdout: &str) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for line in stdout.lines() {
+        let Some(path) = line.strip_prefix('n') else {
+            continue;
+        };
+        let path_buf = PathBuf::from(path);
         if path.contains("/.codex/sessions/")
             && path.ends_with(".jsonl")
             && path.contains("rollout-")
+            && !paths.contains(&path_buf)
         {
-            return Some(PathBuf::from(path));
+            paths.push(path_buf);
         }
     }
-    None
+    paths
 }
 
 #[cfg(test)]
@@ -728,7 +830,8 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        build_probe, build_start_command, has_explicit_resume_target, inject_resume_args,
+        build_probe, build_start_command, candidate_process_pids_from_ps,
+        has_explicit_resume_target, inject_resume_args, parse_lsof_rollout_paths,
         parse_opencode_rows, project_path_matches, read_codex_rollout_header,
         select_initial_tool_session, select_refreshed_tool_session, RefreshDecision,
         ToolSessionCandidate,
@@ -1065,6 +1168,56 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Utc)
         );
+    }
+
+    #[test]
+    fn test_read_codex_rollout_header_ignores_subagent_rollout() {
+        let temp = tempdir().unwrap();
+        let rollout = temp.path().join("rollout.jsonl");
+        let line = serde_json::json!({
+            "timestamp": "2026-04-24T14:07:24.415Z",
+            "type": "session_meta",
+            "payload": {
+                "id": "019dbfd1-135a-7690-ac84-2c59d3bc53cb",
+                "timestamp": "2026-04-24T14:07:23.503Z",
+                "cwd": "/tmp/example",
+                "source": {
+                    "subagent": {
+                        "other": "guardian"
+                    }
+                }
+            }
+        })
+        .to_string();
+        std::fs::write(&rollout, format!("{line}\n")).unwrap();
+
+        assert!(
+            read_codex_rollout_header(&rollout).is_none(),
+            "subagent rollouts are not resumable user-facing Codex sessions"
+        );
+    }
+
+    #[test]
+    fn test_parse_lsof_rollout_paths_skips_non_name_lines() {
+        let stdout = "p123\nfcwd\nn/Users/me/project\nf38\nn/Users/me/.codex/sessions/2026/05/07/rollout-good.jsonl\n";
+
+        let paths = parse_lsof_rollout_paths(stdout);
+
+        assert_eq!(
+            paths,
+            vec![std::path::PathBuf::from(
+                "/Users/me/.codex/sessions/2026/05/07/rollout-good.jsonl"
+            )]
+        );
+    }
+
+    #[test]
+    fn test_candidate_process_pids_from_ps_includes_pane_descendants() {
+        let ps = "10 1\n11 10\n12 11\n20 1\n";
+
+        let pids = candidate_process_pids_from_ps(10, Some(10), ps);
+
+        assert_eq!(pids, vec![10, 11, 12]);
     }
 
     fn live_resolution_result(tool: &str) -> Result<String> {
