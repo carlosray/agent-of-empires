@@ -7,6 +7,7 @@ mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 mod home;
+pub(crate) mod responsive;
 pub mod settings;
 mod status_poller;
 pub(crate) mod styles;
@@ -15,7 +16,7 @@ pub use app::*;
 
 use anyhow::Result;
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -62,19 +63,8 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         std::process::exit(1);
     }
 
-    // Check for coding tools
+    // Check for coding tools (no-agents case is handled inside the TUI)
     let available_tools = crate::tmux::AvailableTools::detect();
-    if !available_tools.any_available() {
-        eprintln!("Error: No coding tools found in PATH");
-        eprintln!();
-        eprintln!("Agent of Empires requires at least one of:");
-        eprintln!("  claude    - Anthropic's Claude CLI");
-        eprintln!("  opencode  - OpenCode CLI");
-        eprintln!("  cursor    - Cursor's Agent CLI");
-        eprintln!();
-        eprintln!("Install one of these tools and ensure it's in your PATH.");
-        std::process::exit(1);
-    }
 
     // If version changed, refresh the update cache before showing TUI.
     // This ensures we have release notes for the changelog dialog.
@@ -100,7 +90,12 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     if let Some(title) = crate::terminal::dashboard_title_for_profile(profile) {
@@ -109,19 +104,42 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         }
     }
 
+    // Combine the caller-supplied startup warning (e.g. debug-log file
+    // failures) with any config-parse failures we detect at startup.
+    // `tracing::warn!` events from the `_or_warn` config helpers are dropped
+    // by default in TUI mode (no subscriber attached), so we surface them
+    // through the same InfoDialog channel here.
+    //
+    // Detected before `App::new` so we can suppress the first-run welcome /
+    // changelog dialogs when there's a warning, both for UX (the warning is
+    // the more important thing for the user to see) and to avoid overwriting
+    // a malformed config.toml with defaults via `save_config`.
+    let combined_warning = match (
+        startup_warning,
+        crate::session::collect_startup_config_warnings(profile),
+    ) {
+        (Some(a), Some(b)) => Some(format!("{a}\n\n{b}")),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
     // Create app and run
-    let mut app = App::new(profile, available_tools)?;
-    if let Some(warning) = startup_warning {
+    let mut app = App::new(profile, available_tools, combined_warning.is_some())?;
+    if let Some(warning) = combined_warning {
         app.show_startup_warning(&warning);
     }
     let result = app.run(&mut terminal).await;
+
+    crate::session::clear_tui_heartbeat();
 
     // Restore terminal
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableBracketedPaste
+        DisableBracketedPaste,
+        DisableMouseCapture
     )?;
     terminal.show_cursor()?;
 

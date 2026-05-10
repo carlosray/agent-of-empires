@@ -2,7 +2,7 @@
 
 use crate::session::{
     validate_check_interval, Config, ContainerRuntimeName, DefaultTerminalMode, ProfileConfig,
-    TmuxMouseMode, TmuxStatusBarMode,
+    TmuxClipboardMode, TmuxMouseMode, TmuxStatusBarMode,
 };
 use crate::sound::{
     validate_sound_exists, volume_from_option, volume_options, volume_to_index, SoundMode,
@@ -22,6 +22,8 @@ pub enum SettingsCategory {
     Session,
     Sound,
     Hooks,
+    Web,
+    Cockpit,
 }
 
 impl SettingsCategory {
@@ -35,6 +37,8 @@ impl SettingsCategory {
             Self::Session => "Session",
             Self::Sound => "Sound",
             Self::Hooks => "Hooks",
+            Self::Web => "Web",
+            Self::Cockpit => "Cockpit",
         }
     }
 }
@@ -44,11 +48,14 @@ impl SettingsCategory {
 pub enum FieldKey {
     // Theme
     ThemeName,
+    ThemeColorMode,
+    IdleDecayMinutes,
     // Updates
     CheckEnabled,
     CheckIntervalHours,
     NotifyInCli,
     // Worktree
+    WorktreeEnabled,
     PathTemplate,
     BareRepoPathTemplate,
     WorktreeAutoCleanup,
@@ -76,8 +83,10 @@ pub enum FieldKey {
     Mouse,
     RenameTerminalTabOnAttach,
     DashboardTabTitle,
+    Clipboard,
     // Session
     DefaultTool,
+    StrictHotkeys,
     AgentExtraArgs,
     AgentCommandOverride,
     AgentStatusHooks,
@@ -97,6 +106,21 @@ pub enum FieldKey {
     HookOnCreate,
     HookOnLaunch,
     HookOnDestroy,
+    // Web
+    WebNotificationsEnabled,
+    WebNotifyOnWaiting,
+    WebNotifyOnIdle,
+    WebNotifyOnError,
+    // Cockpit (gated on the `serve` feature; the variants are always
+    // present in the enum so external callers don't have to cfg-gate
+    // their match arms)
+    CockpitEnabled,
+    CockpitDefaultForClaude,
+    CockpitDefaultAgent,
+    CockpitMaxConcurrentWorkers,
+    CockpitReplayEvents,
+    CockpitReplayBytes,
+    CockpitNodePath,
 }
 
 /// Resolve a field value from global config and optional profile override.
@@ -257,7 +281,166 @@ pub fn build_fields_for_category(
         SettingsCategory::Session => build_session_fields(scope, global, profile),
         SettingsCategory::Sound => build_sound_fields(scope, global, profile),
         SettingsCategory::Hooks => build_hooks_fields(scope, global, profile),
+        SettingsCategory::Web => build_web_fields(scope, global, profile),
+        SettingsCategory::Cockpit => build_cockpit_fields(scope, global, profile),
     }
+}
+
+fn build_cockpit_fields(
+    scope: SettingsScope,
+    global: &Config,
+    profile: &ProfileConfig,
+) -> Vec<SettingField> {
+    let p = profile.cockpit.as_ref();
+
+    let (enabled, enabled_override) =
+        resolve_value(scope, global.cockpit.enabled, p.and_then(|c| c.enabled));
+    let (default_for_claude, dfc_override) = resolve_value(
+        scope,
+        global.cockpit.default_for_claude,
+        p.and_then(|c| c.default_for_claude),
+    );
+    let (default_agent, da_override) = resolve_value(
+        scope,
+        global.cockpit.default_agent.clone(),
+        p.and_then(|c| c.default_agent.clone()),
+    );
+    let (max_workers, mw_override) = resolve_value(
+        scope,
+        global.cockpit.max_concurrent_workers,
+        p.and_then(|c| c.max_concurrent_workers),
+    );
+    let (replay_events, re_override) = resolve_value(
+        scope,
+        global.cockpit.replay_events,
+        p.and_then(|c| c.replay_events),
+    );
+    let (replay_bytes, rb_override) = resolve_value(
+        scope,
+        global.cockpit.replay_bytes,
+        p.and_then(|c| c.replay_bytes),
+    );
+    let (node_path, np_override) = resolve_value(
+        scope,
+        global.cockpit.node_path.clone(),
+        p.and_then(|c| c.node_path.clone()),
+    );
+
+    vec![
+        SettingField {
+            key: FieldKey::CockpitEnabled,
+            label: "Cockpit enabled",
+            description: "Master switch for cockpit (ACP-based native agent rendering). When off, sessions use the terminal/PTY view even with --cockpit.",
+            value: FieldValue::Bool(enabled),
+            category: SettingsCategory::Cockpit,
+            has_override: enabled_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitDefaultForClaude,
+            label: "Default for Claude (mobile)",
+            description: "On mobile clients, default new Claude sessions to cockpit mode.",
+            value: FieldValue::Bool(default_for_claude),
+            category: SettingsCategory::Cockpit,
+            has_override: dfc_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitDefaultAgent,
+            label: "Default agent",
+            description: "Cockpit agent to use when --agent is not specified (e.g., aoe-agent, claude-code, gemini).",
+            value: FieldValue::Text(default_agent),
+            category: SettingsCategory::Cockpit,
+            has_override: da_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitMaxConcurrentWorkers,
+            label: "Max concurrent workers",
+            description: "Hard cap on simultaneously running cockpit agent subprocesses; additional sessions queue.",
+            value: FieldValue::Number(u64::from(max_workers)),
+            category: SettingsCategory::Cockpit,
+            has_override: mw_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitReplayEvents,
+            label: "Replay buffer events",
+            description: "Maximum number of cockpit events kept in the per-session replay buffer.",
+            value: FieldValue::Number(u64::from(replay_events)),
+            category: SettingsCategory::Cockpit,
+            has_override: re_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitReplayBytes,
+            label: "Replay buffer bytes",
+            description: "Maximum bytes of cockpit events kept in the per-session replay buffer.",
+            value: FieldValue::Number(replay_bytes),
+            category: SettingsCategory::Cockpit,
+            has_override: rb_override,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::CockpitNodePath,
+            label: "Node path",
+            description: "Override Node.js binary location. Empty -> auto-resolve via AOE_COCKPIT_NODE / PATH / bundled.",
+            value: FieldValue::Text(node_path),
+            category: SettingsCategory::Cockpit,
+            has_override: np_override,
+            inherited_display: None,
+        },
+    ]
+}
+
+fn build_web_fields(
+    scope: SettingsScope,
+    global: &Config,
+    _profile: &ProfileConfig,
+) -> Vec<SettingField> {
+    // Web settings are server-global, not profile-scoped. In Profile mode
+    // we still surface the field (read-only) so users discover it; writes
+    // always apply to the global config.
+    let _ = scope;
+
+    vec![
+        SettingField {
+            key: FieldKey::WebNotificationsEnabled,
+            label: "Push notifications",
+            description: "Allow the web dashboard to deliver browser push notifications (server-wide kill switch).",
+            value: FieldValue::Bool(global.web.notifications_enabled),
+            category: SettingsCategory::Web,
+            has_override: false,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::WebNotifyOnWaiting,
+            label: "Notify on waiting",
+            description: "Default: send a push when a session transitions Running to Waiting (agent is asking for input). Sessions can override individually.",
+            value: FieldValue::Bool(global.web.notify_on_waiting),
+            category: SettingsCategory::Web,
+            has_override: false,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::WebNotifyOnIdle,
+            label: "Notify on idle",
+            description: "Default: send a push when a session finishes (Running to Idle). Off by default because short sessions make this noisy; sessions can opt in individually.",
+            value: FieldValue::Bool(global.web.notify_on_idle),
+            category: SettingsCategory::Web,
+            has_override: false,
+            inherited_display: None,
+        },
+        SettingField {
+            key: FieldKey::WebNotifyOnError,
+            label: "Notify on error",
+            description: "Default: send a push when a session errors (Running to Error).",
+            value: FieldValue::Bool(global.web.notify_on_error),
+            category: SettingsCategory::Web,
+            has_override: false,
+            inherited_display: None,
+        },
+    ]
 }
 
 fn build_theme_fields(
@@ -288,15 +471,69 @@ fn build_theme_fields(
         },
     );
 
-    vec![SettingField {
-        key: FieldKey::ThemeName,
-        label: "Theme",
-        description: "Color theme for the TUI",
-        value: FieldValue::Select { selected, options },
-        category: SettingsCategory::Theme,
-        has_override,
-        inherited_display: inherited,
-    }]
+    let color_mode_options: Vec<String> = vec!["truecolor".to_string(), "palette".to_string()];
+    let (color_mode_val, cm_has_override) = resolve_value(
+        scope,
+        global.theme.color_mode.clone(),
+        theme.and_then(|t| t.color_mode.clone()),
+    );
+    let cm_selected = match color_mode_val {
+        crate::session::config::ColorMode::Truecolor => 0,
+        crate::session::config::ColorMode::Palette => 1,
+    };
+    let global_cm_selected = match global.theme.color_mode {
+        crate::session::config::ColorMode::Truecolor => 0,
+        crate::session::config::ColorMode::Palette => 1,
+    };
+    let cm_inherited = inherited_if(
+        cm_has_override,
+        FieldValue::Select {
+            selected: global_cm_selected,
+            options: color_mode_options.clone(),
+        },
+    );
+
+    let (idle_decay_minutes, idle_decay_override) = resolve_value(
+        scope,
+        global.theme.idle_decay_minutes,
+        theme.and_then(|t| t.idle_decay_minutes),
+    );
+
+    vec![
+        SettingField {
+            key: FieldKey::ThemeName,
+            label: "Theme",
+            description: "Color theme for the TUI",
+            value: FieldValue::Select { selected, options },
+            category: SettingsCategory::Theme,
+            has_override,
+            inherited_display: inherited,
+        },
+        SettingField {
+            key: FieldKey::ThemeColorMode,
+            label: "Color Mode",
+            description: "Truecolor (24-bit RGB) or palette (xterm-256). Use palette if your terminal mangles RGB escapes.",
+            value: FieldValue::Select {
+                selected: cm_selected,
+                options: color_mode_options,
+            },
+            category: SettingsCategory::Theme,
+            has_override: cm_has_override,
+            inherited_display: cm_inherited,
+        },
+        SettingField {
+            key: FieldKey::IdleDecayMinutes,
+            label: "Idle Decay (minutes)",
+            description: "Off by default (0). Set a positive value to opt in: a freshly-stopped Idle session keeps a fresh-idle tint and an animated breathe icon for this many minutes before snapping back to the static look, and is treated as actionable by the `w` keybind. The time-since-stop column on Idle rows shows regardless of this setting.",
+            value: FieldValue::Number(idle_decay_minutes),
+            category: SettingsCategory::Theme,
+            has_override: idle_decay_override,
+            inherited_display: inherited_if(
+                idle_decay_override,
+                FieldValue::Number(global.theme.idle_decay_minutes),
+            ),
+        },
+    ]
 }
 
 fn build_updates_fields(
@@ -363,6 +600,7 @@ fn build_worktree_fields(
 ) -> Vec<SettingField> {
     let wt = profile.worktree.as_ref();
 
+    let (enabled, o0) = resolve_value(scope, global.worktree.enabled, wt.and_then(|w| w.enabled));
     let (path_template, o1) = resolve_value(
         scope,
         global.worktree.path_template.clone(),
@@ -401,6 +639,15 @@ fn build_worktree_fields(
     );
 
     vec![
+        SettingField {
+            key: FieldKey::WorktreeEnabled,
+            label: "Enabled by Default",
+            description: "Enable worktree mode by default for new sessions",
+            value: FieldValue::Bool(enabled),
+            category: SettingsCategory::Worktree,
+            has_override: o0,
+            inherited_display: inherited_if(o0, FieldValue::Bool(global.worktree.enabled)),
+        },
         SettingField {
             key: FieldKey::PathTemplate,
             label: "Path Template",
@@ -568,7 +815,8 @@ fn build_sandbox_fields(
 
     let container_runtime_selected = match container_runtime {
         ContainerRuntimeName::Docker => 0,
-        ContainerRuntimeName::AppleContainer => 1,
+        ContainerRuntimeName::Podman => 1,
+        ContainerRuntimeName::AppleContainer => 2,
     };
 
     let global_terminal_mode_selected = match global.sandbox.default_terminal_mode {
@@ -579,9 +827,11 @@ fn build_sandbox_fields(
 
     let global_container_runtime_selected = match global.sandbox.container_runtime {
         ContainerRuntimeName::Docker => 0,
-        ContainerRuntimeName::AppleContainer => 1,
+        ContainerRuntimeName::Podman => 1,
+        ContainerRuntimeName::AppleContainer => 2,
     };
-    let container_runtime_options = vec!["Docker".into(), "Apple Container".into()];
+    let container_runtime_options =
+        vec!["Docker".into(), "Podman".into(), "Apple Container".into()];
 
     vec![
         SettingField {
@@ -599,7 +849,7 @@ fn build_sandbox_fields(
         SettingField {
             key: FieldKey::DefaultImage,
             label: "Default Image",
-            description: "Docker image to use for sandboxes",
+            description: "Container image to use for sandboxes",
             value: FieldValue::Text(default_image),
             category: SettingsCategory::Sandbox,
             has_override: o3,
@@ -731,7 +981,7 @@ fn build_sandbox_fields(
         SettingField {
             key: FieldKey::ContainerRuntime,
             label: "Container Runtime",
-            description: "Container runtime for sandboxing (Docker or Apple Container on macOS)",
+            description: "Container runtime for sandboxing",
             value: FieldValue::Select {
                 selected: container_runtime_selected,
                 options: container_runtime_options.clone(),
@@ -775,6 +1025,9 @@ fn build_tmux_fields(
         tmux.and_then(|t| t.dashboard_tab_title.clone()),
     );
 
+    let (clipboard, clipboard_override) =
+        resolve_value(scope, global.tmux.clipboard, tmux.and_then(|t| t.clipboard));
+
     let status_bar_selected = match status_bar {
         TmuxStatusBarMode::Auto => 0,
         TmuxStatusBarMode::Enabled => 1,
@@ -787,6 +1040,12 @@ fn build_tmux_fields(
         TmuxMouseMode::Disabled => 2,
     };
 
+    let clipboard_selected = match clipboard {
+        TmuxClipboardMode::Auto => 0,
+        TmuxClipboardMode::Enabled => 1,
+        TmuxClipboardMode::Disabled => 2,
+    };
+
     let global_status_bar_selected = match global.tmux.status_bar {
         TmuxStatusBarMode::Auto => 0,
         TmuxStatusBarMode::Enabled => 1,
@@ -796,6 +1055,11 @@ fn build_tmux_fields(
         TmuxMouseMode::Auto => 0,
         TmuxMouseMode::Enabled => 1,
         TmuxMouseMode::Disabled => 2,
+    };
+    let global_clipboard_selected = match global.tmux.clipboard {
+        TmuxClipboardMode::Auto => 0,
+        TmuxClipboardMode::Enabled => 1,
+        TmuxClipboardMode::Disabled => 2,
     };
     let tmux_options = vec!["Auto".into(), "Enabled".into(), "Disabled".into()];
 
@@ -832,6 +1096,24 @@ fn build_tmux_fields(
                 mouse_override,
                 FieldValue::Select {
                     selected: global_mouse_selected,
+                    options: tmux_options.clone(),
+                },
+            ),
+        },
+        SettingField {
+            key: FieldKey::Clipboard,
+            label: "Clipboard Pass-through",
+            description: "Forward OSC 52 clipboard from agents to your terminal (Auto respects your tmux config)",
+            value: FieldValue::Select {
+                selected: clipboard_selected,
+                options: tmux_options.clone(),
+            },
+            category: SettingsCategory::Tmux,
+            has_override: clipboard_override,
+            inherited_display: inherited_if(
+                clipboard_override,
+                FieldValue::Select {
+                    selected: global_clipboard_selected,
                     options: tmux_options,
                 },
             ),
@@ -886,6 +1168,12 @@ fn build_session_fields(
         scope,
         global.session.yolo_mode_default,
         session.and_then(|s| s.yolo_mode_default),
+    );
+
+    let (strict_hotkeys, strict_hotkeys_override) = resolve_value(
+        scope,
+        global.session.strict_hotkeys,
+        session.and_then(|s| s.strict_hotkeys),
     );
 
     let (agent_status_hooks, status_hooks_override) = resolve_value(
@@ -1033,6 +1321,19 @@ fn build_session_fields(
             inherited_display: inherited_if(
                 yolo_override,
                 FieldValue::Bool(global.session.yolo_mode_default),
+            ),
+        },
+        SettingField {
+            key: FieldKey::StrictHotkeys,
+            label: "Strict Hotkeys",
+            description:
+                "Require Shift/Ctrl for action hotkeys (guards against dictation/stray input)",
+            value: FieldValue::Bool(strict_hotkeys),
+            category: SettingsCategory::Session,
+            has_override: strict_hotkeys_override,
+            inherited_display: inherited_if(
+                strict_hotkeys_override,
+                FieldValue::Bool(global.session.strict_hotkeys),
             ),
         },
         SettingField {
@@ -1368,6 +1669,15 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::ThemeName, FieldValue::Select { selected, options }) => {
             config.theme.name = options.get(*selected).cloned().unwrap_or_default();
         }
+        (FieldKey::ThemeColorMode, FieldValue::Select { selected, .. }) => {
+            config.theme.color_mode = match selected {
+                1 => crate::session::config::ColorMode::Palette,
+                _ => crate::session::config::ColorMode::Truecolor,
+            };
+        }
+        (FieldKey::IdleDecayMinutes, FieldValue::Number(v)) => {
+            config.theme.idle_decay_minutes = *v;
+        }
         // Updates
         (FieldKey::CheckEnabled, FieldValue::Bool(v)) => config.updates.check_enabled = *v,
         (FieldKey::CheckIntervalHours, FieldValue::Number(v)) => {
@@ -1375,6 +1685,7 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::NotifyInCli, FieldValue::Bool(v)) => config.updates.notify_in_cli = *v,
         // Worktree
+        (FieldKey::WorktreeEnabled, FieldValue::Bool(v)) => config.worktree.enabled = *v,
         (FieldKey::PathTemplate, FieldValue::Text(v)) => config.worktree.path_template = v.clone(),
         (FieldKey::BareRepoPathTemplate, FieldValue::Text(v)) => {
             config.worktree.bare_repo_path_template = v.clone()
@@ -1395,6 +1706,7 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.sandbox.enabled_by_default = *v
         }
         (FieldKey::YoloModeDefault, FieldValue::Bool(v)) => config.session.yolo_mode_default = *v,
+        (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => config.session.strict_hotkeys = *v,
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             config.session.agent_status_hooks = *v;
         }
@@ -1426,6 +1738,7 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::ContainerRuntime, FieldValue::Select { selected, .. }) => {
             config.sandbox.container_runtime = match selected {
                 0 => ContainerRuntimeName::Docker,
+                1 => ContainerRuntimeName::Podman,
                 _ => ContainerRuntimeName::AppleContainer,
             };
         }
@@ -1449,6 +1762,13 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::DashboardTabTitle, FieldValue::Text(v)) => {
             config.tmux.dashboard_tab_title = v.clone();
+        }
+        (FieldKey::Clipboard, FieldValue::Select { selected, .. }) => {
+            config.tmux.clipboard = match selected {
+                0 => TmuxClipboardMode::Auto,
+                1 => TmuxClipboardMode::Enabled,
+                _ => TmuxClipboardMode::Disabled,
+            };
         }
         // Session
         (FieldKey::DefaultTool, FieldValue::Select { selected, .. }) => {
@@ -1499,6 +1819,37 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::HookOnCreate, FieldValue::List(v)) => config.hooks.on_create = v.clone(),
         (FieldKey::HookOnLaunch, FieldValue::List(v)) => config.hooks.on_launch = v.clone(),
         (FieldKey::HookOnDestroy, FieldValue::List(v)) => config.hooks.on_destroy = v.clone(),
+        // Web
+        (FieldKey::WebNotificationsEnabled, FieldValue::Bool(v)) => {
+            config.web.notifications_enabled = *v;
+        }
+        (FieldKey::WebNotifyOnWaiting, FieldValue::Bool(v)) => {
+            config.web.notify_on_waiting = *v;
+        }
+        (FieldKey::WebNotifyOnIdle, FieldValue::Bool(v)) => {
+            config.web.notify_on_idle = *v;
+        }
+        (FieldKey::WebNotifyOnError, FieldValue::Bool(v)) => {
+            config.web.notify_on_error = *v;
+        }
+        // Cockpit
+        (FieldKey::CockpitEnabled, FieldValue::Bool(v)) => config.cockpit.enabled = *v,
+        (FieldKey::CockpitDefaultForClaude, FieldValue::Bool(v)) => {
+            config.cockpit.default_for_claude = *v
+        }
+        (FieldKey::CockpitDefaultAgent, FieldValue::Text(v)) => {
+            config.cockpit.default_agent = v.clone()
+        }
+        (FieldKey::CockpitMaxConcurrentWorkers, FieldValue::Number(v)) => {
+            config.cockpit.max_concurrent_workers = (*v).max(1) as u32
+        }
+        (FieldKey::CockpitReplayEvents, FieldValue::Number(v)) => {
+            config.cockpit.replay_events = (*v).max(1) as u32
+        }
+        (FieldKey::CockpitReplayBytes, FieldValue::Number(v)) => {
+            config.cockpit.replay_bytes = (*v).max(1024)
+        }
+        (FieldKey::CockpitNodePath, FieldValue::Text(v)) => config.cockpit.node_path = v.clone(),
         _ => {}
     }
 }
@@ -1516,6 +1867,23 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 .get_or_insert_with(ThemeConfigOverride::default);
             t.name = Some(name);
         }
+        (FieldKey::ThemeColorMode, FieldValue::Select { selected, .. }) => {
+            use crate::session::ThemeConfigOverride;
+            let t = config
+                .theme
+                .get_or_insert_with(ThemeConfigOverride::default);
+            t.color_mode = Some(match selected {
+                1 => crate::session::config::ColorMode::Palette,
+                _ => crate::session::config::ColorMode::Truecolor,
+            });
+        }
+        (FieldKey::IdleDecayMinutes, FieldValue::Number(v)) => {
+            use crate::session::ThemeConfigOverride;
+            let t = config
+                .theme
+                .get_or_insert_with(ThemeConfigOverride::default);
+            t.idle_decay_minutes = Some(*v);
+        }
         // Updates
         (FieldKey::CheckEnabled, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.updates, |s, val| s.check_enabled = val);
@@ -1529,6 +1897,9 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
             set_profile_override(*v, &mut config.updates, |s, val| s.notify_in_cli = val);
         }
         // Worktree
+        (FieldKey::WorktreeEnabled, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.worktree, |s, val| s.enabled = val);
+        }
         (FieldKey::PathTemplate, FieldValue::Text(v)) => {
             set_profile_override(v.clone(), &mut config.worktree, |s, val| {
                 s.path_template = val
@@ -1630,6 +2001,7 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         (FieldKey::ContainerRuntime, FieldValue::Select { selected, .. }) => {
             let runtime = match selected {
                 0 => ContainerRuntimeName::Docker,
+                1 => ContainerRuntimeName::Podman,
                 _ => ContainerRuntimeName::AppleContainer,
             };
             set_profile_override(runtime, &mut config.sandbox, |s, val| {
@@ -1663,6 +2035,14 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
                 s.dashboard_tab_title = val
             });
         }
+        (FieldKey::Clipboard, FieldValue::Select { selected, .. }) => {
+            let mode = match selected {
+                0 => TmuxClipboardMode::Auto,
+                1 => TmuxClipboardMode::Enabled,
+                _ => TmuxClipboardMode::Disabled,
+            };
+            set_profile_override(mode, &mut config.tmux, |s, val| s.clipboard = val);
+        }
         // Session
         (FieldKey::DefaultTool, FieldValue::Select { selected, .. }) => {
             let tool = crate::agents::name_from_settings_index(*selected).map(|s| s.to_string());
@@ -1674,6 +2054,9 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::YoloModeDefault, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| s.yolo_mode_default = val);
+        }
+        (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.session, |s, val| s.strict_hotkeys = val);
         }
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| {
@@ -1773,6 +2156,36 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::HookOnDestroy, FieldValue::List(v)) => {
             set_profile_override(v.clone(), &mut config.hooks, |s, val| s.on_destroy = val);
+        }
+        // Cockpit
+        (FieldKey::CockpitEnabled, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.cockpit, |s, val| s.enabled = val);
+        }
+        (FieldKey::CockpitDefaultForClaude, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.cockpit, |s, val| s.default_for_claude = val);
+        }
+        (FieldKey::CockpitDefaultAgent, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.cockpit, |s, val| {
+                s.default_agent = val
+            });
+        }
+        (FieldKey::CockpitMaxConcurrentWorkers, FieldValue::Number(v)) => {
+            set_profile_override((*v).max(1) as u32, &mut config.cockpit, |s, val| {
+                s.max_concurrent_workers = val
+            });
+        }
+        (FieldKey::CockpitReplayEvents, FieldValue::Number(v)) => {
+            set_profile_override((*v).max(1) as u32, &mut config.cockpit, |s, val| {
+                s.replay_events = val
+            });
+        }
+        (FieldKey::CockpitReplayBytes, FieldValue::Number(v)) => {
+            set_profile_override((*v).max(1024), &mut config.cockpit, |s, val| {
+                s.replay_bytes = val
+            });
+        }
+        (FieldKey::CockpitNodePath, FieldValue::Text(v)) => {
+            set_profile_override(v.clone(), &mut config.cockpit, |s, val| s.node_path = val);
         }
         _ => {}
     }
@@ -1988,6 +2401,53 @@ mod tests {
             Some(original),
             "Override value should match what was set"
         );
+    }
+
+    #[test]
+    fn test_worktree_enabled_field_uses_existing_config_value() {
+        let mut global = Config::default();
+        global.worktree.enabled = true;
+        let profile = ProfileConfig::default();
+
+        let fields = build_fields_for_category(
+            SettingsCategory::Worktree,
+            SettingsScope::Global,
+            &global,
+            &profile,
+        );
+        let field = fields
+            .iter()
+            .find(|f| f.key == FieldKey::WorktreeEnabled)
+            .unwrap();
+
+        assert_eq!(field.label, "Enabled by Default");
+        assert!(matches!(field.value, FieldValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_worktree_enabled_profile_override() {
+        let global = Config::default();
+        let profile = ProfileConfig {
+            worktree: Some(crate::session::WorktreeConfigOverride {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let fields = build_fields_for_category(
+            SettingsCategory::Worktree,
+            SettingsScope::Profile,
+            &global,
+            &profile,
+        );
+        let field = fields
+            .iter()
+            .find(|f| f.key == FieldKey::WorktreeEnabled)
+            .unwrap();
+
+        assert!(field.has_override);
+        assert!(matches!(field.value, FieldValue::Bool(true)));
     }
 
     #[test]

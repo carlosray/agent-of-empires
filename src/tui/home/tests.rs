@@ -148,7 +148,7 @@ fn test_initial_cursor_position() {
 #[serial]
 fn test_q_returns_quit_action() {
     let mut env = create_test_env_empty();
-    let action = env.view.handle_key(key(KeyCode::Char('q')));
+    let action = env.view.handle_key(key(KeyCode::Char('q')), None);
     assert_eq!(action, Some(Action::Quit));
 }
 
@@ -157,7 +157,7 @@ fn test_q_returns_quit_action() {
 fn test_question_mark_opens_help() {
     let mut env = create_test_env_empty();
     assert!(!env.view.show_help);
-    env.view.handle_key(key(KeyCode::Char('?')));
+    env.view.handle_key(key(KeyCode::Char('?')), None);
     assert!(env.view.show_help);
 }
 
@@ -166,7 +166,7 @@ fn test_question_mark_opens_help() {
 fn test_help_closes_on_esc() {
     let mut env = create_test_env_empty();
     env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Esc));
+    env.view.handle_key(key(KeyCode::Esc), None);
     assert!(!env.view.show_help);
 }
 
@@ -175,7 +175,7 @@ fn test_help_closes_on_esc() {
 fn test_help_closes_on_question_mark() {
     let mut env = create_test_env_empty();
     env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Char('?')));
+    env.view.handle_key(key(KeyCode::Char('?')), None);
     assert!(!env.view.show_help);
 }
 
@@ -184,7 +184,7 @@ fn test_help_closes_on_question_mark() {
 fn test_help_closes_on_q() {
     let mut env = create_test_env_empty();
     env.view.show_help = true;
-    env.view.handle_key(key(KeyCode::Char('q')));
+    env.view.handle_key(key(KeyCode::Char('q')), None);
     assert!(!env.view.show_help);
 }
 
@@ -202,7 +202,7 @@ fn test_has_dialog_returns_true_for_help() {
 fn test_n_opens_new_dialog() {
     let mut env = create_test_env_empty();
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('n')));
+    env.view.handle_key(key(KeyCode::Char('n')), None);
     assert!(env.view.new_dialog.is_some());
 }
 
@@ -224,7 +224,7 @@ fn test_has_dialog_returns_true_for_new_dialog() {
 fn test_cursor_down_j() {
     let mut env = create_test_env_with_sessions(5);
     assert_eq!(env.view.cursor, 0);
-    env.view.handle_key(key(KeyCode::Char('j')));
+    env.view.handle_key(key(KeyCode::Char('j')), None);
     assert_eq!(env.view.cursor, 1);
 }
 
@@ -233,7 +233,7 @@ fn test_cursor_down_j() {
 fn test_cursor_down_arrow() {
     let mut env = create_test_env_with_sessions(5);
     assert_eq!(env.view.cursor, 0);
-    env.view.handle_key(key(KeyCode::Down));
+    env.view.handle_key(key(KeyCode::Down), None);
     assert_eq!(env.view.cursor, 1);
 }
 
@@ -242,7 +242,7 @@ fn test_cursor_down_arrow() {
 fn test_cursor_up_k() {
     let mut env = create_test_env_with_sessions(5);
     env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::Char('k')));
+    env.view.handle_key(key(KeyCode::Char('k')), None);
     assert_eq!(env.view.cursor, 2);
 }
 
@@ -251,7 +251,7 @@ fn test_cursor_up_k() {
 fn test_cursor_up_arrow() {
     let mut env = create_test_env_with_sessions(5);
     env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::Up));
+    env.view.handle_key(key(KeyCode::Up), None);
     assert_eq!(env.view.cursor, 2);
 }
 
@@ -260,7 +260,7 @@ fn test_cursor_up_arrow() {
 fn test_cursor_bounds_at_top() {
     let mut env = create_test_env_with_sessions(5);
     env.view.cursor = 0;
-    env.view.handle_key(key(KeyCode::Up));
+    env.view.handle_key(key(KeyCode::Up), None);
     assert_eq!(env.view.cursor, 0);
 }
 
@@ -269,7 +269,7 @@ fn test_cursor_bounds_at_top() {
 fn test_cursor_bounds_at_bottom() {
     let mut env = create_test_env_with_sessions(5);
     env.view.cursor = 4;
-    env.view.handle_key(key(KeyCode::Down));
+    env.view.handle_key(key(KeyCode::Down), None);
     assert_eq!(env.view.cursor, 4);
 }
 
@@ -278,7 +278,7 @@ fn test_cursor_bounds_at_bottom() {
 fn test_page_down() {
     let mut env = create_test_env_with_sessions(20);
     env.view.cursor = 0;
-    env.view.handle_key(key(KeyCode::PageDown));
+    env.view.handle_key(key(KeyCode::PageDown), None);
     assert_eq!(env.view.cursor, 10);
 }
 
@@ -287,7 +287,7 @@ fn test_page_down() {
 fn test_page_up() {
     let mut env = create_test_env_with_sessions(20);
     env.view.cursor = 15;
-    env.view.handle_key(key(KeyCode::PageUp));
+    env.view.handle_key(key(KeyCode::PageUp), None);
     assert_eq!(env.view.cursor, 5);
 }
 
@@ -296,7 +296,7 @@ fn test_page_up() {
 fn test_page_down_clamps_to_end() {
     let mut env = create_test_env_with_sessions(5);
     env.view.cursor = 0;
-    env.view.handle_key(key(KeyCode::PageDown));
+    env.view.handle_key(key(KeyCode::PageDown), None);
     assert_eq!(env.view.cursor, 4);
 }
 
@@ -305,7 +305,7 @@ fn test_page_down_clamps_to_end() {
 fn test_page_up_clamps_to_start() {
     let mut env = create_test_env_with_sessions(5);
     env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::PageUp));
+    env.view.handle_key(key(KeyCode::PageUp), None);
     assert_eq!(env.view.cursor, 0);
 }
 
@@ -314,7 +314,7 @@ fn test_page_up_clamps_to_start() {
 fn test_home_key() {
     let mut env = create_test_env_with_sessions(10);
     env.view.cursor = 7;
-    env.view.handle_key(key(KeyCode::Home));
+    env.view.handle_key(key(KeyCode::Home), None);
     assert_eq!(env.view.cursor, 0);
 }
 
@@ -323,7 +323,7 @@ fn test_home_key() {
 fn test_end_key() {
     let mut env = create_test_env_with_sessions(10);
     env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::End));
+    env.view.handle_key(key(KeyCode::End), None);
     assert_eq!(env.view.cursor, 9);
 }
 
@@ -334,9 +334,9 @@ fn test_g_key_cycles_group_by() {
 
     let mut env = create_test_env_with_sessions(3);
     env.view.group_by = GroupByMode::Manual;
-    env.view.handle_key(key(KeyCode::Char('g')));
+    env.view.handle_key(key(KeyCode::Char('g')), None);
     assert_eq!(env.view.group_by, GroupByMode::Project);
-    env.view.handle_key(key(KeyCode::Char('g')));
+    env.view.handle_key(key(KeyCode::Char('g')), None);
     assert_eq!(env.view.group_by, GroupByMode::Manual);
 }
 
@@ -345,7 +345,7 @@ fn test_g_key_cycles_group_by() {
 fn test_uppercase_g_goes_to_end() {
     let mut env = create_test_env_with_sessions(10);
     env.view.cursor = 3;
-    env.view.handle_key(key(KeyCode::Char('G')));
+    env.view.handle_key(key(KeyCode::Char('G')), None);
     assert_eq!(env.view.cursor, 9);
 }
 
@@ -353,9 +353,9 @@ fn test_uppercase_g_goes_to_end() {
 #[serial]
 fn test_cursor_movement_on_empty_list() {
     let mut env = create_test_env_empty();
-    env.view.handle_key(key(KeyCode::Down));
+    env.view.handle_key(key(KeyCode::Down), None);
     assert_eq!(env.view.cursor, 0);
-    env.view.handle_key(key(KeyCode::Up));
+    env.view.handle_key(key(KeyCode::Up), None);
     assert_eq!(env.view.cursor, 0);
 }
 
@@ -365,8 +365,47 @@ fn test_enter_on_session_returns_attach_action() {
     let mut env = create_test_env_with_sessions(3);
     env.view.cursor = 1;
     env.view.update_selected();
-    let action = env.view.handle_key(key(KeyCode::Enter));
+    let action = env.view.handle_key(key(KeyCode::Enter), None);
     assert!(matches!(action, Some(Action::AttachSession(_))));
+}
+
+#[cfg(feature = "serve")]
+#[test]
+#[serial]
+fn test_enter_on_cockpit_session_returns_toast() {
+    use crate::session::config::GroupByMode;
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new("test").unwrap();
+    let mut instances = vec![
+        Instance::new("plain", "/tmp/0"),
+        Instance::new("cockpit", "/tmp/1"),
+        Instance::new("plain2", "/tmp/2"),
+    ];
+    instances[1].cockpit_mode = true;
+    storage.save(&instances).unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    view.group_by = GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.cursor = 1;
+    view.update_selected();
+
+    let action = view.handle_key(key(KeyCode::Enter), None);
+    match action {
+        Some(Action::SetTransientStatus(msg)) => {
+            assert!(
+                msg.to_lowercase().contains("cockpit"),
+                "toast should mention cockpit, got: {msg}"
+            );
+            assert!(
+                msg.to_lowercase().contains("dashboard") || msg.contains("aoe serve"),
+                "toast should point at the dashboard, got: {msg}"
+            );
+        }
+        other => panic!("expected SetTransientStatus toast for cockpit session, got {other:?}"),
+    }
 }
 
 #[test]
@@ -374,7 +413,7 @@ fn test_enter_on_session_returns_attach_action() {
 fn test_slash_enters_search_mode() {
     let mut env = create_test_env_with_sessions(3);
     assert!(!env.view.search_active);
-    env.view.handle_key(key(KeyCode::Char('/')));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
     assert!(env.view.search_active);
     assert!(env.view.search_query.value().is_empty());
 }
@@ -383,11 +422,11 @@ fn test_slash_enters_search_mode() {
 #[serial]
 fn test_search_mode_captures_chars() {
     let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('t')));
-    env.view.handle_key(key(KeyCode::Char('e')));
-    env.view.handle_key(key(KeyCode::Char('s')));
-    env.view.handle_key(key(KeyCode::Char('t')));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('t')), None);
+    env.view.handle_key(key(KeyCode::Char('e')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
+    env.view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(env.view.search_query.value(), "test");
 }
 
@@ -395,10 +434,10 @@ fn test_search_mode_captures_chars() {
 #[serial]
 fn test_search_mode_backspace() {
     let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('a')));
-    env.view.handle_key(key(KeyCode::Char('b')));
-    env.view.handle_key(key(KeyCode::Backspace));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('a')), None);
+    env.view.handle_key(key(KeyCode::Char('b')), None);
+    env.view.handle_key(key(KeyCode::Backspace), None);
     assert_eq!(env.view.search_query.value(), "a");
 }
 
@@ -406,9 +445,9 @@ fn test_search_mode_backspace() {
 #[serial]
 fn test_search_mode_esc_exits_and_clears() {
     let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('x')));
-    env.view.handle_key(key(KeyCode::Esc));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('x')), None);
+    env.view.handle_key(key(KeyCode::Esc), None);
     assert!(!env.view.search_active);
     assert!(env.view.search_query.value().is_empty());
     assert!(env.view.search_matches.is_empty());
@@ -418,9 +457,9 @@ fn test_search_mode_esc_exits_and_clears() {
 #[serial]
 fn test_search_mode_enter_exits_and_clears_state() {
     let mut env = create_test_env_with_sessions(3);
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('s')));
-    env.view.handle_key(key(KeyCode::Enter));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
     assert!(!env.view.search_active);
     assert_eq!(env.view.search_query.value(), "");
     assert!(env.view.search_matches.is_empty());
@@ -433,7 +472,7 @@ fn test_d_on_session_opens_delete_dialog() {
     let mut env = create_test_env_with_sessions(3);
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('d')));
+    env.view.handle_key(key(KeyCode::Char('d')), None);
     assert!(env.view.unified_delete_dialog.is_some());
 }
 
@@ -445,7 +484,7 @@ fn test_d_on_group_with_sessions_opens_group_delete_options_dialog() {
     env.view.update_selected();
     assert!(env.view.selected_group.is_some());
     assert!(env.view.group_delete_options_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('d')));
+    env.view.handle_key(key(KeyCode::Char('d')), None);
     assert!(env.view.group_delete_options_dialog.is_some());
 }
 
@@ -454,7 +493,7 @@ fn test_d_on_group_with_sessions_opens_group_delete_options_dialog() {
 fn test_selected_session_updates_on_cursor_move() {
     let mut env = create_test_env_with_sessions(3);
     let first_id = env.view.selected_session.clone();
-    env.view.handle_key(key(KeyCode::Down));
+    env.view.handle_key(key(KeyCode::Down), None);
     assert_ne!(env.view.selected_session, first_id);
 }
 
@@ -572,7 +611,7 @@ fn test_search_n_cycles_forward() {
     assert!(match_count > 1);
 
     let first_cursor = env.view.cursor;
-    env.view.handle_key(key(KeyCode::Char('n')));
+    env.view.handle_key(key(KeyCode::Char('n')), None);
     assert_eq!(env.view.search_match_index, 1);
     // Cursor should have moved
     assert_ne!(env.view.cursor, first_cursor);
@@ -588,7 +627,7 @@ fn test_search_n_wraps_around() {
 
     // Cycle through all matches to wrap
     for _ in 0..match_count {
-        env.view.handle_key(key(KeyCode::Char('n')));
+        env.view.handle_key(key(KeyCode::Char('n')), None);
     }
     assert_eq!(env.view.search_match_index, 0);
 }
@@ -603,7 +642,7 @@ fn test_search_shift_n_cycles_backward() {
     assert!(match_count > 1);
 
     // N from index 0 should wrap to last
-    env.view.handle_key(key(KeyCode::Char('N')));
+    env.view.handle_key(key(KeyCode::Char('N')), None);
     assert_eq!(env.view.search_match_index, match_count - 1);
 }
 
@@ -611,10 +650,10 @@ fn test_search_shift_n_cycles_backward() {
 #[serial]
 fn test_esc_clears_search_matches() {
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('s')));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
     assert!(!env.view.search_matches.is_empty());
-    env.view.handle_key(key(KeyCode::Esc));
+    env.view.handle_key(key(KeyCode::Esc), None);
     assert!(env.view.search_matches.is_empty());
     assert_eq!(env.view.search_match_index, 0);
 }
@@ -624,16 +663,16 @@ fn test_esc_clears_search_matches() {
 fn test_enter_clears_matches_so_n_opens_new_dialog() {
     let mut env = create_test_env_with_sessions(5);
     // Search, then Enter to exit search mode
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('s')));
-    env.view.handle_key(key(KeyCode::Enter));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
     assert!(!env.view.search_active);
     // Enter should have cleared matches
     assert!(env.view.search_matches.is_empty());
 
     // n should now open new session dialog (not cycle matches)
     assert!(env.view.new_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('n')));
+    env.view.handle_key(key(KeyCode::Char('n')), None);
     assert!(env.view.new_dialog.is_some());
 }
 
@@ -642,9 +681,9 @@ fn test_enter_clears_matches_so_n_opens_new_dialog() {
 fn test_reload_does_not_snap_cursor_after_enter() {
     let mut env = create_test_env_with_sessions(5);
     // Search and exit with Enter
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('s')));
-    env.view.handle_key(key(KeyCode::Enter));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
     assert!(!env.view.search_active);
 
     // Navigate away from the search result
@@ -662,12 +701,12 @@ fn test_reload_does_not_snap_cursor_after_enter() {
 #[serial]
 fn test_enter_clears_matches_and_resets_index() {
     let mut env = create_test_env_with_sessions(5);
-    env.view.handle_key(key(KeyCode::Char('/')));
-    env.view.handle_key(key(KeyCode::Char('s')));
+    env.view.handle_key(key(KeyCode::Char('/')), None);
+    env.view.handle_key(key(KeyCode::Char('s')), None);
     let match_count = env.view.search_matches.len();
     assert!(match_count > 0);
 
-    env.view.handle_key(key(KeyCode::Enter));
+    env.view.handle_key(key(KeyCode::Enter), None);
     assert!(!env.view.search_active);
     // Enter should clear matches so normal keybindings work
     assert!(env.view.search_matches.is_empty());
@@ -695,7 +734,7 @@ fn test_r_opens_rename_dialog() {
     let mut env = create_test_env_with_sessions(3);
     env.view.update_selected();
     assert!(env.view.rename_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('r')));
+    env.view.handle_key(key(KeyCode::Char('r')), None);
     assert!(env.view.rename_dialog.is_some());
 }
 
@@ -707,7 +746,7 @@ fn test_rename_dialog_opened_on_group() {
     env.view.update_selected();
     assert!(env.view.selected_group.is_some());
     assert!(env.view.rename_dialog.is_none());
-    env.view.handle_key(key(KeyCode::Char('r')));
+    env.view.handle_key(key(KeyCode::Char('r')), None);
     assert!(env.view.rename_dialog.is_some());
     assert!(env.view.group_rename_context.is_some());
 }
@@ -718,7 +757,7 @@ fn test_has_dialog_returns_true_for_rename_dialog() {
     let mut env = create_test_env_with_sessions(1);
     env.view.update_selected();
     assert!(!env.view.has_dialog());
-    env.view.handle_key(key(KeyCode::Char('r')));
+    env.view.handle_key(key(KeyCode::Char('r')), None);
     assert!(env.view.has_dialog());
 }
 
@@ -753,7 +792,7 @@ fn test_uppercase_p_opens_profile_picker() {
     let mut view = env.view;
 
     assert!(view.profile_picker_dialog.is_none());
-    let action = view.handle_key(key(KeyCode::Char('P')));
+    let action = view.handle_key(key(KeyCode::Char('P')), None);
     assert_eq!(action, None);
     assert!(view.profile_picker_dialog.is_some());
 }
@@ -765,11 +804,11 @@ fn test_uppercase_p_in_search_mode_does_not_open_picker() {
     let mut view = env.view;
 
     // Enter search mode
-    view.handle_key(key(KeyCode::Char('/')));
+    view.handle_key(key(KeyCode::Char('/')), None);
     assert!(view.search_active);
 
     // P should be treated as search input, not open picker
-    view.handle_key(key(KeyCode::Char('P')));
+    view.handle_key(key(KeyCode::Char('P')), None);
     assert!(view.profile_picker_dialog.is_none());
     assert_eq!(view.search_query.value(), "P");
 }
@@ -780,10 +819,10 @@ fn test_uppercase_p_picker_esc_closes() {
     let env = create_test_env_empty();
     let mut view = env.view;
 
-    view.handle_key(key(KeyCode::Char('P')));
+    view.handle_key(key(KeyCode::Char('P')), None);
     assert!(view.profile_picker_dialog.is_some());
 
-    view.handle_key(key(KeyCode::Esc));
+    view.handle_key(key(KeyCode::Esc), None);
     assert!(view.profile_picker_dialog.is_none());
 }
 
@@ -804,15 +843,15 @@ fn test_uppercase_p_picker_switch_profile() {
     view.update_selected();
 
     // Open picker
-    view.handle_key(key(KeyCode::Char('P')));
+    view.handle_key(key(KeyCode::Char('P')), None);
     assert!(view.profile_picker_dialog.is_some());
 
     // In filtered mode, "all" is at top, then "first", "second", "test"
     // Navigate down to reach "second" and select it
-    view.handle_key(key(KeyCode::Down));
-    view.handle_key(key(KeyCode::Down));
-    view.handle_key(key(KeyCode::Down));
-    let action = view.handle_key(key(KeyCode::Enter));
+    view.handle_key(key(KeyCode::Down), None);
+    view.handle_key(key(KeyCode::Down), None);
+    view.handle_key(key(KeyCode::Down), None);
+    let action = view.handle_key(key(KeyCode::Enter), None);
     // Profile switch is handled internally, no Action returned
     assert_eq!(action, None);
     assert_eq!(view.active_profile, Some("second".to_string()));
@@ -827,10 +866,10 @@ fn test_t_toggles_view_mode() {
 
     assert_eq!(view.view_mode, ViewMode::Agent);
 
-    view.handle_key(key(KeyCode::Char('t')));
+    view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Terminal);
 
-    view.handle_key(key(KeyCode::Char('t')));
+    view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Agent);
 }
 
@@ -841,15 +880,15 @@ fn test_enter_returns_attach_terminal_in_terminal_view() {
     let mut view = env.view;
 
     // In Agent view, Enter returns AttachSession
-    let action = view.handle_key(key(KeyCode::Enter));
+    let action = view.handle_key(key(KeyCode::Enter), None);
     assert!(matches!(action, Some(Action::AttachSession(_))));
 
     // Switch to Terminal view
-    view.handle_key(key(KeyCode::Char('t')));
+    view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Terminal);
 
     // In Terminal view, Enter returns AttachTerminal
-    let action = view.handle_key(key(KeyCode::Enter));
+    let action = view.handle_key(key(KeyCode::Enter), None);
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
 }
 
@@ -863,7 +902,7 @@ fn test_shift_t_attaches_terminal_from_agent_view() {
     assert_eq!(view.view_mode, ViewMode::Agent);
 
     // Shift+T should return AttachTerminal without switching view mode
-    let action = view.handle_key(key(KeyCode::Char('T')));
+    let action = view.handle_key(key(KeyCode::Char('T')), None);
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
     assert_eq!(view.view_mode, ViewMode::Agent);
 }
@@ -875,11 +914,11 @@ fn test_shift_t_attaches_terminal_from_terminal_view() {
     let mut view = env.view;
 
     // Switch to Terminal view
-    view.handle_key(key(KeyCode::Char('t')));
+    view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Terminal);
 
     // Shift+T should also work from Terminal view
-    let action = view.handle_key(key(KeyCode::Char('T')));
+    let action = view.handle_key(key(KeyCode::Char('T')), None);
     assert!(matches!(action, Some(Action::AttachTerminal(_, _))));
 }
 
@@ -889,7 +928,7 @@ fn test_shift_t_noop_with_no_sessions() {
     let env = create_test_env_empty();
     let mut view = env.view;
 
-    let action = view.handle_key(key(KeyCode::Char('T')));
+    let action = view.handle_key(key(KeyCode::Char('T')), None);
     assert!(action.is_none());
 }
 
@@ -900,12 +939,12 @@ fn test_d_shows_info_dialog_in_terminal_view() {
     let mut view = env.view;
 
     // Switch to Terminal view
-    view.handle_key(key(KeyCode::Char('t')));
+    view.handle_key(key(KeyCode::Char('t')), None);
     assert_eq!(view.view_mode, ViewMode::Terminal);
 
     // Press 'd' - should show info dialog, not delete dialog
     assert!(view.info_dialog.is_none());
-    view.handle_key(key(KeyCode::Char('d')));
+    view.handle_key(key(KeyCode::Char('d')), None);
     assert!(view.info_dialog.is_some());
     assert!(view.unified_delete_dialog.is_none());
 }
@@ -917,7 +956,7 @@ fn test_uppercase_b_on_non_git_session_shows_info_dialog() {
     let mut view = env.view;
 
     assert!(view.info_dialog.is_none());
-    view.handle_key(key(KeyCode::Char('B')));
+    view.handle_key(key(KeyCode::Char('B')), None);
     assert!(view.info_dialog.is_some());
     assert!(view.confirm_dialog.is_none());
 }
@@ -947,7 +986,7 @@ fn test_uppercase_b_on_changed_branch_opens_confirm_dialog() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    view.handle_key(key(KeyCode::Char('B')));
+    view.handle_key(key(KeyCode::Char('B')), None);
 
     let dialog = view
         .confirm_dialog
@@ -987,7 +1026,7 @@ fn test_has_dialog_includes_settings_view() {
 fn test_s_opens_settings_view() {
     let mut env = create_test_env_empty();
     assert!(env.view.settings_view.is_none());
-    env.view.handle_key(key(KeyCode::Char('s')));
+    env.view.handle_key(key(KeyCode::Char('s')), None);
     assert!(env.view.settings_view.is_some());
 }
 
@@ -1035,7 +1074,6 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         container_id: None,
         image: "ubuntu:latest".to_string(),
         container_name: "test-container".to_string(),
-        created_at: None,
         extra_env: None,
         custom_instruction: None,
     });
@@ -1108,7 +1146,6 @@ fn test_group_has_containers() {
         container_id: None,
         image: "ubuntu:latest".to_string(),
         container_name: "test-container".to_string(),
-        created_at: None,
         extra_env: None,
         custom_instruction: None,
     });
@@ -1301,7 +1338,6 @@ fn test_delete_group_with_sessions_respects_container_option() {
         container_id: None,
         image: "ubuntu:latest".to_string(),
         container_name: "test-container".to_string(),
-        created_at: None,
         extra_env: None,
         custom_instruction: None,
     });
@@ -1449,7 +1485,7 @@ fn test_group_collapsed_state_persists_across_reload() {
     // Move cursor to group and collapse it with Enter
     env.view.cursor = group_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter));
+    env.view.handle_key(key(KeyCode::Enter), None);
 
     // Verify it's collapsed
     if let Item::Group { collapsed, .. } = &env.view.flat_items[group_idx] {
@@ -1503,7 +1539,7 @@ fn test_group_collapsed_state_saved_to_storage() {
         .unwrap();
     env.view.cursor = group_idx;
     env.view.update_selected();
-    env.view.handle_key(key(KeyCode::Enter));
+    env.view.handle_key(key(KeyCode::Enter), None);
 
     // Load fresh from storage to verify persistence
     let (_, groups) = env
@@ -1577,7 +1613,7 @@ fn test_grow_list_clamps_at_maximum() {
 fn test_uppercase_h_shrinks_list() {
     let mut env = create_test_env_empty();
     assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('H')));
+    env.view.handle_key(key(KeyCode::Char('H')), None);
     assert_eq!(env.view.list_width, 30);
 }
 
@@ -1586,7 +1622,7 @@ fn test_uppercase_h_shrinks_list() {
 fn test_uppercase_l_grows_list() {
     let mut env = create_test_env_empty();
     assert_eq!(env.view.list_width, 35);
-    env.view.handle_key(key(KeyCode::Char('L')));
+    env.view.handle_key(key(KeyCode::Char('L')), None);
     assert_eq!(env.view.list_width, 40);
 }
 
@@ -1607,16 +1643,19 @@ fn test_o_key_cycles_sort_order_forward() {
     let mut env = create_test_env_with_mixed_sessions();
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
-    env.view.handle_key(key(KeyCode::Char('o')));
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    assert_eq!(env.view.sort_order, SortOrder::LastActivity);
+
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::Oldest);
 
-    env.view.handle_key(key(KeyCode::Char('o')));
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::AZ);
 
-    env.view.handle_key(key(KeyCode::Char('o')));
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::ZA);
 
-    env.view.handle_key(key(KeyCode::Char('o')));
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 }
 
@@ -1628,21 +1667,36 @@ fn test_ctrl_o_key_cycles_sort_order_backward() {
     let mut env = create_test_env_with_mixed_sessions();
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
-    // Ctrl+o cycles backward: Oldest -> ZA -> AZ -> Newest -> Oldest
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    // Ctrl+o cycles backward:
+    // Newest -> ZA -> AZ -> Oldest -> LastActivity -> Newest
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
     assert_eq!(env.view.sort_order, SortOrder::ZA);
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
     assert_eq!(env.view.sort_order, SortOrder::AZ);
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
     assert_eq!(env.view.sort_order, SortOrder::Oldest);
 
-    env.view
-        .handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
+    assert_eq!(env.view.sort_order, SortOrder::LastActivity);
+
+    env.view.handle_key(
+        KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        None,
+    );
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 }
 
@@ -1654,9 +1708,10 @@ fn test_o_key_flat_items_sorted_az() {
     let mut env = create_test_env_with_mixed_sessions();
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
-    // Press 'o' twice to get to AZ (Newest -> Oldest -> AZ)
-    env.view.handle_key(key(KeyCode::Char('o')));
-    env.view.handle_key(key(KeyCode::Char('o')));
+    // Press 'o' three times to get to AZ (Newest -> LastActivity -> Oldest -> AZ)
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::AZ);
 
     let mut session_titles: Vec<_> = Vec::new();
@@ -1686,10 +1741,12 @@ fn test_o_key_flat_items_sorted_za() {
 
     let mut env = create_test_env_with_mixed_sessions();
 
-    // Press 'o' three times to get to ZA (Oldest -> Newest -> AZ -> ZA)
-    env.view.handle_key(key(KeyCode::Char('o')));
-    env.view.handle_key(key(KeyCode::Char('o')));
-    env.view.handle_key(key(KeyCode::Char('o')));
+    // Press 'o' four times to get to ZA
+    // (Newest -> LastActivity -> Oldest -> AZ -> ZA)
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::ZA);
 
     let mut session_titles: Vec<_> = Vec::new();
@@ -1719,11 +1776,13 @@ fn test_o_key_flat_items_newest_preserves_insertion_order() {
 
     let mut env = create_test_env_with_mixed_sessions();
 
-    // Press 'o' four times to wrap back to Newest (Newest -> Oldest -> AZ -> ZA -> Newest)
-    env.view.handle_key(key(KeyCode::Char('o')));
-    env.view.handle_key(key(KeyCode::Char('o')));
-    env.view.handle_key(key(KeyCode::Char('o')));
-    env.view.handle_key(key(KeyCode::Char('o')));
+    // Press 'o' five times to wrap back to Newest
+    // (Newest -> LastActivity -> Oldest -> AZ -> ZA -> Newest)
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
     assert_eq!(env.view.sort_order, SortOrder::Newest);
 
     let mut session_titles: Vec<_> = Vec::new();
@@ -1765,8 +1824,8 @@ fn test_o_key_clamps_cursor_when_list_shrinks() {
     let filtered_count = env.view.search_matches.len();
     assert!(filtered_count < initial_items);
 
-    env.view.handle_key(key(KeyCode::Char('o')));
-    assert_eq!(env.view.sort_order, SortOrder::Oldest);
+    env.view.handle_key(key(KeyCode::Char('o')), None);
+    assert_eq!(env.view.sort_order, SortOrder::LastActivity);
 
     let valid_max = env.view.flat_items.len().saturating_sub(1);
     assert!(env.view.cursor <= valid_max);
@@ -1914,6 +1973,7 @@ fn test_create_session_in_all_mode_is_findable() {
         path: project_dir.to_str().unwrap().to_string(),
         group: String::new(),
         tool: "claude".to_string(),
+        worktree_enabled: false,
         worktree_branch: None,
         create_new_branch: false,
         extra_repo_paths: Vec::new(),
@@ -2141,7 +2201,7 @@ fn test_shift_n_opens_prefilled_dialog_from_session() {
     env.view.cursor = work_session_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('N')));
+    env.view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
@@ -2162,7 +2222,7 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
     env.view.cursor = group_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('N')));
+    env.view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.group_value(), "work");
 }
@@ -2171,7 +2231,7 @@ fn test_shift_n_opens_prefilled_dialog_from_group() {
 #[serial]
 fn test_shift_n_does_nothing_with_no_selection() {
     let mut env = create_test_env_empty();
-    env.view.handle_key(key(KeyCode::Char('N')));
+    env.view.handle_key(key(KeyCode::Char('N')), None);
     assert!(
         env.view.new_dialog.is_none(),
         "N should not open dialog when nothing is selected"
@@ -2204,7 +2264,7 @@ fn test_shift_n_prefills_main_repo_path_for_worktree_session() {
     view.cursor = 0;
     view.update_selected();
 
-    view.handle_key(key(KeyCode::Char('N')));
+    view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(
         dialog.path_value(),
@@ -2228,7 +2288,7 @@ fn test_shift_n_prefills_session_path_for_ungrouped() {
     env.view.cursor = ungrouped_idx;
     env.view.update_selected();
 
-    env.view.handle_key(key(KeyCode::Char('N')));
+    env.view.handle_key(key(KeyCode::Char('N')), None);
     let dialog = env.view.new_dialog.as_ref().expect("N should open dialog");
     assert_eq!(dialog.path_value(), "/tmp/u");
     assert_eq!(
@@ -2527,10 +2587,10 @@ fn test_q_in_search_mode_types_q_not_quit() {
     let env = create_test_env_with_sessions(3);
     let mut view = env.view;
 
-    view.handle_key(key(KeyCode::Char('/')));
+    view.handle_key(key(KeyCode::Char('/')), None);
     assert!(view.search_active);
 
-    let action = view.handle_key(key(KeyCode::Char('q')));
+    let action = view.handle_key(key(KeyCode::Char('q')), None);
     assert_eq!(action, None);
     assert!(view.search_active);
     assert_eq!(view.search_query.value(), "q");
@@ -2543,7 +2603,7 @@ fn test_has_dialog_true_when_search_active() {
     let mut view = env.view;
 
     assert!(!view.has_dialog());
-    view.handle_key(key(KeyCode::Char('/')));
+    view.handle_key(key(KeyCode::Char('/')), None);
     assert!(view.has_dialog());
 }
 
@@ -2574,6 +2634,7 @@ fn test_apply_creation_results_returns_session_id() {
         path: project_dir.to_str().unwrap().to_string(),
         group: String::new(),
         tool: "claude".to_string(),
+        worktree_enabled: false,
         worktree_branch: None,
         create_new_branch: false,
         extra_repo_paths: Vec::new(),
@@ -2675,6 +2736,7 @@ fn test_apply_status_updates_persists_tool_session_to_storage() {
         id: inst_id.clone(),
         status: Status::Idle,
         last_error: None,
+        idle_entered_at: None,
         tool_session: Some(tool_session.clone()),
         tool_session_probe: Some(ToolSessionProbe {
             launch_started_at: Utc::now(),
@@ -2701,6 +2763,112 @@ fn test_apply_status_updates_persists_tool_session_to_storage() {
         Some("sess-abc123"),
         "tool_session should be persisted to disk after apply_tool_session_update"
     );
+}
+
+#[test]
+#[serial]
+fn test_cursor_follows_session_after_deletion() {
+    let mut env = create_test_env_with_sessions(4);
+
+    // Cursor starts at 0; move it to index 2 (session2)
+    env.view.cursor = 2;
+    env.view.update_selected();
+    let tracked_id = env.view.selected_session.clone().unwrap();
+
+    // Delete item at index 1 (a session above the cursor)
+    let victim_id = match &env.view.flat_items[1] {
+        Item::Session { id, .. } => id.clone(),
+        _ => panic!("expected session at index 1"),
+    };
+    env.view.remove_instance(&victim_id);
+    env.view.rebuild_group_trees();
+    let _ = env.view.save();
+    env.view.reload().unwrap();
+
+    // Cursor should have followed the tracked session to its new position
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(tracked_id.as_str())
+    );
+    assert_eq!(env.view.cursor, 1);
+}
+
+#[test]
+#[serial]
+fn wants_text_selection_tracks_copy_friendly_surfaces() {
+    use crate::tui::dialogs::ChangelogDialog;
+
+    let mut env = create_test_env_empty();
+
+    // Fresh dashboard: mouse capture should stay on (wheel-scroll works).
+    assert!(!env.view.wants_text_selection());
+
+    // info_dialog (e.g. an error message the user might want to copy).
+    env.view.info_dialog = Some(InfoDialog::new("Error", "something went wrong"));
+    assert!(env.view.wants_text_selection());
+    env.view.info_dialog = None;
+    assert!(!env.view.wants_text_selection());
+
+    // changelog_dialog (release notes).
+    env.view.changelog_dialog = Some(ChangelogDialog::new(Some("1.0.0".to_string())));
+    assert!(env.view.wants_text_selection());
+    env.view.changelog_dialog = None;
+    assert!(!env.view.wants_text_selection());
+
+    // serve_view is feature-gated; only assert it when the feature is on,
+    // since the field isn't present otherwise.
+    #[cfg(feature = "serve")]
+    {
+        use crate::tui::dialogs::ServeView;
+        env.view.serve_view = Some(ServeView::new());
+        assert!(env.view.wants_text_selection());
+        env.view.serve_view = None;
+        assert!(!env.view.wants_text_selection());
+    }
+}
+
+// -- apply_one_status_update -------------------------------------------------
+//
+// These guard the bug discovered in #872: the polling loop runs
+// `update_status_with_metadata` on a clone, then projects the result into
+// a `StatusUpdate`. The first version of that struct dropped the
+// freshly-set `idle_entered_at`, which meant the breathe rattle and
+// fresh-idle color never fired in the TUI even though everything looked
+// right via the API.
+
+#[test]
+#[serial]
+fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
+    use crate::session::Status;
+    use crate::tui::status_poller::StatusUpdate;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // The instance was just created (Idle, no transition observed yet).
+    assert_eq!(env.view.get_instance(&id).unwrap().idle_entered_at, None);
+
+    // Simulate the poller observing a Stop hook: status stays Idle on
+    // disk but the wrapper writes `idle_entered_at` on the polling
+    // clone. The apply path must carry that timestamp into the live
+    // instance, otherwise nothing downstream sees it.
+    let now = chrono::Utc::now();
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: Some(now),
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
+    });
+
+    let inst = env.view.get_instance(&id).unwrap();
+    assert_eq!(inst.status, Status::Idle);
+    assert_eq!(inst.idle_entered_at, Some(now));
 }
 
 #[test]
@@ -2738,6 +2906,7 @@ fn test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_
         id: inst_id.clone(),
         status: Status::Idle,
         last_error: None,
+        idle_entered_at: None,
         tool_session: None,
         tool_session_probe: Some(ToolSessionProbe {
             launch_started_at: Utc::now(),
@@ -2852,6 +3021,55 @@ fn test_backfill_tool_sessions_is_noop_for_session_with_existing_mapping() {
 
 #[test]
 #[serial]
+fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
+    use crate::session::Status;
+    use crate::tui::status_poller::StatusUpdate;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // Seed: session is Idle with a freshness timestamp set.
+    let stop_time = chrono::Utc::now() - chrono::Duration::seconds(60);
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: Some(stop_time),
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
+    });
+    assert_eq!(
+        env.view.get_instance(&id).unwrap().idle_entered_at,
+        Some(stop_time)
+    );
+
+    // Transition Idle -> Running. The poller's wrapper clears
+    // `idle_entered_at` on the clone for non-Idle states; the apply
+    // path has to honor that, otherwise a Running session would still
+    // claim a freshness age.
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Running,
+        last_error: None,
+        idle_entered_at: None,
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
+    });
+
+    let inst = env.view.get_instance(&id).unwrap();
+    assert_eq!(inst.status, Status::Running);
+    assert_eq!(inst.idle_entered_at, None);
+    // And `idle_age()` must not synthesize one out of stale state.
+    assert_eq!(inst.idle_age(), None);
+}
+
+#[test]
+#[serial]
 fn test_backfill_tool_sessions_is_noop_when_tracking_disabled() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
@@ -2917,4 +3135,38 @@ fn test_backfill_tool_sessions_is_noop_for_unsupported_tool() {
         !result,
         "backfill should return false for unsupported tools (is_eligible returns false)"
     );
+}
+
+#[test]
+#[serial]
+fn apply_status_update_skips_terminal_states() {
+    use crate::session::Status;
+    use crate::tui::status_poller::StatusUpdate;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+
+    // Move the session into a terminal state that the apply path is
+    // supposed to leave alone.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = Status::Deleting);
+    let stale_ts = chrono::Utc::now() - chrono::Duration::seconds(10);
+
+    env.view.apply_one_status_update(StatusUpdate {
+        id: id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: Some(stale_ts),
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
+    });
+
+    // Status and timestamp should both stay untouched.
+    let inst = env.view.get_instance(&id).unwrap();
+    assert_eq!(inst.status, Status::Deleting);
+    assert_eq!(inst.idle_entered_at, None);
 }

@@ -6,6 +6,7 @@ This document contains the help content for the `aoe` command-line program.
 
 * [`aoe`↴](#aoe)
 * [`aoe add`↴](#aoe-add)
+* [`aoe agents`↴](#aoe-agents)
 * [`aoe init`↴](#aoe-init)
 * [`aoe list`↴](#aoe-list)
 * [`aoe remove`↴](#aoe-remove)
@@ -20,6 +21,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session rename`↴](#aoe-session-rename)
 * [`aoe session capture`↴](#aoe-session-capture)
 * [`aoe session current`↴](#aoe-session-current)
+* [`aoe session set-session-id`↴](#aoe-session-set-session-id)
 * [`aoe group`↴](#aoe-group)
 * [`aoe group list`↴](#aoe-group-list)
 * [`aoe group create`↴](#aoe-group-create)
@@ -31,6 +33,10 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe profile delete`↴](#aoe-profile-delete)
 * [`aoe profile rename`↴](#aoe-profile-rename)
 * [`aoe profile default`↴](#aoe-profile-default)
+* [`aoe project`↴](#aoe-project)
+* [`aoe project list`↴](#aoe-project-list)
+* [`aoe project add`↴](#aoe-project-add)
+* [`aoe project remove`↴](#aoe-project-remove)
 * [`aoe worktree`↴](#aoe-worktree)
 * [`aoe worktree list`↴](#aoe-worktree-list)
 * [`aoe worktree info`↴](#aoe-worktree-info)
@@ -46,7 +52,13 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme export`↴](#aoe-theme-export)
 * [`aoe theme dir`↴](#aoe-theme-dir)
 * [`aoe serve`↴](#aoe-serve)
+* [`aoe cockpit`↴](#aoe-cockpit)
+* [`aoe cockpit doctor`↴](#aoe-cockpit-doctor)
+* [`aoe cockpit agents`↴](#aoe-cockpit-agents)
+* [`aoe cockpit logs`↴](#aoe-cockpit-logs)
+* [`aoe cockpit restart`↴](#aoe-cockpit-restart)
 * [`aoe uninstall`↴](#aoe-uninstall)
+* [`aoe update`↴](#aoe-update)
 * [`aoe completion`↴](#aoe-completion)
 
 ## `aoe`
@@ -60,6 +72,7 @@ Run without arguments to launch the TUI dashboard.
 ###### **Subcommands:**
 
 * `add` — Add a new session
+* `agents` — List supported agents and their install status
 * `init` — Initialize .agent-of-empires/config.toml in a repository
 * `list` — List all sessions
 * `remove` — Remove a session
@@ -68,12 +81,15 @@ Run without arguments to launch the TUI dashboard.
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
 * `profile` — Manage profiles (separate workspaces)
+* `project` — Manage the project registry used by multi-repo session pickers
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
-* `serve` — Start a web dashboard for remote session access [experimental]
+* `serve` — Start a web dashboard for remote session access
+* `cockpit` — Cockpit (ACP-based native agent rendering) management
 * `uninstall` — Uninstall Agent of Empires
+* `update` — Update aoe to the latest release
 * `completion` — Generate shell completions
 
 ###### **Options:**
@@ -104,12 +120,25 @@ Add a new session
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
-* `-s`, `--sandbox` — Run session in Docker sandbox
-* `--sandbox-image <SANDBOX_IMAGE>` — Custom Docker image for sandbox (implies --sandbox)
+* `--project <PROJECTS>` — Names of registered projects to include as extra repos (use with --worktree). Resolves against the union of global + profile project registries
+* `-s`, `--sandbox` — Run session in a container sandbox
+* `--sandbox-image <SANDBOX_IMAGE>` — Custom container image for sandbox (implies --sandbox)
 * `-y`, `--yolo` — Enable YOLO mode (skip permission prompts)
 * `--trust-hooks` — Automatically trust repository hooks without prompting
 * `--extra-args <EXTRA_ARGS>` — Extra arguments to append after the agent binary
 * `--cmd-override <CMD_OVERRIDE>` — Override the agent binary command
+* `--cockpit` — Use cockpit mode (ACP-based native rendering) for this session. Overrides the default-for-claude setting in cockpit config
+* `--no-cockpit` — Force terminal/PTY mode for this session, overriding the default-for-claude cockpit setting
+* `--agent <AGENT>` — Pick a specific cockpit agent (e.g., aoe-agent, claude-code). Implies --cockpit
+* `--model <MODEL>` — Override the model used by aoe-agent (e.g., claude-opus-4-7, gpt-5, gemini-2.5-pro). Forwarded to the agent at session start
+
+
+
+## `aoe agents`
+
+List supported agents and their install status
+
+**Usage:** `aoe agents`
 
 
 
@@ -196,12 +225,13 @@ Manage session lifecycle (start, stop, attach, etc.)
 
 * `start` — Start a session's tmux process
 * `stop` — Stop session process
-* `restart` — Restart session
+* `restart` — Restart session (or all sessions with `--all`)
 * `attach` — Attach to session interactively
 * `show` — Show session details
 * `rename` — Rename a session
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
+* `set-session-id` — Set agent session ID for a session
 
 
 
@@ -231,13 +261,20 @@ Stop session process
 
 ## `aoe session restart`
 
-Restart session
+Restart session (or all sessions with `--all`)
 
-**Usage:** `aoe session restart <IDENTIFIER>`
+**Usage:** `aoe session restart [OPTIONS] [IDENTIFIER]`
 
 ###### **Arguments:**
 
-* `<IDENTIFIER>` — Session ID or title
+* `<IDENTIFIER>` — Session ID or title (required unless `--all` is passed)
+
+###### **Options:**
+
+* `--all` — Restart every session in the active profile. Useful after `aoe update`, after editing `sandbox.environment`, after a Docker hiccup, or after changing a hook. Mutually exclusive with `identifier`
+* `--parallel <PARALLEL>` — Concurrency cap for `--all`. Restarting many sandboxed sessions in parallel pressures dockerd, so the default is intentionally modest. Ignored when `--all` is not set
+
+  Default value: `3`
 
 
 
@@ -316,6 +353,19 @@ Auto-detect current session
 
 * `-q`, `--quiet` — Just session name (for scripting)
 * `--json` — Output as JSON
+
+
+
+## `aoe session set-session-id`
+
+Set agent session ID for a session
+
+**Usage:** `aoe session set-session-id <IDENTIFIER> <SESSION_ID>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+* `<SESSION_ID>` — Agent session ID to set (pass empty string to clear)
 
 
 
@@ -461,6 +511,78 @@ Show or set default profile
 ###### **Arguments:**
 
 * `<NAME>` — Profile name (optional, shows current if not provided)
+
+
+
+## `aoe project`
+
+Manage the project registry used by multi-repo session pickers
+
+**Usage:** `aoe project <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List registered projects
+* `add` — Add a project to the registry
+* `remove` — Remove a project from the registry
+
+
+
+## `aoe project list`
+
+List registered projects
+
+**Usage:** `aoe project list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output as JSON
+* `--scope <SCOPE>` — Filter by scope (default: all)
+
+  Default value: `all`
+
+  Possible values: `all`, `global`, `profile`
+
+
+
+
+## `aoe project add`
+
+Add a project to the registry
+
+**Usage:** `aoe project add [OPTIONS] <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — Path to the git repository
+
+###### **Options:**
+
+* `--name <NAME>` — Display name (defaults to the directory's basename)
+* `--scope <SCOPE>` — Registry scope. When omitted: defaults to GLOBAL, unless `-p <profile>` was passed at the top level, in which case it defaults to PROFILE (scoping the entry to that profile only)
+
+  Possible values: `global`, `profile`
+
+* `--allow-override` — Allow registering this path even if it already exists in the other scope. Without this flag the command errors when the same canonical path is already registered globally (when adding to profile) or in any profile (when adding globally). When override is allowed and both scopes hold the same path, the profile entry shadows the global one
+
+
+
+## `aoe project remove`
+
+Remove a project from the registry
+
+**Usage:** `aoe project remove [OPTIONS] <NAME_OR_PATH>`
+
+###### **Arguments:**
+
+* `<NAME_OR_PATH>` — Project name or path to remove
+
+###### **Options:**
+
+* `--scope <SCOPE>` — Registry scope to remove from. When omitted: defaults to GLOBAL, unless `-p <profile>` was passed at the top level, in which case it defaults to PROFILE
+
+  Possible values: `global`, `profile`
+
 
 
 
@@ -628,7 +750,7 @@ Show the custom themes directory path
 
 ## `aoe serve`
 
-Start a web dashboard for remote session access [experimental]
+Start a web dashboard for remote session access
 
 **Usage:** `aoe serve [OPTIONS]`
 
@@ -642,12 +764,74 @@ Start a web dashboard for remote session access [experimental]
   Default value: `127.0.0.1`
 * `--no-auth` — Disable authentication (only allowed with localhost binding)
 * `--read-only` — Read-only mode: view terminals but cannot send keystrokes
-* `--remote` — Expose via Cloudflare Tunnel for secure remote access
-* `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`)
+* `--remote` — Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale Funnel when `tailscale` is installed and logged in (stable `.ts.net` URL, installable PWAs survive restarts). Falls back to a Cloudflare quick tunnel otherwise (fresh URL on every restart)
+* `--tunnel-name <TUNNEL_NAME>` — Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`). Takes precedence over Tailscale auto-detection
+* `--no-tailscale` — Skip Tailscale Funnel auto-detection and go straight to Cloudflare. Useful if you have Tailscale installed for unrelated reasons
 * `--tunnel-url <TUNNEL_URL>` — Hostname for a named tunnel (e.g., aoe.example.com)
 * `--daemon` — Run as a background daemon (detach from terminal)
 * `--stop` — Stop a running daemon
 * `--passphrase <PASSPHRASE>` — Require a passphrase for login (second-factor auth). Can also be set via AOE_SERVE_PASSPHRASE environment variable
+
+
+
+## `aoe cockpit`
+
+Cockpit (ACP-based native agent rendering) management
+
+**Usage:** `aoe cockpit <COMMAND>`
+
+###### **Subcommands:**
+
+* `doctor` — Verify the cockpit can start: Node runtime, configured agents, provider auth (claude login)
+* `agents` — List configured cockpit agents (claude-code, aoe-agent, etc.)
+* `logs` — Tail the worker stderr for a running cockpit session. Requires `aoe serve` to be running and is deferred until the worker supervisor lands
+* `restart` — Restart a wedged cockpit worker. Reserved for the supervisor slice
+
+
+
+## `aoe cockpit doctor`
+
+Verify the cockpit can start: Node runtime, configured agents, provider auth (claude login)
+
+**Usage:** `aoe cockpit doctor [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Emit machine-readable JSON instead of a human report
+* `--fix` — Attempt safe remediations: install missing claude-code-acp adapter, verify aoe-agent presence, etc. (Reserved for future release; the flag exists so scripts can opt in early.)
+
+
+
+## `aoe cockpit agents`
+
+List configured cockpit agents (claude-code, aoe-agent, etc.)
+
+**Usage:** `aoe cockpit agents`
+
+
+
+## `aoe cockpit logs`
+
+Tail the worker stderr for a running cockpit session. Requires `aoe serve` to be running and is deferred until the worker supervisor lands
+
+**Usage:** `aoe cockpit logs [OPTIONS]`
+
+###### **Options:**
+
+* `--session <SESSION>` — Session id whose worker logs to tail
+* `--follow` — Follow new lines as they arrive
+
+
+
+## `aoe cockpit restart`
+
+Restart a wedged cockpit worker. Reserved for the supervisor slice
+
+**Usage:** `aoe cockpit restart <SESSION>`
+
+###### **Arguments:**
+
+* `<SESSION>` — Session id whose worker to restart
 
 
 
@@ -663,6 +847,20 @@ Uninstall Agent of Empires
 * `--keep-tmux-config` — Keep tmux configuration
 * `--dry-run` — Show what would be removed without removing
 * `-y` — Skip confirmation prompts
+
+
+
+## `aoe update`
+
+Update aoe to the latest release
+
+**Usage:** `aoe update [OPTIONS]`
+
+###### **Options:**
+
+* `-y`, `--yes` — Skip confirmation prompt
+* `--check` — Print update status and exit (no install)
+* `--dry-run` — Detect install method and print what would happen, no download
 
 
 

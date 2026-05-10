@@ -1,5 +1,6 @@
 //! tmux integration module
 
+pub(crate) mod env;
 mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
@@ -10,6 +11,16 @@ pub use session::Session;
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::detect_status_from_content;
 pub use terminal_session::{ContainerTerminalSession, TerminalSession};
+pub use utils::tmux_prefix_display;
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_support {
+    pub use super::env::{
+        get_hidden_env, get_hidden_env_batch, remove_hidden_env, set_hidden_env,
+        set_hidden_env_batch, AOE_CAPTURED_SESSION_ID_KEY, AOE_INSTANCE_ID_KEY,
+    };
+}
 
 use std::collections::HashMap;
 use std::process::Command;
@@ -169,7 +180,7 @@ pub fn is_tmux_available() -> bool {
     Command::new("tmux").arg("-V").output().is_ok()
 }
 
-fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
+pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
     use crate::agents::DetectionMethod;
     match &agent.detection {
         DetectionMethod::Which(binary) => {
@@ -425,6 +436,18 @@ aoe_proj_c_ghi11111|0|1|bash\n";
                 "-y",
                 "24",
                 &compound_cmd,
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
                 ";",
                 "set-option",
                 "-p",

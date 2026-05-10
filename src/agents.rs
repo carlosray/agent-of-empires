@@ -24,6 +24,26 @@ pub enum YoloMode {
     AlwaysYolo,
 }
 
+/// How an agent resumes an existing session from the CLI.
+pub enum ResumeStrategy {
+    /// Append a flag (e.g. `--session <id>`). For agents where new and existing
+    /// sessions use the same flag.
+    Flag(&'static str),
+    /// Two different flags depending on whether conversation data already exists.
+    /// `existing` is used when there is prior conversation data (e.g. `--resume`),
+    /// `new_session` when creating/attaching unconditionally (e.g. `--session-id`).
+    FlagPair {
+        existing: &'static str,
+        new_session: &'static str,
+    },
+    /// Resume is a subcommand rather than a flag (e.g. `codex resume <id>`).
+    /// The subcommand + id are inserted right after the binary name so that
+    /// other flags land after it.
+    Subcommand(&'static str),
+    /// Agent does not support session resume.
+    Unsupported,
+}
+
 /// A single hook event that AoE registers in an agent's settings file.
 pub struct HookEvent {
     /// Event name as the agent expects it (e.g. `"PreToolUse"` for Claude Code).
@@ -39,7 +59,7 @@ pub struct AgentHookConfig {
     /// Path relative to the home dir where the agent's settings live
     /// (e.g. `.claude/settings.json`).
     pub settings_rel_path: &'static str,
-    /// Hook events to register (status transitions).
+    /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
 }
 
@@ -68,9 +88,19 @@ pub struct AgentDef {
     /// hooks into the agent's settings file so status is written to a file instead
     /// of being parsed from tmux pane content.
     pub hook_config: Option<AgentHookConfig>,
+    /// How this agent resumes a prior session.
+    pub resume_strategy: ResumeStrategy,
     /// If true, this agent can only run on the host (no sandbox/worktree support).
     /// The new-session dialog hides sandbox and worktree options for these agents.
     pub host_only: bool,
+    /// Milliseconds to wait between sending literal text and the final Enter key.
+    /// Agents with paste-burst detection (e.g. Codex, 120ms window) swallow Enter
+    /// keys that arrive too quickly after a stream of characters, treating them as
+    /// newlines within a paste rather than as "submit". A delay longer than the
+    /// agent's burst window lets the suppression expire before Enter arrives.
+    pub send_keys_enter_delay_ms: u64,
+    /// One-line install command shown when the agent is missing from PATH.
+    pub install_hint: &'static str,
 }
 
 /// Hook events shared by Claude Code and Cursor CLI.
@@ -117,7 +147,13 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".claude/settings.json",
             events: CLAUDE_CURSOR_HOOK_EVENTS,
         }),
+        resume_strategy: ResumeStrategy::FlagPair {
+            existing: "--resume",
+            new_session: "--session-id",
+        },
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "npm install -g @anthropic-ai/claude-code",
     },
     AgentDef {
         name: "opencode",
@@ -130,7 +166,10 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_opencode_status,
         container_env: &[],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://opencode.ai/install | bash",
     },
     AgentDef {
         name: "vibe",
@@ -143,7 +182,10 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_vibe_status,
         container_env: &[],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "pip install mistral-vibe",
     },
     AgentDef {
         name: "codex",
@@ -158,7 +200,13 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Subcommand("resume"),
         host_only: false,
+        // Codex has paste-burst detection with a 120ms Enter-suppression window;
+        // Enter keys arriving within that window after a character stream are
+        // swallowed as newlines instead of triggering submit. 150ms > 120ms.
+        send_keys_enter_delay_ms: 150,
+        install_hint: "npm install -g @openai/codex",
     },
     AgentDef {
         name: "gemini",
@@ -195,7 +243,10 @@ pub const AGENTS: &[AgentDef] = &[
                 },
             ],
         }),
+        resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "npm install -g @google/gemini-cli",
     },
     AgentDef {
         name: "cursor",
@@ -211,7 +262,10 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".cursor/settings.json",
             events: CLAUDE_CURSOR_HOOK_EVENTS,
         }),
+        resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "see https://docs.cursor.com/cli",
     },
     AgentDef {
         name: "copilot",
@@ -224,7 +278,10 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
     },
     AgentDef {
         name: "pi",
@@ -238,7 +295,10 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_pi_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "npm install -g @mariozechner/pi-coding-agent",
     },
     AgentDef {
         name: "droid",
@@ -251,7 +311,10 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_droid_status,
         container_env: &[],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "npm install -g droid",
     },
     AgentDef {
         name: "settl",
@@ -264,13 +327,71 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_settl_status,
         container_env: &[],
         hook_config: None,
+        resume_strategy: ResumeStrategy::Unsupported,
         host_only: true,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "brew install --cask mozilla-ai/tap/settl",
+    },
+    AgentDef {
+        name: "hermes",
+        binary: "hermes",
+        aliases: &[],
+        detection: DetectionMethod::Which("hermes"),
+        yolo: Some(YoloMode::CliFlag("--yolo")),
+        instruction_flag: None,
+        set_default_command: false,
+        // Status is detected via Hermes's shell-hook system (YAML config),
+        // installed by hooks::install_hermes_hooks(); the stub here just
+        // returns Idle as a fallback before the first hook fires.
+        detect_status: status_detection::detect_hermes_status,
+        // HERMES_ACCEPT_HOOKS bypasses the first-use TTY consent prompt for
+        // shell hooks. Hermes still gates each (event, command) on its
+        // allowlist file, which AoE pre-populates in install_hermes_hooks.
+        container_env: &[("HERMES_ACCEPT_HOOKS", "1")],
+        // Hermes uses YAML (`hooks: { event: [...] }`) rather than the
+        // JSON settings.json schema shared by Claude/Cursor/Gemini, so
+        // hook_config: None and install is special-cased like settl.
+        hook_config: None,
+        resume_strategy: ResumeStrategy::Flag("--resume"),
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint:
+            "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
+    },
+    AgentDef {
+        name: "kiro",
+        binary: "kiro-cli",
+        aliases: &["kiro-cli"],
+        detection: DetectionMethod::Which("kiro-cli"),
+        yolo: Some(YoloMode::CliFlag("--trust-all-tools")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_kiro_status,
+        container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
+        // Kiro uses a per-agent JSON config (lowercase event names, flat
+        // {command} objects) rather than the JSON settings.json schema shared
+        // by Claude/Cursor/Gemini, so hook_config: None and install is
+        // special-cased like hermes/settl. Status comes from the hook sidecar
+        // file written by install_kiro_hooks; the pane stub is unused.
+        hook_config: None,
+        resume_strategy: ResumeStrategy::Flag("--resume-id"),
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
     },
 ];
 
 /// Look up an agent by canonical name.
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+/// Returns the delay (in ms) to insert before the submit-Enter for this agent.
+/// Non-zero for agents with paste-burst detection that swallows fast Enters.
+pub fn send_keys_enter_delay(tool: &str) -> u64 {
+    get_agent(tool)
+        .map(|a| a.send_keys_enter_delay_ms)
+        .unwrap_or(0)
 }
 
 /// All canonical agent names in registry order.
@@ -296,6 +417,11 @@ pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Return the install hint for an agent, looked up by canonical name.
+pub fn install_hint(name: &str) -> Option<&'static str> {
+    get_agent(name).map(|a| a.install_hint)
 }
 
 /// Convert a tool name to a 1-based settings index (0 = Auto).
@@ -335,6 +461,25 @@ mod tests {
         assert_eq!(get_agent("pi").unwrap().binary, "pi");
         assert_eq!(get_agent("droid").unwrap().binary, "droid");
         assert_eq!(get_agent("settl").unwrap().binary, "settl");
+        assert_eq!(get_agent("hermes").unwrap().binary, "hermes");
+        assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
+    }
+
+    #[test]
+    fn test_hermes_agent_definition() {
+        let hermes = get_agent("hermes").unwrap();
+        assert_eq!(hermes.binary, "hermes");
+        assert!(matches!(
+            &hermes.detection,
+            DetectionMethod::Which("hermes")
+        ));
+        assert!(matches!(&hermes.yolo, Some(YoloMode::CliFlag("--yolo"))));
+        assert!(!hermes.host_only);
+        assert_eq!(hermes.send_keys_enter_delay_ms, 0);
+        assert_eq!(
+            hermes.install_hint,
+            "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash"
+        );
     }
 
     #[test]
@@ -349,7 +494,7 @@ mod tests {
             names,
             vec![
                 "claude", "opencode", "vibe", "codex", "gemini", "cursor", "copilot", "pi",
-                "droid", "settl"
+                "droid", "settl", "hermes", "kiro"
             ]
         );
     }
@@ -370,6 +515,9 @@ mod tests {
         assert_eq!(resolve_tool_name("settl"), Some("settl"));
         assert_eq!(resolve_tool_name("settlers"), Some("settl"));
         assert_eq!(resolve_tool_name("catan"), Some("settl"));
+        assert_eq!(resolve_tool_name("hermes"), Some("hermes"));
+        assert_eq!(resolve_tool_name("kiro"), Some("kiro"));
+        assert_eq!(resolve_tool_name("kiro-cli"), Some("kiro"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -385,6 +533,8 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("pi")), 8);
         assert_eq!(settings_index_from_name(Some("droid")), 9);
         assert_eq!(settings_index_from_name(Some("settl")), 10);
+        assert_eq!(settings_index_from_name(Some("hermes")), 11);
+        assert_eq!(settings_index_from_name(Some("kiro")), 12);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -394,6 +544,8 @@ mod tests {
         assert_eq!(name_from_settings_index(8), Some("pi"));
         assert_eq!(name_from_settings_index(9), Some("droid"));
         assert_eq!(name_from_settings_index(10), Some("settl"));
+        assert_eq!(name_from_settings_index(11), Some("hermes"));
+        assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -406,5 +558,61 @@ mod tests {
                 agent.name
             );
         }
+    }
+
+    #[test]
+    fn test_send_keys_enter_delay() {
+        // Codex needs a delay to outlast its 120ms paste-burst suppression window
+        assert!(send_keys_enter_delay("codex") >= 150);
+        // Other agents should not delay
+        assert_eq!(send_keys_enter_delay("claude"), 0);
+        assert_eq!(send_keys_enter_delay("opencode"), 0);
+        assert_eq!(send_keys_enter_delay("hermes"), 0);
+        assert_eq!(send_keys_enter_delay("kiro"), 0);
+        assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
+    }
+
+    #[test]
+    fn test_all_agents_have_install_hint() {
+        for agent in AGENTS {
+            assert!(
+                !agent.install_hint.is_empty(),
+                "Agent '{}' should have a non-empty install_hint",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_install_hint_lookup() {
+        assert_eq!(
+            install_hint("claude"),
+            Some("npm install -g @anthropic-ai/claude-code")
+        );
+        assert_eq!(install_hint("codex"), Some("npm install -g @openai/codex"));
+        // Pi is distributed via npm, not pip (issue #818).
+        assert_eq!(
+            install_hint("pi"),
+            Some("npm install -g @mariozechner/pi-coding-agent")
+        );
+        // Mistral Vibe's PyPI package is `mistral-vibe`, not `vibe-tool`.
+        assert_eq!(install_hint("vibe"), Some("pip install mistral-vibe"));
+        // Factory's Droid CLI npm package is `droid`; `@anthropic-ai/droid`
+        // does not exist on the registry.
+        assert_eq!(install_hint("droid"), Some("npm install -g droid"));
+        // settl ships via the mozilla-ai Homebrew tap (settl.dev is unrelated).
+        assert_eq!(
+            install_hint("settl"),
+            Some("brew install --cask mozilla-ai/tap/settl")
+        );
+        assert_eq!(
+            install_hint("hermes"),
+            Some("curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash")
+        );
+        assert_eq!(
+            install_hint("kiro"),
+            Some("curl -fsSL https://cli.kiro.dev/install | bash")
+        );
+        assert!(install_hint("unknown").is_none());
     }
 }

@@ -5,6 +5,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
+use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::styles::Theme;
 
 /// Options for what to clean up when deleting a session
@@ -47,17 +49,13 @@ pub struct UnifiedDeleteDialog {
 
 impl UnifiedDeleteDialog {
     pub fn new(session_title: String, config: DeleteDialogConfig, profile: &str) -> Self {
-        let user_config = config
-            .project_path
-            .as_ref()
-            .and_then(|p| {
-                crate::session::repo_config::resolve_config_with_repo(
-                    profile,
-                    std::path::Path::new(p),
-                )
-                .ok()
-            })
-            .unwrap_or_else(|| crate::session::resolve_config(profile).unwrap_or_default());
+        let user_config = match config.project_path.as_ref() {
+            Some(p) => crate::session::repo_config::resolve_config_with_repo_or_warn(
+                profile,
+                std::path::Path::new(p),
+            ),
+            None => crate::session::profile_config::resolve_config_or_warn(profile),
+        };
 
         let options = DeleteOptions {
             delete_worktree: config.worktree_branch.is_some() && user_config.worktree.auto_cleanup,
@@ -367,37 +365,16 @@ impl UnifiedDeleteDialog {
         checked: bool,
         focused: bool,
     ) {
-        let checkbox = if checked { "[x]" } else { "[ ]" };
-
-        let checkbox_style = if focused {
-            Style::default().fg(theme.accent).bold()
-        } else if checked {
-            Style::default().fg(theme.error).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-
-        let label_style = if focused {
-            Style::default().fg(theme.accent).underlined()
-        } else {
-            Style::default().fg(theme.text)
-        };
-
-        let mut spans = vec![
-            Span::styled(checkbox, checkbox_style),
-            Span::raw(" "),
-            Span::styled(label, label_style),
-        ];
-
-        if let Some(detail_text) = detail {
-            spans.push(Span::raw(" "));
-            spans.push(Span::styled(
-                format!("({})", detail_text),
-                Style::default().fg(theme.dimmed),
-            ));
-        }
-
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let line = checkbox_line(
+            theme,
+            label,
+            detail,
+            0,
+            checked,
+            focused,
+            CheckboxStyle::delete_session(theme),
+        );
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_indented_checkbox(
@@ -409,56 +386,20 @@ impl UnifiedDeleteDialog {
         checked: bool,
         focused: bool,
     ) {
-        let checkbox = if checked { "[x]" } else { "[ ]" };
-
-        let checkbox_style = if focused {
-            Style::default().fg(theme.accent).bold()
-        } else if checked {
-            Style::default().fg(theme.error).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-
-        let label_style = if focused {
-            Style::default().fg(theme.accent).underlined()
-        } else {
-            Style::default().fg(theme.text)
-        };
-
-        let spans = vec![
-            Span::raw("    "),
-            Span::styled(checkbox, checkbox_style),
-            Span::raw(" "),
-            Span::styled(label, label_style),
-        ];
-
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        let line = checkbox_line(
+            theme,
+            label,
+            None,
+            4,
+            checked,
+            focused,
+            CheckboxStyle::delete_session(theme),
+        );
+        frame.render_widget(Paragraph::new(line), area);
     }
 
     fn render_buttons(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let yes_focused = self.focus == FocusElement::YesButton;
-        let no_focused = self.focus == FocusElement::NoButton;
-
-        let yes_style = if yes_focused {
-            Style::default().fg(theme.error).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-
-        let no_style = if no_focused {
-            Style::default().fg(theme.running).bold()
-        } else {
-            Style::default().fg(theme.dimmed)
-        };
-
-        let buttons = Line::from(vec![
-            Span::raw("  "),
-            Span::styled("[Yes]", yes_style),
-            Span::raw("    "),
-            Span::styled("[No]", no_style),
-        ]);
-
-        frame.render_widget(Paragraph::new(buttons).alignment(Alignment::Center), area);
+        render_yes_no(frame, area, theme, self.focus == FocusElement::YesButton);
     }
 
     fn render_hints(&self, frame: &mut Frame, area: Rect, theme: &Theme, has_checkboxes: bool) {

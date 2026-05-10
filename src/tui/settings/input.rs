@@ -390,10 +390,8 @@ impl SettingsView {
             KeyCode::Esc => {
                 self.list_edit_state = None;
             }
-            KeyCode::Up | KeyCode::Char('k') => {
-                if state.selected_index > 0 {
-                    state.selected_index -= 1;
-                }
+            KeyCode::Up | KeyCode::Char('k') if state.selected_index > 0 => {
+                state.selected_index -= 1;
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if let FieldValue::List(items) = &self.fields[self.selected_field].value {
@@ -538,6 +536,16 @@ impl SettingsView {
                     t.name = None;
                 }
             }
+            FieldKey::ThemeColorMode => {
+                if let Some(ref mut t) = config.theme {
+                    t.color_mode = None;
+                }
+            }
+            FieldKey::IdleDecayMinutes => {
+                if let Some(ref mut t) = config.theme {
+                    t.idle_decay_minutes = None;
+                }
+            }
             // Updates
             FieldKey::CheckEnabled => {
                 if let Some(ref mut u) = config.updates {
@@ -555,6 +563,11 @@ impl SettingsView {
                 }
             }
             // Worktree
+            FieldKey::WorktreeEnabled => {
+                if let Some(ref mut w) = config.worktree {
+                    w.enabled = None;
+                }
+            }
             FieldKey::PathTemplate => {
                 if let Some(ref mut w) = config.worktree {
                     w.path_template = None;
@@ -627,6 +640,11 @@ impl SettingsView {
                     t.dashboard_tab_title = None;
                 }
             }
+            FieldKey::Clipboard => {
+                if let Some(ref mut t) = config.tmux {
+                    t.clipboard = None;
+                }
+            }
             // Session
             FieldKey::DefaultTool => {
                 if let Some(ref mut s) = config.session {
@@ -641,6 +659,11 @@ impl SettingsView {
             FieldKey::YoloModeDefault => {
                 if let Some(ref mut s) = config.session {
                     s.yolo_mode_default = None;
+                }
+            }
+            FieldKey::StrictHotkeys => {
+                if let Some(ref mut s) = config.session {
+                    s.strict_hotkeys = None;
                 }
             }
             FieldKey::AgentExtraArgs => {
@@ -773,6 +796,47 @@ impl SettingsView {
             FieldKey::HookOnDestroy => {
                 if let Some(ref mut h) = config.hooks {
                     h.on_destroy = None;
+                }
+            }
+            // Web settings are server-global; no per-profile override to clear.
+            FieldKey::WebNotificationsEnabled
+            | FieldKey::WebNotifyOnWaiting
+            | FieldKey::WebNotifyOnIdle
+            | FieldKey::WebNotifyOnError => {}
+            // Cockpit overrides clear by setting the override field to None.
+            FieldKey::CockpitEnabled => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.enabled = None;
+                }
+            }
+            FieldKey::CockpitDefaultForClaude => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.default_for_claude = None;
+                }
+            }
+            FieldKey::CockpitDefaultAgent => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.default_agent = None;
+                }
+            }
+            FieldKey::CockpitMaxConcurrentWorkers => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.max_concurrent_workers = None;
+                }
+            }
+            FieldKey::CockpitReplayEvents => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.replay_events = None;
+                }
+            }
+            FieldKey::CockpitReplayBytes => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.replay_bytes = None;
+                }
+            }
+            FieldKey::CockpitNodePath => {
+                if let Some(c) = config.cockpit.as_mut() {
+                    c.node_path = None;
                 }
             }
         }

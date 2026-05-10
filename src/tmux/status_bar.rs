@@ -63,11 +63,12 @@ pub fn apply_status_bar(
     set_session_option(session_name, "status-right-length", "80")?;
 
     set_session_option(session_name, "status-style", &format!("bg={bg},fg={fg}"))?;
+    let prefix = crate::tmux::utils::tmux_prefix_display();
     set_session_option(
         session_name,
         "status-left",
         &format!(
-            " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]Ctrl+b d#[fg={hint}] to detach ",
+            " #[fg={accent},bold]#S#[fg={fg},nobold] \u{2502} #[fg={hint}]{prefix} d#[fg={hint}] to detach ",
         ),
     )?;
     set_session_option(session_name, "status-left-length", "50")?;
@@ -109,12 +110,15 @@ pub fn apply_all_tmux_options(
     use crate::tui::styles::load_theme;
 
     if should_apply_tmux_status_bar() {
-        let config = crate::session::config::Config::load().unwrap_or_default();
+        let config = crate::session::config::Config::load_or_warn();
         let theme_name = if config.theme.name.is_empty() {
             "empire"
         } else {
             &config.theme.name
         };
+        // Always use truecolor here: tmux receives hex color values (#rrggbb)
+        // and manages its own escape-sequence rendering via TERM/terminfo.
+        // Palette mode only affects the TUI's direct terminal output.
         let theme = load_theme(theme_name);
 
         if let Err(e) = apply_status_bar(session_name, title, branch, sandbox, &theme) {

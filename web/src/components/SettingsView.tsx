@@ -1,14 +1,419 @@
+import { useCallback, useEffect, useState } from "react";
 import { ConnectedDevices } from "./ConnectedDevices";
+import { NotificationSettings } from "./NotificationSettings";
 import { SecuritySettings } from "./SecuritySettings";
 import { TerminalSettings } from "./TerminalSettings";
+import {
+  fetchProfiles,
+  fetchSettings,
+  setDefaultProfile,
+  updateProfileSettings,
+} from "../lib/api";
+import type { ProfileInfo } from "../lib/types";
+import {
+  ListField,
+  SelectField,
+  TextField,
+  ToggleField,
+} from "./settings/FormFields";
+import { ThemeSettings } from "./settings/ThemeSettings";
+import { SoundSettings } from "./settings/SoundSettings";
+import { UpdateSettings } from "./settings/UpdateSettings";
+import { TmuxSettings } from "./settings/TmuxSettings";
+import { ProfileSelector } from "./settings/ProfileSelector";
+
+type TabId =
+  | "session"
+  | "sandbox"
+  | "worktree"
+  | "theme"
+  | "sound"
+  | "tmux"
+  | "updates"
+  | "notifications"
+  | "terminal"
+  | "security"
+  | "devices";
+
+type SidebarItem =
+  | { kind: "tab"; id: TabId; label: string }
+  | { kind: "divider"; label: string };
+
+const SIDEBAR: SidebarItem[] = [
+  { kind: "divider", label: "General" },
+  { kind: "tab", id: "session", label: "Session" },
+  { kind: "tab", id: "sandbox", label: "Sandbox" },
+  { kind: "tab", id: "worktree", label: "Worktree" },
+  { kind: "tab", id: "theme", label: "Theme" },
+  { kind: "tab", id: "sound", label: "Sound" },
+  { kind: "tab", id: "tmux", label: "Tmux" },
+  { kind: "tab", id: "updates", label: "Updates" },
+  { kind: "divider", label: "Web Dashboard" },
+  { kind: "tab", id: "notifications", label: "Notifications" },
+  { kind: "tab", id: "terminal", label: "Terminal" },
+  { kind: "tab", id: "security", label: "Security" },
+  { kind: "tab", id: "devices", label: "Devices" },
+];
+
+const TABS = SIDEBAR.filter((s): s is { kind: "tab"; id: TabId; label: string } => s.kind === "tab");
 
 interface Props {
   onClose: () => void;
+  tab: string | null;
+  onSelectTab: (tab: TabId) => void;
 }
 
-export function SettingsView({ onClose }: Props) {
+const TAB_IDS = new Set<TabId>(TABS.map((t) => t.id));
+
+function isTabId(value: unknown): value is TabId {
+  return typeof value === "string" && TAB_IDS.has(value as TabId);
+}
+
+export function SettingsView({ onClose, tab, onSelectTab }: Props) {
+  const [settings, setSettings] = useState<Record<string, unknown> | null>(
+    null,
+  );
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [selectedProfile, setSelectedProfile] = useState("default");
+  const activeTab: TabId = isTabId(tab) ? tab : "session";
+  const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
+
+  useEffect(() => {
+    fetchProfiles().then((p) => {
+      setProfiles(p);
+      const active = p.find((pr) => pr.is_default);
+      if (active) setSelectedProfile(active.name);
+    });
+  }, []);
+
+  const defaultProfile = profiles.find((p) => p.is_default)?.name ?? "default";
+
+  const handleSetDefault = async (name: string) => {
+    const ok = await setDefaultProfile(name);
+    if (ok) fetchProfiles().then(setProfiles);
+  };
+
+  const loadSettings = useCallback(() => {
+    fetchSettings(selectedProfile).then((s) => {
+      if (s) setSettings(s);
+    });
+  }, [selectedProfile]);
+
+  useEffect(() => {
+    loadSettings();
+  }, [loadSettings]);
+
+  const sendSave = useCallback(
+    async (section: string, data: Record<string, unknown>) => {
+      setSaving(true);
+      setSaveError(null);
+      const ok = await updateProfileSettings(selectedProfile, { [section]: data });
+      setSaving(false);
+      if (!ok) {
+        setSaveError("Failed to save, please try again");
+        loadSettings();
+      }
+    },
+    [selectedProfile, loadSettings],
+  );
+
+  const updateLocal = useCallback(
+    (patch: Record<string, unknown>) => {
+      if (settings) setSettings({ ...settings, ...patch });
+    },
+    [settings],
+  );
+
+  const session = (settings?.session ?? {}) as Record<string, unknown>;
+  const sandbox = (settings?.sandbox ?? {}) as Record<string, unknown>;
+  const worktree = (settings?.worktree ?? {}) as Record<string, unknown>;
+  const web = (settings?.web ?? {}) as Record<string, unknown>;
+
+  const saveField = (
+    section: string,
+    sectionData: Record<string, unknown>,
+    field: string,
+    value: unknown,
+  ) => {
+    updateLocal({ [section]: { ...sectionData, [field]: value } });
+    sendSave(section, { [field]: value });
+  };
+
+  const saveSubField = useCallback(
+    (section: string, field: string, value: unknown) => {
+      const sectionData = (settings?.[section] ?? {}) as Record<string, unknown>;
+      saveField(section, sectionData, field, value);
+    },
+    [settings, selectedProfile, sendSave, loadSettings],
+  );
+
+  const renderTabContent = () => {
+    if (!settings && activeTab !== "notifications" && activeTab !== "terminal" && activeTab !== "security" && activeTab !== "devices") {
+      return <div className="text-sm text-text-dim">Loading settings...</div>;
+    }
+
+    switch (activeTab) {
+      case "session":
+        return (
+          <div className="space-y-4">
+            <SelectField
+              label="Default profile"
+              description="Profile used for new sessions"
+              value={defaultProfile}
+              onChange={(v) => handleSetDefault(v)}
+              options={profiles.map((p) => ({ value: p.name, label: p.name }))}
+            />
+            <TextField
+              label="Default agent"
+              value={(session.default_tool as string) ?? ""}
+              onChange={(v) => saveField("session", session, "default_tool", v || null)}
+              placeholder="Auto-detect"
+              mono
+            />
+            <ToggleField
+              label="YOLO mode by default"
+              description="New sessions skip permission prompts"
+              checked={(session.yolo_mode_default as boolean) ?? false}
+              onChange={(v) => saveField("session", session, "yolo_mode_default", v)}
+            />
+            <ToggleField
+              label="Strict hotkeys"
+              description="Require SHIFT on letter-based TUI hotkeys to prevent accidental actions"
+              checked={(session.strict_hotkeys as boolean) ?? false}
+              onChange={(v) => saveField("session", session, "strict_hotkeys", v)}
+            />
+            <ToggleField
+              label="Agent status hooks"
+              description="Install status-detection hooks into agent settings files for reliable status tracking"
+              checked={(session.agent_status_hooks as boolean) ?? true}
+              onChange={(v) => saveField("session", session, "agent_status_hooks", v)}
+            />
+          </div>
+        );
+
+      case "sandbox":
+        return (
+          <div className="space-y-4">
+            <ToggleField
+              label="Sandbox enabled by default"
+              description="Run new sessions in a Docker container"
+              checked={(sandbox.enabled_by_default as boolean) ?? false}
+              onChange={(v) => saveField("sandbox", sandbox, "enabled_by_default", v)}
+            />
+            <TextField
+              label="Default container image"
+              value={(sandbox.default_image as string) ?? ""}
+              onChange={(v) => saveField("sandbox", sandbox, "default_image", v)}
+              placeholder="ghcr.io/njbrake/aoe-sandbox:latest"
+              mono
+            />
+            <SelectField
+              label="Default terminal mode"
+              value={(sandbox.default_terminal_mode as string) ?? "host"}
+              onChange={(v) => saveField("sandbox", sandbox, "default_terminal_mode", v)}
+              options={[
+                { value: "host", label: "Host" },
+                { value: "container", label: "Container" },
+              ]}
+            />
+            <SelectField
+              label="Container runtime"
+              value={(sandbox.container_runtime as string) ?? "docker"}
+              onChange={(v) => saveField("sandbox", sandbox, "container_runtime", v)}
+              options={[
+                { value: "docker", label: "Docker" },
+                { value: "apple_container", label: "Apple Container" },
+              ]}
+            />
+            <TextField
+              label="CPU limit"
+              value={(sandbox.cpu_limit as string) ?? ""}
+              onChange={(v) => saveField("sandbox", sandbox, "cpu_limit", v || null)}
+              placeholder="e.g. 4"
+            />
+            <TextField
+              label="Memory limit"
+              value={(sandbox.memory_limit as string) ?? ""}
+              onChange={(v) => saveField("sandbox", sandbox, "memory_limit", v || null)}
+              placeholder="e.g. 8g"
+            />
+            <ToggleField
+              label="Mount SSH keys"
+              description="Mount ~/.ssh into sandbox containers"
+              checked={(sandbox.mount_ssh as boolean) ?? false}
+              onChange={(v) => saveField("sandbox", sandbox, "mount_ssh", v)}
+            />
+            <ToggleField
+              label="Auto cleanup"
+              description="Remove containers when sessions are deleted"
+              checked={(sandbox.auto_cleanup as boolean) ?? true}
+              onChange={(v) => saveField("sandbox", sandbox, "auto_cleanup", v)}
+            />
+            <TextField
+              label="Custom instruction"
+              description="Text appended to the agent system prompt in sandboxed sessions"
+              value={(sandbox.custom_instruction as string) ?? ""}
+              onChange={(v) => saveField("sandbox", sandbox, "custom_instruction", v || null)}
+              placeholder="Additional instructions for the agent..."
+              multiline
+            />
+            <ListField
+              label="Environment variables"
+              description="Variables passed to sandbox containers (KEY or KEY=VALUE)"
+              items={(sandbox.environment as string[]) ?? []}
+              onChange={(items) => saveField("sandbox", sandbox, "environment", items)}
+              placeholder="KEY or KEY=VALUE"
+              validate={(v) => {
+                if (!/^[A-Za-z_][A-Za-z0-9_]*(=.*)?$/.test(v))
+                  return "Must be KEY or KEY=VALUE (letters, digits, underscores)";
+                return null;
+              }}
+            />
+            <ListField
+              label="Extra volumes"
+              description="Additional volume mounts (host:container[:ro])"
+              items={(sandbox.extra_volumes as string[]) ?? []}
+              onChange={(items) => saveField("sandbox", sandbox, "extra_volumes", items)}
+              placeholder="/host/path:/container/path"
+              validate={(v) => {
+                if (!v.includes(":")) return "Must contain ':' (host:container)";
+                return null;
+              }}
+            />
+            <ListField
+              label="Port mappings"
+              description="Port forwarding (host:container)"
+              items={(sandbox.port_mappings as string[]) ?? []}
+              onChange={(items) => saveField("sandbox", sandbox, "port_mappings", items)}
+              placeholder="3000:3000"
+              validate={(v) => {
+                if (!/^\d+:\d+$/.test(v)) return "Must be port:port (e.g. 3000:3000)";
+                return null;
+              }}
+            />
+            <ListField
+              label="Volume ignores"
+              description="Directories excluded from host bind mount"
+              items={(sandbox.volume_ignores as string[]) ?? []}
+              onChange={(items) => saveField("sandbox", sandbox, "volume_ignores", items)}
+              placeholder="node_modules"
+            />
+          </div>
+        );
+
+      case "worktree":
+        return (
+          <div className="space-y-4">
+            <ToggleField
+              label="Worktrees enabled"
+              description="Create git worktrees for new sessions"
+              checked={(worktree.enabled as boolean) ?? false}
+              onChange={(v) => saveField("worktree", worktree, "enabled", v)}
+            />
+            <TextField
+              label="Path template"
+              description="Template for worktree directories in regular repos ({repo-name}, {branch})"
+              value={(worktree.path_template as string) ?? ""}
+              onChange={(v) => saveField("worktree", worktree, "path_template", v)}
+              placeholder="../{repo-name}-worktrees/{branch}"
+              mono
+            />
+            <TextField
+              label="Bare repo path template"
+              description="Template for worktree directories in bare repos ({branch})"
+              value={(worktree.bare_repo_path_template as string) ?? ""}
+              onChange={(v) => saveField("worktree", worktree, "bare_repo_path_template", v)}
+              placeholder="./{branch}"
+              mono
+            />
+            <TextField
+              label="Workspace path template"
+              description="Template for multi-repo workspace directories ({branch}, {session-id})"
+              value={(worktree.workspace_path_template as string) ?? ""}
+              onChange={(v) => saveField("worktree", worktree, "workspace_path_template", v)}
+              placeholder="../{branch}-workspace-{session-id}"
+              mono
+            />
+            <ToggleField
+              label="Auto cleanup"
+              description="Delete worktrees when sessions are removed"
+              checked={(worktree.auto_cleanup as boolean) ?? true}
+              onChange={(v) => saveField("worktree", worktree, "auto_cleanup", v)}
+            />
+            <ToggleField
+              label="Delete branch on cleanup"
+              description="Also delete the git branch when cleaning up a worktree"
+              checked={(worktree.delete_branch_on_cleanup as boolean) ?? false}
+              onChange={(v) => saveField("worktree", worktree, "delete_branch_on_cleanup", v)}
+            />
+          </div>
+        );
+
+      case "theme":
+        return <ThemeSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "sound":
+        return <SoundSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "tmux":
+        return <TmuxSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+      case "updates":
+        return <UpdateSettings settings={settings!} onSaveField={saveSubField} onUpdate={updateLocal} />;
+
+      case "notifications":
+        return (
+          <div className="space-y-6">
+            <NotificationSettings />
+            {settings && (
+              <div className="space-y-4">
+                <h4 className="text-xs font-mono uppercase tracking-widest text-text-muted">
+                  Server Defaults
+                </h4>
+                <p className="text-xs text-text-dim">
+                  Controls which session events trigger push notifications on the server.
+                </p>
+                <ToggleField
+                  label="Push notifications enabled"
+                  description="Server-wide kill switch for push notifications"
+                  checked={(web.notifications_enabled as boolean) ?? true}
+                  onChange={(v) => saveField("web", web, "notifications_enabled", v)}
+                />
+                <ToggleField
+                  label="Notify on waiting"
+                  description="Send push when a session needs input"
+                  checked={(web.notify_on_waiting as boolean) ?? true}
+                  onChange={(v) => saveField("web", web, "notify_on_waiting", v)}
+                />
+                <ToggleField
+                  label="Notify on idle"
+                  description="Send push when a session finishes"
+                  checked={(web.notify_on_idle as boolean) ?? false}
+                  onChange={(v) => saveField("web", web, "notify_on_idle", v)}
+                />
+                <ToggleField
+                  label="Notify on error"
+                  description="Send push when a session errors"
+                  checked={(web.notify_on_error as boolean) ?? true}
+                  onChange={(v) => saveField("web", web, "notify_on_error", v)}
+                />
+              </div>
+            )}
+          </div>
+        );
+
+      case "terminal":
+        return <TerminalSettings />;
+      case "security":
+        return <SecuritySettings />;
+      case "devices":
+        return <ConnectedDevices />;
+    }
+  };
+
+  const currentTabLabel = TABS.find((t) => t.id === activeTab)?.label ?? "";
+
   return (
     <div className="flex-1 flex flex-col overflow-hidden bg-surface-900">
+      {/* Header */}
       <div className="h-12 bg-surface-850 border-b border-surface-700 flex items-center px-4 shrink-0">
         <button
           onClick={onClose}
@@ -16,15 +421,80 @@ export function SettingsView({ onClose }: Props) {
         >
           &larr; Back
         </button>
-        <span className="text-sm font-semibold text-text-bright">
-          Settings
-        </span>
+        <span className="text-sm font-semibold text-text-bright">Settings</span>
+        {saving && (
+          <span className="ml-2 text-xs text-text-dim">Saving...</span>
+        )}
+        {saveError && (
+          <span className="ml-2 text-xs text-red-400">{saveError}</span>
+        )}
+        <div className="flex-1 flex justify-center">
+          <ProfileSelector
+            selectedProfile={selectedProfile}
+            onSelect={setSelectedProfile}
+          />
+        </div>
       </div>
 
-      <div className="flex-1 overflow-y-auto p-6 max-w-[600px] space-y-8">
-        <SecuritySettings />
-        <TerminalSettings />
-        <ConnectedDevices />
+      {/* Mobile tabs (horizontal scroll) */}
+      <div className="md:hidden border-b border-surface-700 bg-surface-850 overflow-x-auto">
+        <div className="flex items-center">
+          {SIDEBAR.map((item) =>
+            item.kind === "divider" ? (
+              <div key={item.label} className="h-4 w-px bg-surface-700 mx-1 shrink-0" />
+            ) : (
+              <button
+                key={item.id}
+                onClick={() => onSelectTab(item.id)}
+                className={`px-4 py-2.5 text-xs font-medium whitespace-nowrap cursor-pointer transition-colors ${
+                  activeTab === item.id
+                    ? "text-brand-500 border-b-2 border-brand-500"
+                    : "text-text-secondary hover:text-text-primary"
+                }`}
+              >
+                {item.label}
+              </button>
+            ),
+          )}
+        </div>
+      </div>
+
+      {/* Desktop: sidebar tabs + content */}
+      <div className="flex-1 flex min-h-0">
+        {/* Side tabs (desktop only) */}
+        <nav className="hidden md:flex flex-col w-44 shrink-0 border-r border-surface-700 bg-surface-850 py-2 overflow-y-auto">
+          {SIDEBAR.map((item, i) =>
+            item.kind === "divider" ? (
+              <div
+                key={item.label}
+                className={`px-4 pt-3 pb-1 text-[10px] font-mono uppercase tracking-widest text-text-dim ${i > 0 ? "mt-2 border-t border-surface-700/40" : ""}`}
+              >
+                {item.label}
+              </div>
+            ) : (
+              <button
+                key={item.id}
+                onClick={() => onSelectTab(item.id)}
+                className={`px-4 py-2 text-sm text-left cursor-pointer transition-colors ${
+                  activeTab === item.id
+                    ? "text-brand-500 bg-surface-800 border-r-2 border-brand-500"
+                    : "text-text-secondary hover:text-text-primary hover:bg-surface-800/50"
+                }`}
+              >
+                {item.label}
+              </button>
+            ),
+          )}
+        </nav>
+
+        {/* Content area */}
+        <div className="flex-1 overflow-y-auto">
+          <div className="p-6 max-w-2xl mx-auto space-y-5">
+            <h2 className="text-lg font-semibold text-text-bright">{currentTabLabel}</h2>
+
+            {renderTabContent()}
+          </div>
+        </div>
       </div>
     </div>
   );

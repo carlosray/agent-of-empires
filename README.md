@@ -2,18 +2,21 @@
   <img src="assets/logo.png" alt="Agent of Empires" width="128">
   <h1 align="center">Agent of Empires (AoE)</h1>
   <p align="center">
+    <a href="https://trendshift.io/repositories/22434" target="_blank"><img src="https://trendshift.io/api/badge/repositories/22434" alt="njbrake%2Fagent-of-empires | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+  </p>
+  <p align="center">
     <a href="https://github.com/njbrake/agent-of-empires/actions/workflows/ci.yml"><img src="https://github.com/njbrake/agent-of-empires/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-    <a href="https://github.com/njbrake/agent-of-empires/releases"><img src="https://img.shields.io/github/v/release/njbrake/agent-of-empires" alt="GitHub release"></a>
     <a href="https://formulae.brew.sh/formula/aoe"><img src="https://img.shields.io/homebrew/v/aoe" alt="Homebrew"></a>
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
     <a href="https://clawhub.ai/njbrake/aoe"><img src="https://img.shields.io/badge/ClawHub-aoe-blue" alt="ClawHub"></a>
     <br>
     <a href="https://www.youtube.com/@agent-of-empires"><img src="https://img.shields.io/badge/YouTube-channel-red?logo=youtube" alt="YouTube"></a>
     <a href="https://x.com/natebrake"><img src="https://img.shields.io/badge/follow-%40natebrake-black?logo=x&logoColor=white" alt="Follow @natebrake"></a>
+    <a href="https://discord.gg/5N3QKX3f6s"><img src="https://img.shields.io/badge/Discord-Mozilla.ai-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   </p>
 </p>
 
-A session manager for AI coding agents on Linux and macOS. Use it from the terminal (TUI) or from any browser ([web dashboard](docs/guides/web-dashboard.md), experimental).
+A session manager for AI coding agents on Linux and macOS. Use it from the terminal (TUI) or from any browser ([web dashboard](docs/guides/web-dashboard.md)).
 
 Run multiple AI agents in parallel across different branches of your codebase, each in its own isolated session with optional Docker sandboxing. Access your agents from your laptop, phone, or tablet.
 
@@ -24,6 +27,8 @@ This repository tracks upstream [njbrake/agent-of-empires](https://github.com/nj
 Running one AI agent is easy. Running five of them across different branches, keeping track of which is stuck, which is waiting on input, and which just made a mess of your working tree, becomes a part-time job. AoE makes it a glance: one dashboard, one status column, git worktrees and Docker sandboxes set up for you, and sessions that outlive your terminal.
 
 > If you find this project useful, please consider giving it a star on GitHub: it helps others discover the project!
+>
+> Want merch? Visit the [store](https://brake.printful.me/).
 
 <p align="center">
   <img src="docs/assets/demo.gif" alt="Agent of Empires Demo" width="800">
@@ -33,16 +38,24 @@ Running one AI agent is easy. Running five of them across different branches, ke
 
 ## Features
 
-- **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, and Factory Droid
+- **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, and Kiro CLI
 - **TUI app**: visual interface to create, monitor, and manage sessions
-- **Web app**: create, monitor, and control your agents from any browser, installable as a PWA ([experimental](docs/guides/web-dashboard.md))
+- **Web app** (Beta, stabilization in progress): create, monitor, and control your agents from any browser, installable as a PWA ([guide](docs/guides/web-dashboard.md))
 - **CLI app**: create, monitor, and control agents from the command line (integrates with tools like OpenClaw)
-- **Remote access from your phone**: press `R` in the TUI to expose the web dashboard over a Cloudflare tunnel with QR + passphrase auth ([guide](docs/guides/remote-phone-access.md))
+- **Remote access from your phone**: press `R` in the TUI to expose the web dashboard over HTTPS with QR + passphrase auth. Uses Tailscale Funnel when available (stable URL, installable PWAs keep working across restarts) or Cloudflare Tunnel as a fallback ([guide](docs/guides/remote-phone-access.md))
 - **Status detection**: see which agents are running, waiting for input, or idle
 - **Git worktrees**: run parallel agents on different branches of the same repo
 - **Docker sandboxing**: isolate agents in containers with shared auth volumes
 - **Diff view**: review git changes and edit files without leaving the TUI
 - **Profiles**: separate workspaces for different projects or clients
+
+## Web Dashboard (Beta, stabilization in progress)
+
+Access your agents from any browser. The real agent terminal renders in the page; switch sessions, type into the terminal, and review diffs without leaving the tab. Press `R` in the TUI to start the server, or see the [web dashboard guide](docs/guides/web-dashboard.md) for details.
+
+<p align="center">
+  <img src="docs/assets/web-desktop.gif" alt="Web dashboard" width="800">
+</p>
 
 ## How It Works
 
@@ -60,7 +73,7 @@ curl -fsSL \
   https://raw.githubusercontent.com/njbrake/agent-of-empires/main/scripts/install.sh \
   | bash
 
-# Homebrew (TUI only, web dashboard not yet included)
+# Homebrew
 brew install aoe
 
 # Nix
@@ -85,7 +98,7 @@ In the TUI, press `?` for help. The bottom information bar shows all available k
 
 - **[Installation](https://www.agent-of-empires.com/docs/installation/)**: prerequisites and install methods
 - **[Quick Start](https://www.agent-of-empires.com/docs/quick-start/)**: first steps and basic usage
-- **[Remote Phone Access](https://www.agent-of-empires.com/guides/remote-phone-access/)**: check on your agents from your phone via a Cloudflare tunnel
+- **[Remote Phone Access](https://www.agent-of-empires.com/guides/remote-phone-access/)**: check on your agents from your phone via Tailscale Funnel or a Cloudflare tunnel
 - **[Git Worktrees](https://www.agent-of-empires.com/guides/worktrees/)**: parallel agents on different branches
 - **[Docker Sandbox](https://www.agent-of-empires.com/guides/sandbox/)**: container isolation for agents
 - **[Repo Config & Hooks](https://www.agent-of-empires.com/guides/repo-config/)**: per-project settings and automation
@@ -105,7 +118,7 @@ Nothing. Sessions are tmux sessions running in the background. Open and close `a
 
 ### Which AI tools are supported?
 
-Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, and Factory Droid. AoE auto-detects which are installed on your system.
+Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi.dev, Factory Droid, Hermes, and Kiro CLI. AoE auto-detects which are installed on your system.
 
 ### Can I use AoE over SSH?
 

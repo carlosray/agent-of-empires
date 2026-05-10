@@ -3,7 +3,7 @@ members = [".", "xtask"]
 
 [package]
 name = "agent-of-empires"
-version = "1.4.2"
+version = "1.6.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -22,7 +22,7 @@ clap_complete = "4.5"
 ratatui = { version = "0.30", features = ["crossterm"] }
 crossterm = { version = "0.29", features = ["event-stream"] }
 ansi-to-tui = "8.0"
-ratatui-textarea = "0.8"
+ratatui-textarea = "0.9"
 tui-input = "0.15"
 
 # Async runtime
@@ -31,6 +31,7 @@ tokio = { version = "1.50", features = ["full"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 toml = "1.1"
 
 # File watching
@@ -63,32 +64,32 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # HTTP client (for updates)
-reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
+reqwest = { version = "0.13", features = ["json", "rustls", "stream"], default-features = false }
 
-# Unix sockets
-tokio-util = { version = "0.7", features = ["codec"] }
+# Unix sockets + futures-compat for ACP byte streams
+tokio-util = { version = "0.7", features = ["codec", "compat"] }
 
 # Platform detection
 cfg-if = "1.0"
 
 # Process handling
-nix = { version = "0.31", features = ["signal", "process", "net"] }
+nix = { version = "0.31", features = ["signal", "process", "net", "fs", "resource"] }
 
-# Unicode width
+# Unicode width + normalization (NFKD used to fold accents in title-derived branch names)
+unicode-normalization = "0.1"
 unicode-width = "0.2"
 
 # Terminal spinners
-rattles = "0.2"
+rattles = "0.3"
 
 # Regex
 regex = "1.10"
 
 # Git operations
 git2 = { version = "0.20", features = ["vendored-openssl"] }
-enum_dispatch = "0.3.13"
 
 # Diff computation
-similar = "2.6"
+similar = "3.0"
 
 # Hashing
 sha2 = "0.11"
@@ -99,6 +100,15 @@ fs2 = "0.4"
 # Stream utilities (for crossterm EventStream)
 futures-util = "0.3"
 
+# Temporary files and directories
+tempfile = "3.14"
+
+# Local SQLite reader for opencode's session store. Bundled to avoid a
+# system libsqlite3 dependency. Used to read session state without spawning
+# `opencode session list`, which leaks a 4.5MB /tmp/.<hash>.so per invocation
+# via opencode's bun:ffi OpenTUI extract path (see anomalyco/opencode#6523).
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Web server (optional, behind "serve" feature)
 axum = { version = "0.8", features = ["ws"], optional = true }
 tower-http = { version = "0.6", features = ["fs"], optional = true }
@@ -107,14 +117,68 @@ mime_guess = { version = "2.0", optional = true }
 qrcode = { version = "0.14", optional = true }
 argon2 = { version = "0.5", optional = true }
 
+# Web Push (VAPID + payload encryption), optional behind "serve".
+p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"], optional = true }
+base64 = { version = "0.22", optional = true }
+hkdf = { version = "0.13", optional = true }
+aes-gcm = { version = "0.10", optional = true }
+jsonwebtoken = { version = "10.3", optional = true }
+getrandom = { version = "0.4", optional = true }
+
+# Agent Client Protocol — drives the cockpit surface bundled with `serve`.
+agent-client-protocol = { version = "0.11", optional = true }
+agent-client-protocol-tokio = { version = "0.11", optional = true }
+
+# Node tarball download + extraction for the cockpit's bundled-Node
+# fallback. xz2 needs the system liblzma; we use it for tar.xz
+# extraction. The `tar` crate handles the tarball stream. Hex used
+# for nonce display lives in the cockpit/approvals module's local
+# hex helper, no crate needed.
+tar = { version = "0.4", optional = true }
+xz2 = { version = "0.1", optional = true }
+
 [features]
 default = []
-serve = ["axum", "tower-http", "rust-embed", "mime_guess", "qrcode", "argon2"]
+# Re-exports private tmux env helpers via `crate::tmux::test_support` so that
+# integration tests in `tests/` can poke them. Not enabled by default — only
+# used by `cargo test`.
+test-support = []
+serve = [
+    "axum",
+    "tower-http",
+    "rust-embed",
+    "mime_guess",
+    "qrcode",
+    "argon2",
+    "p256",
+    "base64",
+    "hkdf",
+    "aes-gcm",
+    "jsonwebtoken",
+    "getrandom",
+    # Cockpit (ACP-based structured rendering of agent state) ships
+    # alongside the web dashboard — the two share state, REST routes,
+    # and the WebSocket fanout. Folded into `serve` so building the
+    # dashboard always includes the cockpit surface; pulling them
+    # apart later is straightforward (cockpit code lives entirely
+    # under src/cockpit/).
+    "agent-client-protocol",
+    "agent-client-protocol-tokio",
+    "tar",
+    "xz2",
+]
 
 [dev-dependencies]
-tempfile = "3.14"
 serial_test = "3.4"
 cargo-husky = { version = "1", default-features = false, features = ["precommit-hook", "run-cargo-fmt", "run-cargo-clippy"] }
+# Test-only axum dep, used by the update e2e fixture server that serves
+# a fake release tarball. The runtime code uses reqwest, not axum.
+axum = { version = "0.8", features = ["ws"] }
+# Self-dev-dependency: enables the `test-support` feature when building
+# integration tests so they can reach `crate::tmux::test_support`. This is
+# the standard Cargo pattern for opt-in test-only re-exports; the lib build
+# (and release binaries) never see the feature.
+agent-of-empires = { path = ".", features = ["test-support"] }
 
 [profile.release]
 lto = true

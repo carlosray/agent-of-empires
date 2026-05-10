@@ -7,12 +7,15 @@ interface ShortcutActions {
   onHelp: () => void;
   onSettings: () => void;
   onPalette: () => void;
+  onToggleSidebar: () => void;
+  onToggleRightPanel: () => void;
+  onToggleTerminalFocus: () => void;
 }
 
 /**
  * Global keyboard shortcuts for the dashboard.
  * Single-key shortcuts fire only when no input/textarea/terminal is focused.
- * Cmd/Ctrl+K (palette) and Escape fire regardless of focus.
+ * Cmd+K (Mac) / Ctrl+K (other) and Escape fire regardless of focus.
  */
 export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
   useEffect(() => {
@@ -25,12 +28,44 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
           target.isContentEditable);
 
       const actions = getActions();
+      const mod = e.metaKey || e.ctrlKey;
 
-      // Palette: Cmd+K / Ctrl+K, works everywhere.
-      if ((e.metaKey || e.ctrlKey) && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") {
+      // Palette: Cmd+K (Mac) / Ctrl+K (other), works everywhere.
+      if (mod && !e.shiftKey && !e.altKey && e.key.toLowerCase() === "k") {
         e.preventDefault();
         e.stopPropagation();
         actions.onPalette();
+        return;
+      }
+
+      // Toggle terminal focus: Cmd+` (Mac) / Ctrl+` (other), works everywhere.
+      // Use e.code so layouts where backtick lives behind a modifier still match.
+      // No stopPropagation: preventDefault is enough to suppress the browser's
+      // own Cmd+` window cycling, and we don't want to silently shadow other
+      // doc-level listeners that might want this combo.
+      if (mod && !e.shiftKey && !e.altKey && e.code === "Backquote") {
+        e.preventDefault();
+        e.stopPropagation();
+        actions.onToggleTerminalFocus();
+        return;
+      }
+
+      // Use e.code for B shortcuts because Option+B on Mac produces "∫"
+      // instead of "b", causing e.key matching to fail.
+      // Toggle right panel: Cmd+Opt+B (Mac) / Ctrl+Alt+B (other)
+      // Check alt combo first so Cmd+B doesn't swallow Cmd+Opt+B.
+      if (mod && !e.shiftKey && e.altKey && e.code === "KeyB") {
+        e.preventDefault();
+        e.stopPropagation();
+        actions.onToggleRightPanel();
+        return;
+      }
+
+      // Toggle left sidebar: Cmd+B (Mac) / Ctrl+B (other)
+      if (mod && !e.shiftKey && !e.altKey && e.code === "KeyB") {
+        e.preventDefault();
+        e.stopPropagation();
+        actions.onToggleSidebar();
         return;
       }
 
@@ -62,7 +97,7 @@ export function useKeyboardShortcuts(getActions: () => ShortcutActions) {
       }
     };
 
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
+    document.addEventListener("keydown", handler, true);
+    return () => document.removeEventListener("keydown", handler, true);
   }, [getActions]);
 }

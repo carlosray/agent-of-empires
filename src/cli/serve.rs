@@ -23,13 +23,22 @@ pub struct ServeArgs {
     #[arg(long)]
     pub read_only: bool,
 
-    /// Expose via Cloudflare Tunnel for secure remote access
+    /// Expose the dashboard over a public HTTPS tunnel. Prefers Tailscale
+    /// Funnel when `tailscale` is installed and logged in (stable
+    /// `.ts.net` URL, installable PWAs survive restarts). Falls back to a
+    /// Cloudflare quick tunnel otherwise (fresh URL on every restart).
     #[arg(long)]
     pub remote: bool,
 
-    /// Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`)
+    /// Use a named Cloudflare Tunnel (requires prior `cloudflared tunnel create`).
+    /// Takes precedence over Tailscale auto-detection.
     #[arg(long, requires = "remote")]
     pub tunnel_name: Option<String>,
+
+    /// Skip Tailscale Funnel auto-detection and go straight to Cloudflare.
+    /// Useful if you have Tailscale installed for unrelated reasons.
+    #[arg(long, requires = "remote")]
+    pub no_tailscale: bool,
 
     /// Hostname for a named tunnel (e.g., aoe.example.com)
     #[arg(long, requires = "tunnel_name")]
@@ -47,6 +56,20 @@ pub struct ServeArgs {
     /// Can also be set via AOE_SERVE_PASSPHRASE environment variable.
     #[arg(long, env = "AOE_SERVE_PASSPHRASE")]
     pub passphrase: Option<String>,
+}
+
+/// True when `aoe serve --remote` will route through Cloudflare and therefore
+/// needs `cloudflared` on PATH. That covers both an explicit named tunnel
+/// (`--tunnel-name`) and the quick-tunnel fallback path that runs when
+/// Tailscale isn't usable or the user passed `--no-tailscale`. Mirrors the
+/// transport selection inside `start_server()` so the early guard doesn't
+/// reject Tailscale-only setups (issue #813).
+fn cloudflared_required(
+    no_tailscale: bool,
+    has_tunnel_name: bool,
+    tailscale_available: bool,
+) -> bool {
+    no_tailscale || has_tunnel_name || !tailscale_available
 }
 
 pub fn pid_file_path() -> Result<PathBuf> {
@@ -91,6 +114,7 @@ fn read_serve_mode_label() -> Option<&'static str> {
     match raw.trim() {
         "local" => Some("local"),
         "tunnel" => Some("tunnel"),
+        "tailscale" => Some("tailscale"),
         _ => None,
     }
 }
@@ -152,6 +176,7 @@ pub fn daemon_pid() -> Option<u32> {
                     let _ = std::fs::remove_file(dir.join("serve.url"));
                     let _ = std::fs::remove_file(dir.join("serve.log"));
                     let _ = std::fs::remove_file(dir.join("serve.mode"));
+                    let _ = std::fs::remove_file(dir.join("serve.passphrase"));
                 }
                 None
             }
@@ -167,7 +192,27 @@ pub fn daemon_pid() -> Option<u32> {
 
 pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
     if args.stop {
-        return stop_daemon();
+        return stop_daemon().await;
+    }
+
+    // Refuse to start a second instance (daemon or foreground) while another
+    // aoe serve is already running. Without this gate, a foreground
+    // `aoe serve` would overwrite the existing daemon's PID file in the
+    // non-daemon write below before its own port-bind eventually failed; the
+    // post-exit cleanup would then delete the (now-foreground) PID file and
+    // orphan the real daemon.
+    //
+    // Skip the bail if the PID file already points to our own process: that
+    // means we are the daemonized child that start_daemon() just spawned and
+    // pre-populated the file for, not a competing instance.
+    if let Some(existing) = daemon_pid() {
+        if existing != std::process::id() {
+            bail!(
+                "A serve daemon is already running (PID {}). \
+                 Stop it first with `aoe serve --stop`.",
+                existing
+            );
+        }
     }
 
     let is_localhost = args.host == "localhost"
@@ -207,10 +252,21 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         );
     }
 
-    // Remote mode: check cloudflared and force localhost binding
+    // Remote mode: check cloudflared (only when Tailscale Funnel can't carry the
+    // traffic) and force localhost binding. start_server() prefers Tailscale when
+    // it's available, so requiring cloudflared up front would falsely reject
+    // Tailscale-only setups (issue #813).
     let host = if args.remote {
-        crate::server::tunnel::check_cloudflared()?;
-        // Force localhost since cloudflared connects to localhost
+        let tailscale_ok =
+            tokio::task::spawn_blocking(crate::server::tunnel::tailscale_available_sync)
+                .await
+                .unwrap_or(false);
+        if cloudflared_required(args.no_tailscale, args.tunnel_name.is_some(), tailscale_ok) {
+            tokio::task::spawn_blocking(crate::server::tunnel::check_cloudflared)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))??;
+        }
+        // Force localhost since the tunnel connects to localhost
         "127.0.0.1".to_string()
     } else {
         args.host.clone()
@@ -232,7 +288,8 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         eprintln!("  public internet without TLS termination.");
         eprintln!();
         eprintln!("  Or use: aoe serve --remote");
-        eprintln!("  for automatic HTTPS via Cloudflare Tunnel.");
+        eprintln!("  for automatic HTTPS via Tailscale Funnel");
+        eprintln!("  (preferred) or Cloudflare Tunnel.");
         eprintln!();
         if args.read_only {
             eprintln!("  Read-only mode is ON: terminal input is disabled.");
@@ -265,7 +322,7 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
 
     // Write PID file for non-daemon mode too (so --stop works either way)
     if let Ok(path) = pid_file_path() {
-        let _ = std::fs::write(&path, std::process::id().to_string());
+        let _ = tokio::fs::write(&path, std::process::id().to_string()).await;
     }
 
     let result = crate::server::start_server(crate::server::ServerConfig {
@@ -277,18 +334,30 @@ pub async fn run(profile: &str, args: ServeArgs) -> Result<()> {
         remote: args.remote,
         tunnel_name: args.tunnel_name.as_deref(),
         tunnel_url: args.tunnel_url.as_deref(),
+        no_tailscale: args.no_tailscale,
         is_daemon: false,
         passphrase: args.passphrase.as_deref(),
     })
     .await;
 
-    // Clean up PID and URL files on exit
+    // Clean up PID and URL files on exit, but only if the PID file
+    // still belongs to this process. A newer daemon spawn may have
+    // overwritten it; removing their file would orphan them.
     if let Ok(path) = pid_file_path() {
-        let _ = std::fs::remove_file(path);
-    }
-    if let Ok(dir) = crate::session::get_app_dir() {
-        let _ = std::fs::remove_file(dir.join("serve.url"));
-        let _ = std::fs::remove_file(dir.join("serve.mode"));
+        let is_ours = tokio::fs::read_to_string(&path)
+            .await
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|pid| pid == std::process::id());
+        if is_ours {
+            let _ = tokio::fs::remove_file(&path).await;
+            if let Ok(dir) = crate::session::get_app_dir() {
+                let _ = tokio::fs::remove_file(dir.join("serve.url")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.log")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.mode")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
+            }
+        }
     }
 
     result
@@ -330,6 +399,9 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     if let Some(ref url) = args.tunnel_url {
         cmd.args(["--tunnel-url", url]);
     }
+    if args.no_tailscale {
+        cmd.arg("--no-tailscale");
+    }
     if let Some(ref passphrase) = args.passphrase {
         // Pass via env var to avoid exposing the passphrase in the process list
         cmd.env("AOE_SERVE_PASSPHRASE", passphrase);
@@ -339,6 +411,21 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     }
 
     cmd.stdin(Stdio::null());
+
+    // Create a new session so the daemon is not killed by SIGHUP when the
+    // parent terminal closes. setsid() is async-signal-safe.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: setsid() is async-signal-safe per POSIX, which is the
+        // only requirement for pre_exec closures.
+        unsafe {
+            cmd.pre_exec(|| {
+                nix::unistd::setsid().map_err(std::io::Error::other)?;
+                Ok(())
+            });
+        }
+    }
 
     // Redirect stdout/stderr to a log file so controllers like the TUI can
     // tail the daemon's output. Truncate on each start so stale content from
@@ -371,7 +458,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     Ok(())
 }
 
-fn stop_daemon() -> Result<()> {
+async fn stop_daemon() -> Result<()> {
     let path = pid_file_path()?;
 
     if !path.exists() {
@@ -381,7 +468,7 @@ fn stop_daemon() -> Result<()> {
         );
     }
 
-    let pid_str = std::fs::read_to_string(&path)?;
+    let pid_str = tokio::fs::read_to_string(&path).await?;
     let pid: i32 = pid_str
         .trim()
         .parse()
@@ -389,7 +476,7 @@ fn stop_daemon() -> Result<()> {
 
     // Verify PID belongs to an aoe process on all platforms
     if !verify_pid_is_aoe(pid) {
-        std::fs::remove_file(&path)?;
+        tokio::fs::remove_file(&path).await?;
         bail!(
             "PID {} belongs to a different process (stale PID file). Cleaned up.",
             pid
@@ -402,21 +489,46 @@ fn stop_daemon() -> Result<()> {
         nix::sys::signal::Signal::SIGTERM,
     ) {
         Ok(()) => {
-            std::fs::remove_file(&path)?;
+            // Wait for the process to actually exit so the port is
+            // released before a new daemon can be spawned. Without
+            // this, closing the dialog and immediately reopening
+            // races with the dying daemon and can orphan it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                match nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None) {
+                    Err(nix::errno::Errno::ESRCH) => break,
+                    _ if std::time::Instant::now() >= deadline => {
+                        // Still alive after timeout; escalate.
+                        let _ = nix::sys::signal::kill(
+                            nix::unistd::Pid::from_raw(pid),
+                            nix::sys::signal::Signal::SIGKILL,
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // The daemon's own cleanup may have already removed some
+            // of these; that's fine.
+            let _ = tokio::fs::remove_file(&path).await;
             if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = std::fs::remove_file(dir.join("serve.url"));
-                let _ = std::fs::remove_file(dir.join("serve.log"));
-                let _ = std::fs::remove_file(dir.join("serve.mode"));
+                let _ = tokio::fs::remove_file(dir.join("serve.url")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.log")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.mode")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
             }
             println!("Stopped aoe serve daemon (PID {})", pid);
         }
         Err(nix::errno::Errno::ESRCH) => {
             // Process doesn't exist; clean up stale PID file
-            std::fs::remove_file(&path)?;
+            tokio::fs::remove_file(&path).await?;
             if let Ok(dir) = crate::session::get_app_dir() {
-                let _ = std::fs::remove_file(dir.join("serve.url"));
-                let _ = std::fs::remove_file(dir.join("serve.log"));
-                let _ = std::fs::remove_file(dir.join("serve.mode"));
+                let _ = tokio::fs::remove_file(dir.join("serve.url")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.log")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.mode")).await;
+                let _ = tokio::fs::remove_file(dir.join("serve.passphrase")).await;
             }
             println!("Daemon was not running (stale PID file cleaned up)");
         }
@@ -424,4 +536,32 @@ fn stop_daemon() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloudflared_skipped_when_tailscale_available_and_default_flags() {
+        // Regression: aoe serve --remote with Tailscale up and cloudflared
+        // missing was failing because of the unconditional check. Tailscale
+        // alone is enough.
+        assert!(!cloudflared_required(false, false, true));
+    }
+
+    #[test]
+    fn cloudflared_required_when_no_tailscale_flag_set() {
+        assert!(cloudflared_required(true, false, true));
+    }
+
+    #[test]
+    fn cloudflared_required_when_named_tunnel_pinned() {
+        assert!(cloudflared_required(false, true, true));
+    }
+
+    #[test]
+    fn cloudflared_required_when_tailscale_unavailable() {
+        assert!(cloudflared_required(false, false, false));
+    }
 }

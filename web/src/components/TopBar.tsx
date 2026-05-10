@@ -10,8 +10,6 @@ interface Props {
   onOpenPalette: () => void;
   onToggleDiff: () => void;
   diffCollapsed: boolean;
-  diffFileCount: number;
-  onOpenSettings: () => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onLogout: () => void;
@@ -27,8 +25,6 @@ export function TopBar({
   onOpenPalette,
   onToggleDiff,
   diffCollapsed,
-  diffFileCount,
-  onOpenSettings,
   onOpenHelp,
   onOpenAbout,
   onLogout,
@@ -41,13 +37,12 @@ export function TopBar({
 
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
-      { label: "Settings", onClick: onOpenSettings },
       { label: "Help", onClick: onOpenHelp },
       { label: "About", onClick: onOpenAbout },
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenSettings, onOpenHelp, onOpenAbout, onLogout, loginRequired]);
+  }, [onOpenHelp, onOpenAbout, onLogout, loginRequired]);
 
   return (
     <header className="h-12 bg-surface-800 border-b border-surface-700/20 flex items-center px-3 shrink-0 gap-2">
@@ -99,11 +94,6 @@ export function TopBar({
                 </span>
               </>
             )}
-            {activeSession?.tool && (
-              <span className="hidden md:inline text-text-dim truncate">
-                · {activeSession.tool}
-              </span>
-            )}
           </div>
         )}
       </div>
@@ -128,7 +118,7 @@ export function TopBar({
         {activeWorkspace && activeSession && (
           <button
             onClick={onToggleDiff}
-            className={`relative w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors hover:bg-surface-700/50 ${
+            className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors hover:bg-surface-700/50 ${
               diffCollapsed
                 ? "text-text-dim hover:text-text-secondary"
                 : "text-text-secondary hover:text-text-primary"
@@ -149,11 +139,6 @@ export function TopBar({
               <rect x="3" y="3" width="18" height="18" rx="2" />
               <line x1="15" y1="3" x2="15" y2="21" />
             </svg>
-            {diffCollapsed && diffFileCount > 0 && (
-              <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] px-1 rounded-full bg-accent-600 text-[9px] font-mono text-surface-900 flex items-center justify-center">
-                {diffFileCount > 9 ? "9+" : diffFileCount}
-              </span>
-            )}
           </button>
         )}
 

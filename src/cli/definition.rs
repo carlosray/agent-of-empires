@@ -7,10 +7,13 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
 use super::add::AddArgs;
+#[cfg(feature = "serve")]
+use super::cockpit::CockpitCommands;
 use super::group::GroupCommands;
 use super::init::InitArgs;
 use super::list::ListArgs;
 use super::profile::ProfileCommands;
+use super::project::ProjectCommands;
 use super::remove::RemoveArgs;
 use super::send::SendArgs;
 #[cfg(feature = "serve")]
@@ -21,6 +24,7 @@ use super::status::StatusArgs;
 use super::theme::ThemeCommands;
 use super::tmux::TmuxCommands;
 use super::uninstall::UninstallArgs;
+use super::update::UpdateArgs;
 use super::worktree::WorktreeCommands;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -46,7 +50,10 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Add a new session
-    Add(AddArgs),
+    Add(Box<AddArgs>),
+
+    /// List supported agents and their install status
+    Agents,
 
     /// Initialize .agent-of-empires/config.toml in a repository
     Init(InitArgs),
@@ -83,6 +90,12 @@ pub enum Commands {
         command: Option<ProfileCommands>,
     },
 
+    /// Manage the project registry used by multi-repo session pickers
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
+
     /// Manage git worktrees for parallel development
     Worktree {
         #[command(subcommand)]
@@ -107,12 +120,22 @@ pub enum Commands {
         command: ThemeCommands,
     },
 
-    /// Start a web dashboard for remote session access [experimental]
+    /// Start a web dashboard for remote session access
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
 
+    /// Cockpit (ACP-based native agent rendering) management.
+    #[cfg(feature = "serve")]
+    Cockpit {
+        #[command(subcommand)]
+        command: CockpitCommands,
+    },
+
     /// Uninstall Agent of Empires
     Uninstall(UninstallArgs),
+
+    /// Update aoe to the latest release
+    Update(UpdateArgs),
 
     /// Generate shell completions
     Completion {

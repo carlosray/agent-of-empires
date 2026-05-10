@@ -45,6 +45,68 @@ pub struct Config {
 
     #[serde(default)]
     pub app_state: AppStateConfig,
+
+    #[serde(default)]
+    pub web: WebConfig,
+
+    #[serde(default)]
+    pub cockpit: CockpitConfig,
+}
+
+/// Configuration for the cockpit (ACP-based native rendering of agent
+/// state). Defaults match the documented v4 design and v005 migration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CockpitConfig {
+    /// Master kill switch for cockpit mode. When false, every session
+    /// runs as plain tmux even if --cockpit is passed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// On mobile viewports, default new Claude sessions to cockpit mode.
+    #[serde(default = "default_true")]
+    pub default_for_claude: bool,
+    /// The agent name to use when --agent is not specified.
+    #[serde(default = "default_agent")]
+    pub default_agent: String,
+    /// Hard cap on simultaneously running agent worker subprocesses.
+    #[serde(default = "default_max_workers")]
+    pub max_concurrent_workers: u32,
+    /// Replay buffer event-count cap (per session).
+    #[serde(default = "default_replay_events")]
+    pub replay_events: u32,
+    /// Replay buffer byte cap (per session).
+    #[serde(default = "default_replay_bytes")]
+    pub replay_bytes: u64,
+    /// Optional path to the Node runtime used to spawn aoe-agent. If
+    /// empty, aoe resolves Node via PATH then bundled fallback.
+    #[serde(default)]
+    pub node_path: String,
+}
+
+impl Default for CockpitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            default_for_claude: true,
+            default_agent: default_agent(),
+            max_concurrent_workers: default_max_workers(),
+            replay_events: default_replay_events(),
+            replay_bytes: default_replay_bytes(),
+            node_path: String::new(),
+        }
+    }
+}
+
+fn default_agent() -> String {
+    "aoe-agent".to_string()
+}
+fn default_max_workers() -> u32 {
+    5
+}
+fn default_replay_events() -> u32 {
+    500
+}
+fn default_replay_bytes() -> u64 {
+    5_242_880
 }
 
 /// Session list sort order
@@ -53,6 +115,7 @@ pub struct Config {
 pub enum SortOrder {
     #[default]
     Newest,
+    LastActivity,
     Oldest,
     AZ,
     ZA,
@@ -61,7 +124,8 @@ pub enum SortOrder {
 impl SortOrder {
     pub fn cycle(self) -> Self {
         match self {
-            SortOrder::Newest => SortOrder::Oldest,
+            SortOrder::Newest => SortOrder::LastActivity,
+            SortOrder::LastActivity => SortOrder::Oldest,
             SortOrder::Oldest => SortOrder::AZ,
             SortOrder::AZ => SortOrder::ZA,
             SortOrder::ZA => SortOrder::Newest,
@@ -71,7 +135,8 @@ impl SortOrder {
     pub fn cycle_reverse(self) -> Self {
         match self {
             SortOrder::Newest => SortOrder::ZA,
-            SortOrder::Oldest => SortOrder::Newest,
+            SortOrder::LastActivity => SortOrder::Newest,
+            SortOrder::Oldest => SortOrder::LastActivity,
             SortOrder::AZ => SortOrder::Oldest,
             SortOrder::ZA => SortOrder::AZ,
         }
@@ -80,6 +145,7 @@ impl SortOrder {
     pub fn label(self) -> &'static str {
         match self {
             SortOrder::Newest => "Newest",
+            SortOrder::LastActivity => "Recent",
             SortOrder::Oldest => "Oldest",
             SortOrder::AZ => "A-Z",
             SortOrder::ZA => "Z-A",
@@ -180,6 +246,17 @@ pub struct SessionConfig {
     /// Maps a custom (or built-in) agent to another agent's status detection heuristics.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub agent_detect_as: HashMap<String, String>,
+
+    /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
+    /// Guards against accidental destructive actions from dictation software, a forgotten
+    /// focus, or stray keystrokes. Navigation keys (h/j/k/l, arrows, Enter, Esc), punctuation
+    /// (/, ?), and numeric modifiers stay unshifted. Previously-uppercase bindings
+    /// (P, R, T, N, D, G) relocate to Ctrl+letter so nothing is lost.
+    /// Note: Ctrl+D (diff view) may conflict with terminal EOF in some tmux configs;
+    /// if so, rebind tmux's send-prefix or use the `D` key from the help overlay.
+    /// Off by default — existing users keep the legacy single-letter UX.
+    #[serde(default)]
+    pub strict_hotkeys: bool,
 }
 
 impl SessionConfig {
@@ -261,14 +338,98 @@ fn default_context_lines() -> usize {
     3
 }
 
+/// Web dashboard runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WebConfig {
+    /// Operator kill switch for browser push notifications. When false,
+    /// `/api/push/*` returns 404 and the status-change consumer drops
+    /// events without sending. Existing subscriptions persist across
+    /// flips, so toggling back to true resumes delivery without requiring
+    /// users to re-opt-in.
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
+
+    /// Server-wide default: fire a push on Running to Waiting transitions.
+    /// Sessions can override per-session via `Instance.notify_on_waiting`.
+    #[serde(default = "default_true")]
+    pub notify_on_waiting: bool,
+
+    /// Server-wide default: fire a push on Running to Idle transitions.
+    /// Off by default because Idle fires on every session completion and
+    /// gets spammy quickly. Sessions can opt in via `Instance.notify_on_idle`.
+    #[serde(default)]
+    pub notify_on_idle: bool,
+
+    /// Server-wide default: fire a push on Running to Error transitions.
+    #[serde(default = "default_true")]
+    pub notify_on_error: bool,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            notifications_enabled: true,
+            notify_on_waiting: true,
+            notify_on_idle: false,
+            notify_on_error: true,
+        }
+    }
+}
+
 fn default_profile() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ColorMode {
+    /// Emit 24-bit RGB escapes (\e[38;2;R;G;Bm). Default — best fidelity on
+    /// modern terminals and SSH sessions that pass RGB correctly.
+    #[default]
+    Truecolor,
+    /// Emit 256-palette escapes (\e[38;5;<idx>m) by converting every theme
+    /// Rgb(r,g,b) to the nearest xterm-256 index. Use this when the transport
+    /// (notably some mosh clients) mishandles 24-bit RGB — preview panes in
+    /// aoe already use 256-palette via ansi-to-tui, so palette mode renders
+    /// chrome through the same escape path and survives the same transports.
+    Palette,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThemeConfig {
     #[serde(default)]
     pub name: String,
+    /// How theme colors are emitted at the escape-sequence level.
+    /// See `ColorMode` for the truecolor vs palette trade-off.
+    #[serde(default)]
+    pub color_mode: ColorMode,
+    /// Minutes a freshly-stopped Idle session keeps the fresh-idle color
+    /// and animated `breathe` rattle before snapping back to the regular
+    /// static idle look. Sessions inside the window are also included in
+    /// the `w` keybind's "needs attention" bucket.
+    ///
+    /// Default is `0` (off): the freshness rattle and fresh-idle color
+    /// stay off, every Idle row renders with the regular static look
+    /// the moment its Stop hook fires. The time-since-stop column on
+    /// Idle rows is independent of this setting and shows regardless.
+    /// Set a positive value (e.g. 20) to opt in to the visual freshness
+    /// signal.
+    #[serde(default = "default_idle_decay_minutes")]
+    pub idle_decay_minutes: u64,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            color_mode: ColorMode::default(),
+            idle_decay_minutes: default_idle_decay_minutes(),
+        }
+    }
+}
+
+fn default_idle_decay_minutes() -> u64 {
+    0
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -282,9 +443,6 @@ pub struct UpdatesConfig {
     #[serde(default = "default_true")]
     pub check_enabled: bool,
 
-    #[serde(default)]
-    pub auto_update: bool,
-
     #[serde(default = "default_check_interval")]
     pub check_interval_hours: u64,
 
@@ -296,7 +454,6 @@ impl Default for UpdatesConfig {
     fn default() -> Self {
         Self {
             check_enabled: true,
-            auto_update: false,
             check_interval_hours: 24,
             notify_in_cli: true,
         }
@@ -423,7 +580,7 @@ pub struct SandboxConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instruction: Option<String>,
 
-    /// Container runtime to use for sandboxing (docker or apple_container)
+    /// Container runtime to use for sandboxing (docker, podman, or apple_container)
     #[serde(default)]
     pub container_runtime: ContainerRuntimeName,
 }
@@ -435,6 +592,7 @@ pub enum ContainerRuntimeName {
     AppleContainer,
     #[default]
     Docker,
+    Podman,
 }
 
 impl Default for SandboxConfig {
@@ -500,6 +658,22 @@ pub enum TmuxMouseMode {
     Disabled,
 }
 
+/// Controls whether aoe configures tmux to forward OSC 52 clipboard escape
+/// sequences from inner TUIs (Claude Code, OpenCode, Codex, etc.) to the
+/// outer terminal. Without this, "select to copy" inside the wrapped agent
+/// silently fails because tmux swallows the escape sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TmuxClipboardMode {
+    /// Apply clipboard pass-through only if the user has no tmux config
+    #[default]
+    Auto,
+    /// Always apply clipboard pass-through to aoe sessions
+    Enabled,
+    /// Never apply clipboard pass-through (use plain tmux defaults)
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TmuxConfig {
     #[serde(default)]
@@ -516,6 +690,12 @@ pub struct TmuxConfig {
     /// Static terminal title restored when AoE regains control after attach.
     #[serde(default = "default_dashboard_tab_title")]
     pub dashboard_tab_title: String,
+
+    /// Clipboard pass-through mode (auto, enabled, disabled). Controls
+    /// `set-clipboard on` and `allow-passthrough on` so OSC 52 from the
+    /// wrapped agent reaches the terminal.
+    #[serde(default)]
+    pub clipboard: TmuxClipboardMode,
 }
 
 impl Default for TmuxConfig {
@@ -525,6 +705,7 @@ impl Default for TmuxConfig {
             mouse: TmuxMouseMode::Auto,
             rename_terminal_tab_on_attach: false,
             dashboard_tab_title: default_dashboard_tab_title(),
+            clipboard: TmuxClipboardMode::Auto,
         }
     }
 }
@@ -546,7 +727,7 @@ pub fn user_has_tmux_config() -> bool {
 
 /// Determine if status bar styling should be applied based on config and environment.
 pub fn should_apply_tmux_status_bar() -> bool {
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_or_warn();
     match config.tmux.status_bar {
         TmuxStatusBarMode::Enabled => true,
         TmuxStatusBarMode::Disabled => false,
@@ -557,7 +738,7 @@ pub fn should_apply_tmux_status_bar() -> bool {
 /// Determine if mouse support should be enabled based on config and environment.
 /// Returns Some(true) to enable, Some(false) to disable, None to not touch the setting.
 pub fn should_apply_tmux_mouse() -> Option<bool> {
-    let config = Config::load().unwrap_or_default();
+    let config = Config::load_or_warn();
     match config.tmux.mouse {
         TmuxMouseMode::Enabled => Some(true),
         TmuxMouseMode::Disabled => Some(false),
@@ -572,7 +753,20 @@ pub fn should_apply_tmux_mouse() -> Option<bool> {
     }
 }
 
-fn config_path() -> Result<PathBuf> {
+/// Determine if clipboard pass-through (`set-clipboard on` +
+/// `allow-passthrough on`) should be applied. Auto enables it when the user
+/// has no tmux config of their own; users with custom tmux configs are
+/// expected to manage these options themselves.
+pub fn should_apply_tmux_clipboard() -> bool {
+    let config = Config::load_or_warn();
+    match config.tmux.clipboard {
+        TmuxClipboardMode::Enabled => true,
+        TmuxClipboardMode::Disabled => false,
+        TmuxClipboardMode::Auto => !user_has_tmux_config(),
+    }
+}
+
+pub(crate) fn config_path() -> Result<PathBuf> {
     Ok(get_app_dir()?.join("config.toml"))
 }
 
@@ -586,6 +780,18 @@ impl Config {
         let content = fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Like [`Config::load`], but logs a warning on failure and returns defaults
+    /// instead of propagating the error.
+    pub fn load_or_warn() -> Self {
+        match Self::load() {
+            Ok(config) => config,
+            Err(e) => {
+                tracing::warn!("Failed to load global config, using defaults: {e}");
+                Config::default()
+            }
+        }
     }
 }
 
@@ -606,21 +812,32 @@ pub fn save_config(config: &Config) -> Result<()> {
 
 /// Load the user's default profile name, falling back to "default" on error.
 pub fn resolve_default_profile() -> String {
-    Config::load()
-        .map(|c| c.default_profile)
-        .unwrap_or_else(|_| "default".to_string())
+    let config = Config::load_or_warn();
+    if config.default_profile.is_empty() {
+        "default".to_string()
+    } else {
+        config.default_profile
+    }
+}
+
+/// Return `profile` if non-empty, otherwise the user's globally configured
+/// default profile. Used at start-time config-resolution sites that prefer
+/// an instance's `source_profile` but tolerate it being unset (e.g. tests
+/// or pre-`source_profile`-wiring callers).
+pub fn effective_profile(profile: &str) -> String {
+    if profile.is_empty() {
+        resolve_default_profile()
+    } else {
+        profile.to_string()
+    }
 }
 
 pub fn get_update_settings() -> UpdatesConfig {
-    load_config()
-        .ok()
-        .flatten()
-        .map(|c| c.updates)
-        .unwrap_or_default()
+    Config::load_or_warn().updates
 }
 
 pub fn get_claude_config_dir() -> Option<PathBuf> {
-    let config = load_config().ok().flatten()?;
+    let config = Config::load_or_warn();
     config.claude.config_dir.map(|s| {
         if let Some(stripped) = s.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
@@ -634,6 +851,68 @@ pub fn get_claude_config_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_effective_profile_returns_input_when_non_empty() {
+        // Non-empty input is passed through verbatim, regardless of what's
+        // configured globally as the default. No filesystem access needed.
+        assert_eq!(effective_profile("personal"), "personal");
+        assert_eq!(effective_profile("default"), "default");
+        assert_eq!(effective_profile("alpha-beta_v2"), "alpha-beta_v2");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_effective_profile_falls_back_to_global_default_when_empty() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        #[cfg(target_os = "linux")]
+        let app_dir = temp_home.path().join(".config").join("agent-of-empires");
+        #[cfg(not(target_os = "linux"))]
+        let app_dir = temp_home.path().join(".agent-of-empires");
+
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::write(app_dir.join("config.toml"), r#"default_profile = "alpha""#).unwrap();
+
+        assert_eq!(
+            effective_profile(""),
+            "alpha",
+            "empty profile must fall back to the user's globally configured default",
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_load_or_warn_returns_defaults_on_malformed_toml() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        #[cfg(target_os = "linux")]
+        let app_dir = temp_home.path().join(".config").join("agent-of-empires");
+        #[cfg(not(target_os = "linux"))]
+        let app_dir = temp_home.path().join(".agent-of-empires");
+
+        std::fs::create_dir_all(&app_dir).unwrap();
+        // Malformed: 'enabled_by_default' under [sandbox] expects a boolean.
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = \"not-a-bool\"\n",
+        )
+        .unwrap();
+
+        let config = Config::load_or_warn();
+        // Defaults restored rather than propagated; the parse error is logged.
+        let defaults = Config::default();
+        assert_eq!(
+            config.sandbox.enabled_by_default,
+            defaults.sandbox.enabled_by_default,
+        );
+    }
 
     // Tests for Config defaults
     #[test]
@@ -670,6 +949,10 @@ mod tests {
     fn test_theme_config_default() {
         let theme = ThemeConfig::default();
         assert_eq!(theme.name, "");
+        // Freshness signal is off by default; users opt in by setting a
+        // positive value via Settings -> Theme -> Idle Decay (minutes)
+        // or in config.toml directly.
+        assert_eq!(theme.idle_decay_minutes, 0);
     }
 
     #[test]
@@ -677,6 +960,32 @@ mod tests {
         let toml = r#"name = "dark""#;
         let theme: ThemeConfig = toml::from_str(toml).unwrap();
         assert_eq!(theme.name, "dark");
+        // Missing field defaults to the off state. Existing configs
+        // without `idle_decay_minutes` get the calmer (no-rattle)
+        // default rather than being opted into the visual signal.
+        assert_eq!(theme.idle_decay_minutes, 0);
+    }
+
+    #[test]
+    fn test_theme_config_idle_decay_override() {
+        let toml = r#"
+            name = "dracula"
+            idle_decay_minutes = 5
+        "#;
+        let theme: ThemeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(theme.idle_decay_minutes, 5);
+    }
+
+    #[test]
+    fn test_theme_config_idle_decay_zero_disables() {
+        // 0 is a valid setting that disables the freshness signal
+        // entirely. Verifying it round-trips cleanly so users can opt
+        // out without having to remove the field.
+        let toml = r#"
+            idle_decay_minutes = 0
+        "#;
+        let theme: ThemeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(theme.idle_decay_minutes, 0);
     }
 
     // Tests for UpdatesConfig
@@ -684,7 +993,6 @@ mod tests {
     fn test_updates_config_default() {
         let updates = UpdatesConfig::default();
         assert!(updates.check_enabled);
-        assert!(!updates.auto_update);
         assert_eq!(updates.check_interval_hours, 24);
         assert!(updates.notify_in_cli);
     }
@@ -693,13 +1001,11 @@ mod tests {
     fn test_updates_config_deserialize() {
         let toml = r#"
             check_enabled = false
-            auto_update = true
             check_interval_hours = 12
             notify_in_cli = false
         "#;
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
         assert!(!updates.check_enabled);
-        assert!(updates.auto_update);
         assert_eq!(updates.check_interval_hours, 12);
         assert!(!updates.notify_in_cli);
     }
@@ -710,8 +1016,26 @@ mod tests {
         let updates: UpdatesConfig = toml::from_str(toml).unwrap();
         assert!(!updates.check_enabled);
         // Defaults for other fields
-        assert!(!updates.auto_update);
         assert_eq!(updates.check_interval_hours, 24);
+    }
+
+    /// Regression: a previous schema had `auto_update = bool` on
+    /// UpdatesConfig (it was wired through profiles but never read).
+    /// The field is gone now, so old configs that still set it must
+    /// deserialize cleanly with the field silently dropped by serde.
+    #[test]
+    fn test_legacy_auto_update_field_is_silently_ignored() {
+        let old_toml = r#"
+            check_enabled = true
+            auto_update = true
+            check_interval_hours = 12
+            notify_in_cli = true
+        "#;
+        let updates: UpdatesConfig =
+            toml::from_str(old_toml).expect("old auto_update field should not error");
+        assert_eq!(updates.check_interval_hours, 12);
+        assert!(updates.check_enabled);
+        assert!(updates.notify_in_cli);
     }
 
     // Tests for WorktreeConfig
@@ -951,6 +1275,7 @@ mod tests {
         assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
         assert!(!tmux.rename_terminal_tab_on_attach);
         assert_eq!(tmux.dashboard_tab_title, "AoE");
+        assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
     }
 
     #[test]
@@ -1014,6 +1339,28 @@ mod tests {
         let toml = r#""#;
         let tmux: TmuxConfig = toml::from_str(toml).unwrap();
         assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
+    }
+
+    #[test]
+    fn test_tmux_config_clipboard_deserialize() {
+        let toml = r#"clipboard = "enabled""#;
+        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
+        assert_eq!(tmux.clipboard, TmuxClipboardMode::Enabled);
+        assert_eq!(tmux.mouse, TmuxMouseMode::Auto);
+    }
+
+    #[test]
+    fn test_tmux_config_clipboard_default_auto() {
+        let toml = r#""#;
+        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
+        assert_eq!(tmux.clipboard, TmuxClipboardMode::Auto);
+    }
+
+    #[test]
+    fn test_tmux_config_clipboard_disabled() {
+        let toml = r#"clipboard = "disabled""#;
+        let tmux: TmuxConfig = toml::from_str(toml).unwrap();
+        assert_eq!(tmux.clipboard, TmuxClipboardMode::Disabled);
     }
 
     #[test]
@@ -1206,5 +1553,18 @@ mod tests {
             deserialized.session.agent_detect_as.get("lenovo-claude"),
             Some(&"claude".to_string()),
         );
+    }
+
+    #[test]
+    fn test_container_runtime_podman_round_trip() {
+        // Users on Linux configure podman via `container_runtime = "podman"`
+        // in config.toml; if the snake_case rename ever drifts, their config
+        // would silently fall back to the docker default.
+        let toml_str = r#"container_runtime = "podman""#;
+        let parsed: SandboxConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.container_runtime, ContainerRuntimeName::Podman);
+
+        let serialized = toml::to_string(&parsed).unwrap();
+        assert!(serialized.contains(r#"container_runtime = "podman""#));
     }
 }

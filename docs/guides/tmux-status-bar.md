@@ -36,7 +36,8 @@ Configure the status bar behavior in `~/.agent-of-empires/config.toml`:
 # "enabled"        - Always apply aoe status bar styling
 # "disabled"       - Never apply, use your own tmux config
 status_bar = "auto"
-mouse = "auto"    # Same modes: auto, enabled, disabled
+mouse = "auto"     # Same modes: auto, enabled, disabled
+clipboard = "auto" # Same modes: auto, enabled, disabled
 rename_terminal_tab_on_attach = false
 dashboard_tab_title = "AoE"
 ```
@@ -55,6 +56,32 @@ AoE can also rename the outer terminal tab or window title while you are attache
 
 - `rename_terminal_tab_on_attach = true` sets the terminal tab title to the session title before attach
 - `dashboard_tab_title = "AoE"` restores a static title when control returns to the AoE dashboard
+
+## Clipboard Pass-through
+
+Modern TUI agents (Claude Code, OpenCode, Codex, Gemini CLI, etc.) write to the system clipboard by emitting OSC 52 escape sequences. tmux intercepts those by default, so "select to copy" inside the wrapped agent silently fails: the notification appears, but nothing reaches your terminal's clipboard.
+
+When clipboard pass-through is enabled (the default in `auto` mode if you have no `~/.tmux.conf`), aoe sets two options on every aoe-managed tmux session:
+
+```tmux
+set-option -t <session> set-clipboard on
+set-option -t <session> allow-passthrough on
+```
+
+These let the agent's OSC 52 sequence reach your terminal emulator (Windows Terminal, iTerm2, Ghostty, etc.) instead of being swallowed by tmux.
+
+### When to disable
+
+If you're running aoe in an environment where you don't trust the wrapped agent's terminal output, set `clipboard = "disabled"`. `allow-passthrough on` lets the inner program write arbitrary escape sequences to your outer terminal; for most aoe users this is fine (you're already letting the agent run code), but it's worth knowing.
+
+If you have your own `~/.tmux.conf` and want to manage these options yourself, you'll need:
+
+```tmux
+set -g set-clipboard on
+set -g allow-passthrough on
+```
+
+Some terminal emulators also need clipboard write permission enabled on their side (Ghostty's `clipboard-write = allow`, etc.).
 
 ## Custom Integration
 

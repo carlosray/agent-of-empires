@@ -13,6 +13,7 @@ const MOBILE_GESTURES = [
   { key: "Two fingers", desc: "Swipe up/down to scroll the terminal (tmux copy-mode)" },
   { key: "Tap pane", desc: "Open the soft keyboard" },
   { key: "Long-press ↑↓", desc: "Drag horizontally to emit ← →" },
+  { key: "Hold session", desc: "Long-press a session to rename it" },
 ];
 
 const IS_MAC =
@@ -22,8 +23,13 @@ const IS_MAC =
 export function HelpOverlay({ onClose }: Props) {
   const modKey = IS_MAC ? "⌘" : "Ctrl";
 
+  const optKey = IS_MAC ? "⌥" : "Alt";
+
   const shortcuts = [
     { key: `${modKey}K`, desc: "Open command palette" },
+    { key: `${modKey}B`, desc: "Toggle left sidebar" },
+    { key: `${modKey}${optKey}B`, desc: "Toggle right panel" },
+    { key: `${modKey}\``, desc: "Toggle agent / shell terminal focus" },
     { key: "n", desc: "New session" },
     { key: "D", desc: "Toggle diff panel" },
     { key: "s", desc: "Toggle settings" },

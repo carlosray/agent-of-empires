@@ -40,10 +40,6 @@ fn needs_worktree_cleanup(inst: &Instance, args: &RemoveArgs) -> bool {
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let storage = Storage::new(profile)?;
     let (instances, groups) = storage.load_with_groups()?;
-    // Config is resolved per-session inside the loop (see below) so that
-    // repo-level overrides (e.g. delete_branch_on_cleanup) are respected.
-    // We keep a fallback for the case where no session matches.
-    let fallback_config = crate::session::resolve_config(profile).unwrap_or_default();
 
     let mut found = false;
     let mut removed_title = String::new();
@@ -57,11 +53,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             found = true;
             removed_title = inst.title.clone();
 
-            let config = crate::session::repo_config::resolve_config_with_repo(
+            let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
                 profile,
                 std::path::Path::new(&inst.project_path),
-            )
-            .unwrap_or_else(|_| fallback_config.clone());
+            );
 
             // Run on_destroy hooks before cleanup so resources are still available.
             // Global/profile hooks are implicitly trusted; repo hooks require trust.
@@ -79,9 +74,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     }
                     Ok(crate::session::repo_config::HookTrustStatus::NeedsTrust { .. }) => {
                         // Repo hooks changed; fall back to global/profile only.
-                        on_destroy = crate::session::resolve_config(profile)
-                            .map(|c| c.hooks.on_destroy)
-                            .unwrap_or_default();
+                        on_destroy =
+                            crate::session::profile_config::resolve_config_or_warn(profile)
+                                .hooks
+                                .on_destroy;
                     }
                     _ => {}
                 }
@@ -89,6 +85,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                 if !on_destroy.is_empty() {
                     let is_sandboxed = inst.sandbox_info.as_ref().is_some_and(|s| s.enabled);
 
+                    // CLI context: leave the terminal attached so a hook that
+                    // legitimately needs user input can still be answered.
                     let errors = if is_sandboxed {
                         if let Some(ref sandbox) = inst.sandbox_info {
                             let workdir = inst.container_workdir();
@@ -96,6 +94,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                                 &on_destroy,
                                 &sandbox.container_name,
                                 &workdir,
+                                false,
                             )
                         } else {
                             vec![]
@@ -104,6 +103,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                         crate::session::repo_config::execute_hooks_best_effort(
                             &on_destroy,
                             project_path,
+                            false,
                         )
                     };
 

@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyModifiers,
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::prelude::*;
@@ -11,9 +11,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::home::{HomeView, TerminalMode};
-use super::styles::load_theme;
 use super::styles::Theme;
-use crate::session::{get_update_settings, load_config, save_config};
+use crate::session::{get_update_settings, load_config, save_config, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
 
@@ -62,6 +61,34 @@ fn apply_tool_session_state_change(
     changed
 }
 
+struct UpdateStatus {
+    text: String,
+    expires_at: Option<std::time::Instant>,
+}
+
+impl UpdateStatus {
+    fn persistent(text: String) -> Self {
+        Self {
+            text,
+            expires_at: None,
+        }
+    }
+
+    fn transient(text: String) -> Self {
+        Self {
+            text,
+            expires_at: Some(std::time::Instant::now() + std::time::Duration::from_secs(10)),
+        }
+    }
+
+    fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(deadline) => std::time::Instant::now() >= deadline,
+            None => false,
+        }
+    }
+}
+
 pub struct App {
     home: HomeView,
     should_quit: bool,
@@ -69,17 +96,30 @@ pub struct App {
     needs_redraw: bool,
     update_info: Option<UpdateInfo>,
     update_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<UpdateInfo>>>,
+    update_status: Option<UpdateStatus>,
+    update_status_rx: Option<tokio::sync::oneshot::Receiver<anyhow::Result<()>>>,
+    /// User dismissed the update bar this session. Resets when the
+    /// process exits; on next launch the startup check runs again and
+    /// the bar reappears if an update is still available. In-memory
+    /// only — no config persistence.
+    update_bar_dismissed: bool,
     /// Held in an Option so `with_raw_mode_disabled` can drop it before
     /// spawning child processes. Crossterm's EventStream runs a background
     /// reader thread on stdin; if it's alive when tmux attach-session starts,
     /// the two compete for stdin and tmux fails to initialize its client.
     event_stream: Option<EventStream>,
+    /// Tracks whether we currently have xterm mouse-tracking enabled. The TUI
+    /// turns it off while a copy-friendly surface is open (`HomeView::
+    /// wants_text_selection`) so users can drag-select natively, then turns
+    /// it back on when the surface dismisses. Default true to match the
+    /// startup `EnableMouseCapture` in `tui::run`.
+    mouse_captured: bool,
 }
 
 /// Check if the app version changed and return the previous version if changelog should be shown.
 /// This is called before App::new to allow async cache refresh.
 pub fn check_version_change() -> Result<Option<String>> {
-    let config = load_config()?.unwrap_or_default();
+    let config = Config::load_or_warn();
     let current_version = env!("CARGO_PKG_VERSION");
 
     if config.app_state.has_seen_welcome
@@ -92,7 +132,12 @@ pub fn check_version_change() -> Result<Option<String>> {
 }
 
 impl App {
-    pub fn new(profile: &str, available_tools: AvailableTools) -> Result<Self> {
+    pub fn new(
+        profile: &str,
+        available_tools: AvailableTools,
+        suppress_first_run_dialogs: bool,
+    ) -> Result<Self> {
+        let no_agents = !available_tools.any_available();
         let active_profile = if profile.is_empty() {
             None // all-profiles mode
         } else {
@@ -101,7 +146,7 @@ impl App {
         let mut home = HomeView::new(active_profile, available_tools)?;
 
         // Check if we need to show welcome or changelog dialogs
-        let mut config = load_config()?.unwrap_or_default();
+        let mut config = Config::load_or_warn();
 
         // Load theme from config, defaulting to empire if empty
         let theme_name = if config.theme.name.is_empty() {
@@ -109,10 +154,21 @@ impl App {
         } else {
             &config.theme.name
         };
-        let theme = load_theme(theme_name);
+        let palette_mode = matches!(
+            config.theme.color_mode,
+            crate::session::config::ColorMode::Palette
+        );
+        let theme = crate::tui::styles::load_theme_with_mode(theme_name, palette_mode);
         let current_version = env!("CARGO_PKG_VERSION").to_string();
 
-        if !config.app_state.has_seen_welcome {
+        if no_agents {
+            // Show the no-agents onboarding dialog (takes priority over welcome/changelog)
+            home.show_no_agents();
+        } else if suppress_first_run_dialogs {
+            // A startup warning will be shown by the caller; skip welcome and
+            // changelog so the warning is what the user sees first, and avoid
+            // overwriting a malformed config.toml with defaults via save_config.
+        } else if !config.app_state.has_seen_welcome {
             home.show_welcome();
             config.app_state.has_seen_welcome = true;
             config.app_state.last_seen_version = Some(current_version);
@@ -131,8 +187,36 @@ impl App {
             needs_redraw: true,
             update_info: None,
             update_rx: None,
+            update_status: None,
+            update_status_rx: None,
+            update_bar_dismissed: false,
             event_stream: Some(EventStream::new()),
+            mouse_captured: true,
         })
+    }
+
+    /// Turn xterm mouse tracking on or off to match the current view state.
+    ///
+    /// **Contract**: must be called after any handler that may open or close
+    /// a surface counted by `HomeView::wants_text_selection`. Currently the
+    /// event-loop `Event::Key` arm and the tail of `with_raw_mode_disabled`
+    /// cover this; new event sources that mutate dialog state need to call
+    /// this too or mouse capture will lag a frame behind reality.
+    fn sync_mouse_capture(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        let desired = !self.home.wants_text_selection();
+        if desired == self.mouse_captured {
+            return Ok(());
+        }
+        if desired {
+            crossterm::execute!(terminal.backend_mut(), EnableMouseCapture)?;
+        } else {
+            crossterm::execute!(terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_captured = desired;
+        Ok(())
     }
 
     /// Temporarily leave TUI mode, run a closure, and restore TUI mode.
@@ -150,10 +234,11 @@ impl App {
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::LeaveAlternateScreen,
-            crossterm::event::DisableMouseCapture,
             DisableBracketedPaste,
+            DisableMouseCapture,
             crossterm::cursor::Show
         )?;
+        self.mouse_captured = false;
         std::io::Write::flush(terminal.backend_mut())?;
 
         // Drop the event stream so its background reader releases stdin.
@@ -171,15 +256,14 @@ impl App {
         crossterm::execute!(
             terminal.backend_mut(),
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::event::EnableMouseCapture,
             EnableBracketedPaste,
             crossterm::cursor::Hide
         )?;
+        // Defer mouse-capture restore to sync_mouse_capture so we don't
+        // briefly enable it only to disable again when the user returned
+        // to the serve view.
+        self.sync_mouse_capture(terminal)?;
         std::io::Write::flush(terminal.backend_mut())?;
-
-        while event::poll(Duration::from_millis(0))? {
-            let _ = event::read();
-        }
 
         terminal.clear()?;
 
@@ -187,11 +271,45 @@ impl App {
     }
 
     pub fn show_startup_warning(&mut self, message: &str) {
-        self.home.info_dialog = Some(crate::tui::dialogs::InfoDialog::new("Warning", message));
+        // Size the dialog to fit the message after wrapping. The message area
+        // is `width - 4` columns wide (borders + 1-cell margin on each side),
+        // so each \n-separated line wraps to ceil(len / inner_width) visual
+        // rows. Borders + margin + the OK button take 6 rows.
+        const WIDTH: u16 = 80;
+        let inner_width = WIDTH.saturating_sub(4) as usize;
+        let visual_lines: usize = message
+            .lines()
+            .map(|l| {
+                if l.is_empty() {
+                    1
+                } else {
+                    l.len().div_ceil(inner_width)
+                }
+            })
+            .sum();
+        // +6 for borders/margin/button; +1 safety margin since byte-length
+        // wrap estimation under-counts when Paragraph word-wraps mid-line.
+        let height = ((visual_lines as u16).saturating_add(7)).clamp(9, 35);
+        // Warnings preempt onboarding dialogs so the user sees the problem
+        // before the welcome screen.
+        self.home.welcome_dialog = None;
+        self.home.changelog_dialog = None;
+        self.home.info_dialog =
+            Some(crate::tui::dialogs::InfoDialog::new("Warning", message).with_size(WIDTH, height));
     }
 
     pub fn set_theme(&mut self, name: &str) {
-        self.theme = load_theme(name);
+        let palette_mode = load_config()
+            .ok()
+            .flatten()
+            .map(|c| {
+                matches!(
+                    c.theme.color_mode,
+                    crate::session::config::ColorMode::Palette
+                )
+            })
+            .unwrap_or(false);
+        self.theme = crate::tui::styles::load_theme_with_mode(name, palette_mode);
         self.needs_redraw = true;
     }
 
@@ -213,7 +331,26 @@ impl App {
             self.update_rx = Some(rx);
             tokio::spawn(async move {
                 let version = env!("CARGO_PKG_VERSION");
-                let _ = tx.send(check_for_update(version, false).await);
+                let mut result = check_for_update(version, false).await;
+                // For Homebrew installs, suppress the "update available"
+                // ribbon until the formula has caught up to the GitHub
+                // release. Otherwise users see the prompt, press 'u', and
+                // hit a no-op `brew upgrade` while the formula lags. The
+                // brew probes are sync; offload to keep the runtime free.
+                if let Ok(info) = &mut result {
+                    if info.available {
+                        let target = info.latest_version.clone();
+                        let actionable = tokio::task::spawn_blocking(move || {
+                            crate::update::install::install_method_supports_target(&target)
+                        })
+                        .await
+                        .unwrap_or(true);
+                        if !actionable {
+                            info.available = false;
+                        }
+                    }
+                }
+                let _ = tx.send(result);
             });
         }
 
@@ -240,10 +377,16 @@ impl App {
         let mut last_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
+        let mut last_heartbeat = std::time::Instant::now();
         const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+
+        // Signal that the TUI is active so the web push consumer can
+        // suppress notifications while the user is watching the dashboard.
+        crate::session::write_tui_heartbeat();
 
         loop {
             // Force full redraw if needed (e.g., after returning from tmux).
@@ -262,6 +405,7 @@ impl App {
                     match event {
                         Some(Ok(Event::Key(key))) => {
                             self.handle_key(key, terminal).await?;
+                            self.sync_mouse_capture(terminal)?;
 
                             // Skip the draw when returning from tmux attach.
                             // needs_redraw triggers a clear + stale event drain
@@ -276,12 +420,41 @@ impl App {
                             }
                             continue;
                         }
-                        Some(Ok(Event::Mouse(_))) => continue,
+                        Some(Ok(Event::Mouse(mouse))) => {
+                            let hit_scroll_target = if self.home.is_diff_open() {
+                                self.home.hit_diff(mouse.column, mouse.row)
+                            } else if self.home.has_selected_session() {
+                                self.home.hit_preview(mouse.column, mouse.row)
+                            } else {
+                                false
+                            };
+                            let handled = match mouse.kind {
+                                MouseEventKind::ScrollUp if hit_scroll_target => self.home.handle_scroll_up(),
+                                MouseEventKind::ScrollDown if hit_scroll_target => self.home.handle_scroll_down(),
+                                _ => false,
+                            };
+                            if handled {
+                                terminal.draw(|f| self.render(f))?;
+                            }
+                            continue;
+                        }
                         Some(Ok(Event::Paste(text))) => {
                             self.home.handle_paste(&text);
 
                             terminal.draw(|f| self.render(f))?;
 
+                            continue;
+                        }
+                        Some(Ok(Event::Resize(_, _))) => {
+                            // Soft keyboard slides up/down on iPad/iPhone Mosh
+                            // (and ordinary terminal resizes) emit Resize. The
+                            // catch-all below would silently drop them, leaving
+                            // the screen mid-stale until the next refresh tick.
+                            // Redraw now so viewport-driven layout
+                            // (responsive::dialog_width, STACKED_BREAKPOINT,
+                            // etc.) re-evaluates; ratatui's draw() autoresizes
+                            // internally before rendering.
+                            terminal.draw(|f| self.render(f))?;
                             continue;
                         }
                         Some(Ok(_)) => {}
@@ -336,6 +509,11 @@ impl App {
                 self.needs_redraw = true;
             }
 
+            // Check for in-progress update completion
+            if self.poll_update_status() {
+                self.needs_redraw = true;
+            }
+
             // Periodic refreshes (only when no input pending)
             let mut refresh_needed = false;
 
@@ -352,6 +530,10 @@ impl App {
                 refresh_needed = true;
             }
 
+            if self.home.apply_session_id_updates() {
+                refresh_needed = true;
+            }
+
             if let Some(session_id) = self.home.apply_creation_results() {
                 self.attach_session(&session_id, terminal)?;
                 refresh_needed = true;
@@ -365,6 +547,11 @@ impl App {
                 self.home.reload()?;
                 last_disk_refresh = std::time::Instant::now();
                 refresh_needed = true;
+            }
+
+            if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+                crate::session::write_tui_heartbeat();
+                last_heartbeat = std::time::Instant::now();
             }
 
             // Animated spinners (rattles) need periodic redraws, but only at
@@ -385,6 +572,7 @@ impl App {
             }
         }
 
+        self.home.apply_session_id_updates();
         self.home.cleanup_pending_creation();
 
         if let Err(e) = self.home.save() {
@@ -395,8 +583,17 @@ impl App {
     }
 
     fn render(&mut self, frame: &mut Frame) {
-        self.home
-            .render(frame, frame.area(), &self.theme, self.update_info.as_ref());
+        if self.update_status.as_ref().is_some_and(|s| s.is_expired()) {
+            self.update_status = None;
+        }
+        let status_text = self.update_status.as_ref().map(|s| s.text.as_str());
+        self.home.render(
+            frame,
+            frame.area(),
+            &self.theme,
+            self.update_info.as_ref(),
+            status_text,
+        );
     }
 
     /// Poll for update check result (non-blocking).
@@ -406,7 +603,104 @@ impl App {
             poll_update_receiver(self.update_rx.take(), self.update_info.take());
         self.update_info = update_info;
         self.update_rx = update_rx;
+        // If the user dismissed the bar this session, drop the info so
+        // render() and the `u` hotkey both see None. Reset on next launch.
+        if received && self.update_bar_dismissed {
+            self.update_info = None;
+            return false;
+        }
         received
+    }
+
+    /// Poll the in-progress update task for completion.
+    /// Returns true when the status line changed and a redraw is needed.
+    fn poll_update_status(&mut self) -> bool {
+        let Some(mut rx) = self.update_status_rx.take() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(Ok(())) => {
+                self.update_status = Some(UpdateStatus::persistent(
+                    "update complete. Restart aoe to use the new version.".into(),
+                ));
+                true
+            }
+            Ok(Err(e)) => {
+                self.update_status = Some(UpdateStatus::transient(format!("update failed: {e}")));
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                self.update_status_rx = Some(rx);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.update_status = Some(UpdateStatus::transient(
+                    "update task ended unexpectedly".into(),
+                ));
+                true
+            }
+        }
+    }
+
+    /// Dispatch the confirmed update, choosing between a blocking suspend and a
+    /// background tokio task based on whether the method requires sudo.
+    fn spawn_update(
+        &mut self,
+        method: crate::update::install::InstallMethod,
+        version: String,
+        terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    ) -> Result<()> {
+        use crate::update::install::InstallMethod;
+
+        let needs_sudo = matches!(
+            &method,
+            InstallMethod::Tarball { binary_path }
+                if !crate::update::install::parent_is_writable(binary_path)
+        );
+
+        if matches!(method, InstallMethod::Homebrew) || needs_sudo {
+            // Suspend the TUI so sudo's password prompt can use the terminal.
+            self.update_status = Some(UpdateStatus::transient(format!("updating to v{version}…")));
+            let method_clone = method.clone();
+            let version_clone = version.clone();
+            let result = self.with_raw_mode_disabled(terminal, move |_backend| {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        crate::update::install::perform_update(&method_clone, &version_clone, None)
+                            .await
+                    })
+                })
+            })?;
+            match result {
+                Ok(()) => {
+                    self.update_status = Some(UpdateStatus::persistent(
+                        "update complete. Restart aoe to use the new version.".into(),
+                    ));
+                }
+                Err(e) => {
+                    self.update_status =
+                        Some(UpdateStatus::transient(format!("update failed: {e}")));
+                }
+            }
+        } else {
+            // Background task for writable tarball installs.
+            // `perform_update`'s future is !Send because its `on_progress` parameter is
+            // `Option<&mut dyn FnMut(...)>` (no Send bound on the trait object), so
+            // `tokio::spawn` won't accept it. A std::thread + Handle::block_on lets the
+            // async I/O still use the existing tokio runtime while sidestepping the
+            // Send constraint.
+            self.update_status = Some(UpdateStatus::transient(format!("updating to v{version}…")));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.update_status_rx = Some(rx);
+            let handle = tokio::runtime::Handle::current();
+            std::thread::spawn(move || {
+                let result = handle.block_on(crate::update::install::perform_update(
+                    &method, &version, None,
+                ));
+                let _ = tx.send(result);
+            });
+        }
+        Ok(())
     }
 }
 
@@ -460,20 +754,33 @@ impl App {
                 self.should_quit = true;
                 return Ok(());
             }
-            (KeyCode::Char('q'), _) => {
-                if !self.home.has_dialog() {
-                    if self.home.is_creation_pending() {
-                        self.home.show_quit_during_creation_confirm();
-                        return Ok(());
-                    }
-                    self.should_quit = true;
+            (KeyCode::Char('q'), _) if !self.home.has_dialog() => {
+                if self.home.is_creation_pending() {
+                    self.home.show_quit_during_creation_confirm();
                     return Ok(());
                 }
+                self.should_quit = true;
+                return Ok(());
+            }
+            // Ctrl+x dismisses the update bar / status toast for this
+            // session. Gated on something being visible AND no dialog
+            // open so it doesn't fire during dialog input. On next launch
+            // the startup check runs again and the bar reappears if the
+            // update is still available.
+            (KeyCode::Char('x'), KeyModifiers::CONTROL)
+                if (self.update_info.is_some() || self.update_status.is_some())
+                    && !self.home.has_dialog() =>
+            {
+                self.update_info = None;
+                self.update_status = None;
+                self.update_bar_dismissed = true;
+                self.needs_redraw = true;
+                return Ok(());
             }
             _ => {}
         }
 
-        if let Some(action) = self.home.handle_key(key) {
+        if let Some(action) = self.home.handle_key(key, self.update_info.as_ref()) {
             self.execute_action(action, terminal)?;
         }
 
@@ -525,6 +832,17 @@ impl App {
             Action::SetTheme(name) => {
                 self.set_theme(&name);
             }
+            Action::SpawnUpdate(method, version) => {
+                if self.update_status_rx.is_some() {
+                    self.update_status =
+                        Some(UpdateStatus::transient("update already in progress".into()));
+                    return Ok(());
+                }
+                self.spawn_update(method, version, terminal)?;
+            }
+            Action::SetTransientStatus(text) => {
+                self.update_status = Some(UpdateStatus::transient(text));
+            }
         }
         Ok(())
     }
@@ -538,6 +856,17 @@ impl App {
             Some(inst) => inst.clone(),
             None => return Ok(()),
         };
+
+        // Cockpit-mode sessions are not backed by tmux. The Enter
+        // handler in `home::input` already short-circuits with a
+        // transient toast pointing the user at the web dashboard;
+        // this function still gets called from `apply_creation_results`
+        // after `aoe add --launch`, so guard here too. Falling through
+        // would attempt a tmux attach against a non-existent pane.
+        if instance.is_cockpit_mode() {
+            let _ = terminal;
+            return Ok(());
+        }
 
         let tmux_session = instance.tmux_session()?;
 
@@ -573,9 +902,6 @@ impl App {
             "attach_session: restart decision"
         );
         if needs_restart {
-            if tmux_session.exists() {
-                let _ = tmux_session.kill();
-            }
             // Show warning (once) if custom instruction is configured for an unsupported agent
             if instance.is_sandboxed() {
                 let has_instruction = instance
@@ -588,7 +914,7 @@ impl App {
                     && crate::agents::get_agent(&instance.tool)
                         .is_none_or(|a| a.instruction_flag.is_none())
                 {
-                    let config = load_config()?.unwrap_or_default();
+                    let config = Config::load_or_warn();
                     if !config.app_state.has_seen_custom_instruction_warning {
                         self.home.info_dialog = Some(
                             crate::tui::dialogs::InfoDialog::new(
@@ -620,22 +946,23 @@ impl App {
 
             self.home
                 .set_instance_status(session_id, crate::session::Status::Starting);
-            let mut inst = instance.clone();
-            if let Err(e) = inst.start_with_size_opts(size, skip_on_launch) {
+            if let Err(e) =
+                self.home
+                    .restart_instance_with_size_opts(session_id, size, skip_on_launch)
+            {
                 self.home
                     .set_instance_error(session_id, Some(e.to_string()));
                 self.home
                     .set_instance_status(session_id, crate::session::Status::Error);
                 return Ok(());
             }
-            self.home.try_mutate_instance(session_id, |current| {
-                *current = inst.clone();
-                Ok(())
-            })?;
-            self.home.save()?;
             self.home.set_instance_error(session_id, None);
         }
 
+        let tmux_session = match self.home.get_instance(session_id) {
+            Some(inst) => inst.tmux_session()?,
+            None => return Ok(()),
+        };
         let tmux_config = tmux_config_for_instance(&instance);
         let session_tab_title =
             crate::terminal::session_attach_title(&tmux_config, &instance.title);
@@ -680,6 +1007,7 @@ impl App {
             self.home.save()?;
         }
         self.home.request_status_refresh();
+        self.home.stamp_last_accessed(session_id);
         self.home.select_session_by_id(session_id);
 
         if let Err(e) = attach_result {
@@ -841,13 +1169,13 @@ pub enum Action {
     EditFile(PathBuf),
     StopSession(String),
     SetTheme(String),
+    SpawnUpdate(crate::update::install::InstallMethod, String),
+    SetTransientStatus(String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{Instance, ToolSessionProbe, ToolSessionProbeState};
-    use chrono::Utc;
 
     #[test]
     fn test_action_enum() {
@@ -938,68 +1266,5 @@ mod tests {
         assert!(info.is_some()); // But existing info is preserved
         assert_eq!(info.as_ref().unwrap().latest_version, "0.5.0");
         assert!(rx_out.is_none());
-    }
-
-    #[test]
-    fn test_restore_runtime_session_state_preserves_tool_session_probe() {
-        let mut current = Instance::new("Current", "/tmp/current");
-        let mut previous = Instance::new("Previous", "/tmp/previous");
-        let probe = ToolSessionProbe {
-            launch_started_at: Utc::now(),
-            baseline_source_refs: vec!["rollout-a".to_string()],
-            state: ToolSessionProbeState::Pending,
-        };
-        previous.tool_session_probe = Some(probe.clone());
-
-        restore_runtime_session_state(&mut current, &previous);
-
-        let restored = current
-            .tool_session_probe
-            .expect("probe should be restored");
-        assert_eq!(restored.baseline_source_refs, probe.baseline_source_refs);
-        assert_eq!(restored.state, probe.state);
-    }
-
-    #[test]
-    fn test_refresh_tool_session_state_returns_false_without_change() {
-        let mut current = Instance::new("Current", "/tmp/current");
-        current.tool = "vibe".to_string();
-
-        assert!(!refresh_tool_session_state(&mut current).unwrap());
-        assert!(current.tool_session.is_none());
-    }
-
-    #[test]
-    fn test_apply_tool_session_state_change_does_not_clear_on_probe_only_change() {
-        use crate::session::{tool_session::ToolSessionStateChange, ToolSessionProbeState};
-        use crate::session::{ToolSession, ToolSessionProbe};
-
-        let existing = ToolSession {
-            display_id: "existing".to_string(),
-            resume_target: "existing".to_string(),
-            source_ref: "existing-ref".to_string(),
-            updated_at: Utc::now(),
-        };
-        let mut current = Instance::new("Current", "/tmp/current");
-        current.tool_session = Some(existing.clone());
-
-        let changed = apply_tool_session_state_change(
-            &mut current,
-            ToolSessionStateChange {
-                tool_session: None,
-                tool_session_probe: Some(ToolSessionProbe {
-                    launch_started_at: Utc::now(),
-                    baseline_source_refs: vec!["a".to_string(), "b".to_string()],
-                    state: ToolSessionProbeState::Ambiguous,
-                }),
-            },
-        );
-
-        assert!(!changed);
-        assert_eq!(current.tool_session, Some(existing));
-        assert_eq!(
-            current.tool_session_probe.as_ref().map(|probe| probe.state),
-            Some(ToolSessionProbeState::Ambiguous)
-        );
     }
 }

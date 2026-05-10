@@ -9,7 +9,8 @@ use std::collections::HashMap;
 use std::fs;
 
 use super::config::{
-    Config, ContainerRuntimeName, DefaultTerminalMode, TmuxMouseMode, TmuxStatusBarMode,
+    ColorMode, Config, ContainerRuntimeName, DefaultTerminalMode, TmuxClipboardMode, TmuxMouseMode,
+    TmuxStatusBarMode,
 };
 use super::get_profile_dir;
 
@@ -42,12 +43,40 @@ pub struct ProfileConfig {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sound: Option<crate::sound::SoundConfigOverride>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cockpit: Option<CockpitConfigOverride>,
+}
+
+/// Per-profile overrides for the [cockpit] config section. Every field
+/// is `Option<T>`; when `None`, the global value wins. The TUI's
+/// "Clear override" action sets the field to None.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CockpitConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_for_claude: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_workers: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_events: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replay_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ThemeConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_mode: Option<ColorMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_decay_minutes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -60,9 +89,6 @@ pub struct ClaudeConfigOverride {
 pub struct UpdatesConfigOverride {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_enabled: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auto_update: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_interval_hours: Option<u64>,
@@ -169,6 +195,9 @@ pub struct TmuxConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dashboard_tab_title: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard: Option<TmuxClipboardMode>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -196,6 +225,9 @@ pub struct SessionConfigOverride {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_detect_as: Option<HashMap<String, String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_hotkeys: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -267,6 +299,21 @@ pub fn resolve_config(profile: &str) -> Result<Config> {
     let global = Config::load()?;
     let profile_config = load_profile_config(profile)?;
     Ok(merge_configs(global, &profile_config))
+}
+
+/// Like [`resolve_config`], but logs a warning on failure and returns defaults
+/// instead of propagating the error.
+pub fn resolve_config_or_warn(profile: &str) -> Config {
+    match resolve_config(profile) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load config for profile '{}', using defaults: {e}",
+                profile
+            );
+            Config::default()
+        }
+    }
 }
 
 /// Apply sandbox config overrides to a target config.
@@ -391,6 +438,9 @@ pub fn apply_session_overrides(
     if let Some(ref detect_as) = source.agent_detect_as {
         target.agent_detect_as = detect_as.clone();
     }
+    if let Some(strict_hotkeys) = source.strict_hotkeys {
+        target.strict_hotkeys = strict_hotkeys;
+    }
 }
 
 /// Apply tmux config overrides to a target config.
@@ -407,6 +457,9 @@ pub fn apply_tmux_overrides(target: &mut super::config::TmuxConfig, source: &Tmu
     if let Some(ref dashboard_tab_title) = source.dashboard_tab_title {
         target.dashboard_tab_title = dashboard_tab_title.clone();
     }
+    if let Some(clipboard) = source.clipboard {
+        target.clipboard = clipboard;
+    }
 }
 
 /// Merge profile overrides into global config
@@ -414,6 +467,12 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
     if let Some(ref theme_override) = profile.theme {
         if let Some(ref name) = theme_override.name {
             global.theme.name = name.clone();
+        }
+        if let Some(ref color_mode) = theme_override.color_mode {
+            global.theme.color_mode = color_mode.clone();
+        }
+        if let Some(idle_decay_minutes) = theme_override.idle_decay_minutes {
+            global.theme.idle_decay_minutes = idle_decay_minutes;
         }
     }
 
@@ -426,9 +485,6 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
     if let Some(ref updates_override) = profile.updates {
         if let Some(check_enabled) = updates_override.check_enabled {
             global.updates.check_enabled = check_enabled;
-        }
-        if let Some(auto_update) = updates_override.auto_update {
-            global.updates.auto_update = auto_update;
         }
         if let Some(check_interval_hours) = updates_override.check_interval_hours {
             global.updates.check_interval_hours = check_interval_hours;
@@ -460,6 +516,30 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
 
     if let Some(ref sound_override) = profile.sound {
         crate::sound::apply_sound_overrides(&mut global.sound, sound_override);
+    }
+
+    if let Some(ref cockpit_override) = profile.cockpit {
+        if let Some(v) = cockpit_override.enabled {
+            global.cockpit.enabled = v;
+        }
+        if let Some(v) = cockpit_override.default_for_claude {
+            global.cockpit.default_for_claude = v;
+        }
+        if let Some(ref v) = cockpit_override.default_agent {
+            global.cockpit.default_agent = v.clone();
+        }
+        if let Some(v) = cockpit_override.max_concurrent_workers {
+            global.cockpit.max_concurrent_workers = v;
+        }
+        if let Some(v) = cockpit_override.replay_events {
+            global.cockpit.replay_events = v;
+        }
+        if let Some(v) = cockpit_override.replay_bytes {
+            global.cockpit.replay_bytes = v;
+        }
+        if let Some(ref v) = cockpit_override.node_path {
+            global.cockpit.node_path = v.clone();
+        }
     }
 
     global
@@ -583,7 +663,6 @@ mod tests {
         let updates = config.updates.unwrap();
         assert_eq!(updates.check_enabled, Some(false));
         assert_eq!(updates.check_interval_hours, Some(48));
-        assert!(updates.auto_update.is_none());
 
         assert!(config.sandbox.is_some());
         let sandbox = config.sandbox.unwrap();
@@ -661,6 +740,7 @@ mod tests {
         let with_override = ProfileConfig {
             theme: Some(ThemeConfigOverride {
                 name: Some("dark".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };
@@ -766,6 +846,40 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_configs_with_tmux_clipboard_override() {
+        let global = Config::default();
+        assert_eq!(global.tmux.clipboard, TmuxClipboardMode::Auto);
+
+        let profile = ProfileConfig {
+            tmux: Some(TmuxConfigOverride {
+                clipboard: Some(TmuxClipboardMode::Disabled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.tmux.clipboard, TmuxClipboardMode::Disabled);
+    }
+
+    #[test]
+    fn test_merge_configs_tmux_clipboard_inherits_when_not_overridden() {
+        let mut global = Config::default();
+        global.tmux.clipboard = TmuxClipboardMode::Enabled;
+
+        let profile = ProfileConfig {
+            tmux: Some(TmuxConfigOverride {
+                mouse: Some(TmuxMouseMode::Enabled),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let merged = merge_configs(global, &profile);
+        assert_eq!(merged.tmux.clipboard, TmuxClipboardMode::Enabled);
+    }
+
+    #[test]
     fn test_merge_configs_with_volume_ignores_override() {
         let global = Config::default();
         assert!(global.sandbox.volume_ignores.is_empty());
@@ -832,6 +946,7 @@ mod tests {
                 mouse: Some(TmuxMouseMode::Enabled),
                 rename_terminal_tab_on_attach: Some(true),
                 dashboard_tab_title: Some("Empire".to_string()),
+                clipboard: Some(TmuxClipboardMode::Enabled),
             }),
             ..Default::default()
         };
@@ -870,6 +985,7 @@ mod tests {
         let profile = ProfileConfig {
             theme: Some(ThemeConfigOverride {
                 name: Some("tokyo-night".to_string()),
+                ..Default::default()
             }),
             ..Default::default()
         };

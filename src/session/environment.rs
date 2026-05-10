@@ -113,6 +113,31 @@ fn redact_export_statements(cmd: &str) -> String {
 pub(crate) const DEFAULT_TERMINAL_ENV_VARS: &[&str] =
     &["TERM", "COLORTERM", "FORCE_COLOR", "NO_COLOR"];
 
+/// Vertex provider env vars auto-forwarded into sandbox containers when
+/// `CLAUDE_CODE_USE_VERTEX` is set on the host. The flag itself is included
+/// so the container sees a consistent state.
+///
+/// `ANTHROPIC_API_KEY` is intentionally not in this list: Vertex auth uses
+/// GCP credentials, and force-forwarding the Anthropic API key would change
+/// behavior for users who happen to have it on their shell for unrelated
+/// reasons. Users who want it forwarded can add it to `sandbox.environment`
+/// explicitly.
+pub(crate) const AUTO_FORWARD_VERTEX_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_VERTEX_PROJECT_ID",
+    "ANTHROPIC_VERTEX_REGION",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLOUD_ML_REGION",
+];
+
+/// Returns true when `CLAUDE_CODE_USE_VERTEX` is set on the host to a
+/// non-empty value. An empty string is treated as unset to match how the
+/// flag is conventionally interpreted.
+pub(crate) fn host_vertex_enabled() -> bool {
+    std::env::var("CLAUDE_CODE_USE_VERTEX")
+        .ok()
+        .is_some_and(|v| !v.is_empty())
+}
+
 /// Returns the user's preferred shell from `$SHELL`, falling back to `bash`.
 ///
 /// Used for host-side command wrappers (agent launch, local hook execution)
@@ -263,6 +288,21 @@ pub(crate) fn collect_environment(
         }
     }
 
+    // Auto-forward Vertex provider env vars when Vertex is enabled on the host.
+    // Gating on the host flag keeps non-Vertex users' sandboxes unchanged.
+    if host_vertex_enabled() {
+        for &key in AUTO_FORWARD_VERTEX_ENV_VARS {
+            if seen_keys.insert(key.to_string()) {
+                if let Ok(val) = std::env::var(key) {
+                    result.push(EnvEntry::Inherit {
+                        key: key.to_string(),
+                        value: val,
+                    });
+                }
+            }
+        }
+    }
+
     for entry in entries {
         if let Some((key, value)) = entry.split_once('=') {
             if seen_keys.insert(key.to_string()) {
@@ -313,12 +353,15 @@ pub(crate) fn collect_environment(
     result
 }
 
-/// Resolve the effective sandbox config by merging global + active profile + repo.
-fn resolved_sandbox_config(project_path: &std::path::Path) -> super::config::SandboxConfig {
-    let profile = super::config::resolve_default_profile();
-    super::repo_config::resolve_config_with_repo(&profile, project_path)
-        .map(|c| c.sandbox)
-        .unwrap_or_default()
+/// Resolve the effective sandbox config by merging global + the given profile + repo.
+/// An empty `profile` falls back to the user's globally configured default profile
+/// via [`super::config::effective_profile`].
+fn resolved_sandbox_config(
+    profile: &str,
+    project_path: &std::path::Path,
+) -> super::config::SandboxConfig {
+    let resolved = super::config::effective_profile(profile);
+    super::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
 /// Result of building docker exec environment arguments.
@@ -349,13 +392,15 @@ pub(crate) struct DockerExecEnv {
 /// The `docker run` path (container creation) is protected separately via
 /// `Command::env()` in `run_create`, which keeps secrets out of argv entirely.
 pub(crate) fn build_docker_env_args(
+    profile: &str,
     sandbox: &SandboxInfo,
     project_path: &std::path::Path,
 ) -> DockerExecEnv {
-    let sandbox_config = resolved_sandbox_config(project_path);
+    let sandbox_config = resolved_sandbox_config(profile, project_path);
 
     tracing::debug!(
-        "build_docker_env_args: config.sandbox.environment={:?}, extra_env={:?}",
+        "build_docker_env_args: profile={:?}, config.sandbox.environment={:?}, extra_env={:?}",
+        profile,
         sandbox_config.environment,
         sandbox.extra_env
     );
@@ -396,6 +441,97 @@ pub(crate) fn build_docker_env_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test: when an instance is created under a non-default profile and
+    /// has no per-session `extra_env` overrides, the docker env args must come from
+    /// THAT profile's `sandbox.environment`, not from the user's globally configured
+    /// default profile. Pre-fix, the web flow surfaced this as "personal profile's
+    /// GH_TOKEN was ignored when launching from the web app."
+    #[test]
+    #[serial_test::serial]
+    fn test_build_docker_env_args_uses_passed_profile_not_global_default() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(target_os = "linux")]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        // Determine app dir layout (matches session::get_app_dir_path).
+        #[cfg(target_os = "linux")]
+        let app_dir = temp_home.path().join(".config").join("agent-of-empires");
+        #[cfg(not(target_os = "linux"))]
+        let app_dir = temp_home.path().join(".agent-of-empires");
+
+        let profiles_dir = app_dir.join("profiles");
+        std::fs::create_dir_all(profiles_dir.join("default")).unwrap();
+        std::fs::create_dir_all(profiles_dir.join("personal")).unwrap();
+
+        // Global config sets the "currently active" default profile.
+        std::fs::write(
+            app_dir.join("config.toml"),
+            r#"default_profile = "default""#,
+        )
+        .unwrap();
+
+        // Two profiles with distinct env values; both use literal values so the
+        // test does not depend on inherited host env vars.
+        std::fs::write(
+            profiles_dir.join("default").join("config.toml"),
+            r#"
+[sandbox]
+environment = ["GH_TOKEN=read_only_token"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            profiles_dir.join("personal").join("config.toml"),
+            r#"
+[sandbox]
+environment = ["GH_TOKEN=write_token"]
+"#,
+        )
+        .unwrap();
+
+        // Sandbox info with no per-session overrides forces the fallback path
+        // through `sandbox_config.environment`, which is the buggy path pre-fix.
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let project_path = temp_home.path().join("nonexistent_project");
+
+        let result_personal = build_docker_env_args("personal", &sandbox, &project_path);
+        assert!(
+            result_personal
+                .docker_args
+                .contains("GH_TOKEN='write_token'"),
+            "passing profile=\"personal\" should resolve personal profile's env, got: {}",
+            result_personal.docker_args,
+        );
+
+        let result_default = build_docker_env_args("default", &sandbox, &project_path);
+        assert!(
+            result_default
+                .docker_args
+                .contains("GH_TOKEN='read_only_token'"),
+            "passing profile=\"default\" should resolve default profile's env, got: {}",
+            result_default.docker_args,
+        );
+
+        // Empty profile must fall back to the user's globally configured default,
+        // preserving prior behavior for callers without a profile in hand.
+        let result_empty = build_docker_env_args("", &sandbox, &project_path);
+        assert!(
+            result_empty
+                .docker_args
+                .contains("GH_TOKEN='read_only_token'"),
+            "empty profile must fall back to global default, got: {}",
+            result_empty.docker_args,
+        );
+    }
 
     #[test]
     fn test_redact_env_values_docker_flags() {
@@ -525,7 +661,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: None,
             custom_instruction: None,
         };
@@ -548,7 +683,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: None,
             custom_instruction: None,
         };
@@ -568,7 +702,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec!["AOE_TEST_EXTRA".to_string(), "FOO=bar".to_string()]),
             custom_instruction: None,
         };
@@ -594,7 +727,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec!["DUP_KEY=from_session".to_string()]),
             custom_instruction: None,
         };
@@ -616,7 +748,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: None,
             custom_instruction: None,
         };
@@ -638,7 +769,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: None,
             custom_instruction: None,
         };
@@ -661,7 +791,6 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: None,
             custom_instruction: None,
         };
@@ -722,11 +851,10 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec!["AOE_TEST_TOKEN=$AOE_TEST_TOKEN".to_string()]),
             custom_instruction: None,
         };
-        let result = build_docker_env_args(&sandbox, std::path::Path::new("/nonexistent"));
+        let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // docker_args should have the key but NOT the secret value
         assert!(
             result.docker_args.contains("-e AOE_TEST_TOKEN"),
@@ -758,11 +886,10 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec!["MY_MAPPED=$AOE_TEST_SOURCE".to_string()]),
             custom_instruction: None,
         };
-        let result = build_docker_env_args(&sandbox, std::path::Path::new("/nonexistent"));
+        let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
             result.docker_args.contains("-e MY_MAPPED"),
             "Expected -e MY_MAPPED in docker_args: {}",
@@ -794,11 +921,10 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec!["AOE_TEST_BARE".to_string()]),
             custom_instruction: None,
         };
-        let result = build_docker_env_args(&sandbox, std::path::Path::new("/nonexistent"));
+        let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
             result.docker_args.contains("-e AOE_TEST_BARE"),
             "Expected -e AOE_TEST_BARE in docker_args: {}",
@@ -829,11 +955,10 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec!["MY_LITERAL=some_value".to_string()]),
             custom_instruction: None,
         };
-        let result = build_docker_env_args(&sandbox, std::path::Path::new("/nonexistent"));
+        let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         assert!(
             result.docker_args.contains("MY_LITERAL="),
             "Expected MY_LITERAL=value in docker_args: {}",
@@ -860,14 +985,13 @@ mod tests {
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            created_at: None,
             extra_env: Some(vec![
                 "AOE_TEST_SECRET=$AOE_TEST_SECRET".to_string(),
                 "MY_LITERAL=public_val".to_string(),
             ]),
             custom_instruction: None,
         };
-        let result = build_docker_env_args(&sandbox, std::path::Path::new("/nonexistent"));
+        let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
         // Secret: key only in docker_args, value in exports
         assert!(result.docker_args.contains("-e AOE_TEST_SECRET"));
         assert!(!result.docker_args.contains("mysecret"));
@@ -950,5 +1074,147 @@ mod tests {
             Some(v) => std::env::set_var("SHELL", v),
             None => std::env::remove_var("SHELL"),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_environment_auto_forwards_vertex_vars_when_enabled() {
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
+        std::env::set_var("CLOUD_ML_REGION", "us-east5");
+        let config = SandboxConfig::default();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+
+        let vertex_flag = find_entry(&result, "CLAUDE_CODE_USE_VERTEX")
+            .expect("CLAUDE_CODE_USE_VERTEX not found");
+        assert_eq!(vertex_flag.value(), "1");
+        assert!(matches!(vertex_flag, EnvEntry::Inherit { .. }));
+
+        let project = find_entry(&result, "ANTHROPIC_VERTEX_PROJECT_ID")
+            .expect("ANTHROPIC_VERTEX_PROJECT_ID not found");
+        assert_eq!(project.value(), "my-proj");
+
+        let region = find_entry(&result, "CLOUD_ML_REGION").expect("CLOUD_ML_REGION not found");
+        assert_eq!(region.value(), "us-east5");
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
+        std::env::remove_var("CLOUD_ML_REGION");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_environment_skips_vertex_vars_when_flag_unset() {
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
+        std::env::set_var("CLOUD_ML_REGION", "us-east5");
+        let config = SandboxConfig::default();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+        assert!(
+            find_entry(&result, "ANTHROPIC_VERTEX_PROJECT_ID").is_none(),
+            "Vertex vars should not auto-forward when CLAUDE_CODE_USE_VERTEX is unset",
+        );
+        assert!(find_entry(&result, "CLOUD_ML_REGION").is_none());
+
+        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
+        std::env::remove_var("CLOUD_ML_REGION");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_environment_skips_vertex_vars_when_flag_empty() {
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
+        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
+        let config = SandboxConfig::default();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+        assert!(
+            find_entry(&result, "ANTHROPIC_VERTEX_PROJECT_ID").is_none(),
+            "Empty CLAUDE_CODE_USE_VERTEX must be treated as unset",
+        );
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_environment_does_not_auto_forward_anthropic_api_key() {
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-host-key");
+        let config = SandboxConfig::default();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+        assert!(
+            find_entry(&result, "ANTHROPIC_API_KEY").is_none(),
+            "ANTHROPIC_API_KEY must not be auto-forwarded; users opt in via sandbox.environment",
+        );
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+        std::env::remove_var("ANTHROPIC_API_KEY");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_environment_vertex_vars_not_duplicated() {
+        std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
+        std::env::set_var("ANTHROPIC_VERTEX_PROJECT_ID", "my-proj");
+        let config = SandboxConfig {
+            environment: vec!["ANTHROPIC_VERTEX_PROJECT_ID".to_string()],
+            ..Default::default()
+        };
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+        let matches: Vec<_> = result
+            .iter()
+            .filter(|e| e.key() == "ANTHROPIC_VERTEX_PROJECT_ID")
+            .collect();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].value(), "my-proj");
+
+        std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+        std::env::remove_var("ANTHROPIC_VERTEX_PROJECT_ID");
     }
 }

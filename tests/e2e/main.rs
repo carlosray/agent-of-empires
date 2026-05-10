@@ -18,9 +18,13 @@
 mod harness;
 
 mod cli;
+mod command_palette;
 mod errors;
 mod new_session;
 mod profile_picker;
+mod project_registry;
 mod sandbox;
+mod serve;
 mod tui_launch;
 mod unified_view;
+mod update_command;

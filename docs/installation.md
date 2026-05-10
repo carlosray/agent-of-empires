@@ -4,7 +4,7 @@
 
 - [tmux](https://github.com/tmux/tmux/wiki) (required)
 - [Docker](https://www.docker.com/) (optional, for sandboxing agents in containers)
-- [Node.js](https://nodejs.org/) (optional, only for building the web dashboard with `--features serve`)
+- [Node.js](https://nodejs.org/) (optional, only needed when building the web dashboard from source with `--features serve`)
 
 ## Install Agent of Empires
 
@@ -23,8 +23,6 @@ curl -fsSL \
 ```bash
 brew install aoe
 ```
-
-> **Note:** The Homebrew formula does not yet include the web dashboard (`aoe serve`) since the feature is still experimental. To use the web dashboard, install via the [quick install script](#quick-install-recommended) or [build from source](#build-from-source) with `--features serve`.
 
 ### Build from Source
 
@@ -49,6 +47,16 @@ This requires Node.js and npm. The web frontend is built automatically during co
 ```bash
 aoe --version
 ```
+
+## Updating
+
+```bash
+aoe update
+```
+
+The `aoe update` command detects how aoe was installed (Homebrew, the curl install script, Nix, or Cargo) and dispatches to the right upgrade mechanism. For Nix and Cargo it prints the manual upgrade command instead of attempting an automatic update, since those cases need external tooling.
+
+Inside the TUI, press `u` when the update bar is visible to run the same flow without leaving the app. Press `Ctrl+x` to dismiss the bar for the current session.
 
 ## Uninstall
 

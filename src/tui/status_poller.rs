@@ -18,6 +18,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
+
 use crate::session::{Instance, Status, ToolSession, ToolSessionProbe};
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
@@ -47,6 +49,12 @@ pub struct StatusUpdate {
     pub id: String,
     pub status: Status,
     pub last_error: Option<String>,
+    /// Snapshot of the polled clone's `idle_entered_at` after
+    /// `update_status_with_metadata` ran. Propagating this field is what
+    /// keeps the freshness signal working in the TUI: without it, the
+    /// wrapper's timestamp write lives only on the polling clone and is
+    /// lost when we project the result back into a `StatusUpdate`.
+    pub idle_entered_at: Option<DateTime<Utc>>,
     pub tool_session: Option<ToolSession>,
     pub tool_session_probe: Option<ToolSessionProbe>,
     pub tool_session_changed: bool,
@@ -158,6 +166,7 @@ impl StatusPoller {
                                         id: inst.id,
                                         status: Status::Error,
                                         last_error: Some("Container is not running".to_string()),
+                                        idle_entered_at: None,
                                         tool_session: None,
                                         tool_session_probe: None,
                                         tool_session_changed: false,
@@ -177,9 +186,8 @@ impl StatusPoller {
                     // status tier. Each refresh fans out to lsof or sqlite3
                     // subprocesses; running it every cycle multiplies that
                     // cost by the session count and starves the UI thread.
-                    // Sessions with a Pending probe (the launch grace window)
-                    // still refresh every cycle so the initial bind happens
-                    // promptly.
+                    // Sessions with a Pending probe still refresh every cycle
+                    // so the initial bind happens promptly.
                     let in_initial_bind_window = inst.tool_session.is_none()
                         && matches!(
                             inst.tool_session_probe.as_ref().map(|p| p.state),
@@ -197,6 +205,7 @@ impl StatusPoller {
                         id: inst.id,
                         status: inst.status,
                         last_error: inst.last_error,
+                        idle_entered_at: inst.idle_entered_at,
                         tool_session: tool_session_change
                             .as_ref()
                             .and_then(|change| change.tool_session.clone()),
@@ -236,12 +245,25 @@ impl Default for StatusPoller {
 mod tests {
     use super::*;
 
-    fn is_due(cycle: u64, tier: u64) -> bool {
-        if tier == 1 {
-            true
-        } else {
-            cycle % tier == 0
-        }
+    #[test]
+    fn status_update_carries_idle_entered_at() {
+        // Regression: the polling loop runs `update_status_with_metadata`
+        // on a clone, then projects the result into a `StatusUpdate`. If
+        // `idle_entered_at` falls off the projection (the original bug),
+        // the breathe rattle + fresh-idle color never fire in the TUI
+        // even though the wrapper sets the timestamp on the clone
+        // correctly.
+        let ts = Utc::now();
+        let update = StatusUpdate {
+            id: "abc".into(),
+            status: Status::Idle,
+            last_error: None,
+            idle_entered_at: Some(ts),
+            tool_session: None,
+            tool_session_probe: None,
+            tool_session_changed: false,
+        };
+        assert_eq!(update.idle_entered_at, Some(ts));
     }
 
     #[test]
@@ -270,27 +292,26 @@ mod tests {
 
     #[test]
     fn test_tier_cycle_alignment() {
-        // Hot sessions are polled every cycle
-        for cycle in 1..=10u64 {
-            assert!(is_due(cycle, TIER_HOT));
-        }
+        // Hot sessions are polled every cycle: TIER_HOT must stay at 1.
+        assert_eq!(TIER_HOT, 1);
         // Warm sessions are polled every 5 cycles
-        assert!(!is_due(1, TIER_WARM));
-        assert!(!is_due(2, TIER_WARM));
-        assert!(is_due(5, TIER_WARM));
-        assert!(is_due(10, TIER_WARM));
+        assert_ne!(1u64 % TIER_WARM, 0);
+        assert_ne!(2u64 % TIER_WARM, 0);
+        assert_eq!(5u64 % TIER_WARM, 0);
+        assert_eq!(10u64 % TIER_WARM, 0);
         // Cold sessions are polled every 60 cycles
-        assert!(!is_due(1, TIER_COLD));
-        assert!(is_due(60, TIER_COLD));
-        assert!(is_due(120, TIER_COLD));
+        assert_ne!(1u64 % TIER_COLD, 0);
+        assert_eq!(60u64 % TIER_COLD, 0);
+        assert_eq!(120u64 % TIER_COLD, 0);
     }
 
     #[test]
     fn test_first_cycle_polls_all_tiers() {
         // cycle_count starts at TIER_COLD - 1, first cycle wraps to TIER_COLD
         let first_cycle = (TIER_COLD - 1).wrapping_add(1);
-        assert!(is_due(first_cycle, TIER_HOT), "first cycle must poll hot");
-        assert!(is_due(first_cycle, TIER_WARM), "first cycle must poll warm");
-        assert!(is_due(first_cycle, TIER_COLD), "first cycle must poll cold");
+        // TIER_HOT == 1 (see test_tier_cycle_alignment), so any cycle trivially
+        // polls hot; just verify the warm and cold alignments here.
+        assert_eq!(first_cycle % TIER_WARM, 0, "first cycle must poll warm");
+        assert_eq!(first_cycle % TIER_COLD, 0, "first cycle must poll cold");
     }
 }

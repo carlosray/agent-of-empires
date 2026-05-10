@@ -1,4 +1,5 @@
 import { test, expect, devices, type Page } from "@playwright/test";
+import { clickSidebarSession } from "./helpers/sidebar";
 import {
   mockTerminalApis,
   installTerminalSpies,
@@ -11,11 +12,14 @@ test.use({ ...devices["iPhone 13"] });
 
 test.describe("Terminal pinch zoom (mobile)", () => {
   async function openSession(page: Page) {
-    await page
-      .getByRole("button", { name: /pinch-test claude/ })
-      .first()
-      .click();
-    await page.locator(".xterm").waitFor({ state: "visible", timeout: 10_000 });
+    // On mobile the sidebar is collapsed; open it first.
+    const sidebarToggle = page.getByRole("button", { name: "Toggle sidebar" });
+    if (await sidebarToggle.isVisible()) {
+      await sidebarToggle.click();
+      await page.waitForTimeout(300);
+    }
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator(".wterm").waitFor({ state: "visible", timeout: 10_000 });
   }
 
   async function wsCount(page: Page) {

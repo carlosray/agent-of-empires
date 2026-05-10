@@ -10,27 +10,29 @@ mod tests;
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
+use ratatui::prelude::Rect;
 use tui_input::Input;
 
 use crate::session::{
     config::{load_config, save_config, GroupByMode, SortOrder},
-    flatten_tree, flatten_tree_all_profiles, resolve_config, DefaultTerminalMode, Group, GroupTree,
-    Instance, Item, Storage,
+    flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn, DefaultTerminalMode, Group,
+    GroupTree, Instance, Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
 use super::creation_poller::{CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
-use super::dialogs::ServeDialog;
+use super::dialogs::ServeView;
 use super::dialogs::{
-    ChangelogDialog, ConfirmDialog, GroupDeleteOptionsDialog, HookTrustDialog, HooksInstallDialog,
-    InfoDialog, NewSessionData, NewSessionDialog, ProfilePickerDialog, RenameDialog,
-    UnifiedDeleteDialog, WelcomeDialog,
+    ChangelogDialog, CommandPaletteDialog, ConfirmDialog, GroupDeleteOptionsDialog,
+    HookTrustDialog, HooksInstallDialog, InfoDialog, NewSessionData, NewSessionDialog,
+    NoAgentsDialog, ProfilePickerDialog, ProjectsDialog, RenameDialog, UnifiedDeleteDialog,
+    UpdateConfirmDialog, WelcomeDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
-use super::status_poller::StatusPoller;
+use super::status_poller::{StatusPoller, StatusUpdate};
 
 /// Extract a project group name from a session instance.
 /// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
@@ -60,11 +62,6 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
-pub(super) struct BranchRefreshContext {
-    pub(super) session_id: String,
-    pub(super) new_branch: String,
-}
-
 /// View mode for the home screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -87,6 +84,11 @@ pub(super) struct PreviewCache {
     pub(super) content: String,
     pub(super) last_refresh: Instant,
     pub(super) dimensions: (u16, u16),
+    /// Number of lines that were captured into `content`. Used together with
+    /// the BUFFER reserve so consecutive wheel ticks don't trigger a fresh
+    /// `tmux capture-pane` subprocess while the cached window still covers
+    /// the requested scroll.
+    pub(super) captured_lines: usize,
 }
 
 impl Default for PreviewCache {
@@ -96,6 +98,7 @@ impl Default for PreviewCache {
             content: String::new(),
             last_refresh: Instant::now(),
             dimensions: (0, 0),
+            captured_lines: 0,
         }
     }
 }
@@ -129,6 +132,11 @@ pub(super) const ICON_EXPANDED: &str = "▼";
 pub(super) struct CreatingHookProgress {
     pub(super) hook_output: Vec<String>,
     pub(super) current_hook: Option<String>,
+}
+
+pub(super) struct BranchRefreshContext {
+    pub(super) session_id: String,
+    pub(super) new_branch: String,
 }
 
 pub struct HomeView {
@@ -166,11 +174,15 @@ pub struct HomeView {
     /// Session data pending agent hooks acknowledgment
     pub(super) pending_hooks_install_data: Option<NewSessionData>,
     pub(super) welcome_dialog: Option<WelcomeDialog>,
+    pub(super) no_agents_dialog: Option<NoAgentsDialog>,
     pub(super) changelog_dialog: Option<ChangelogDialog>,
     pub(super) info_dialog: Option<InfoDialog>,
     pub(super) profile_picker_dialog: Option<ProfilePickerDialog>,
+    pub(super) projects_dialog: Option<ProjectsDialog>,
+    pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
-    pub(super) serve_dialog: Option<ServeDialog>,
+    pub(super) serve_view: Option<ServeView>,
+    pub(super) update_confirm_dialog: Option<UpdateConfirmDialog>,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
@@ -180,7 +192,7 @@ pub struct HomeView {
     pub(super) pending_stop_session: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
-    /// Session branch change pending user confirmation
+    /// Branch refresh to apply after the confirmation dialog is accepted
     pub(super) pending_branch_refresh: Option<BranchRefreshContext>,
     // Search
     pub(super) search_active: bool,
@@ -215,6 +227,12 @@ pub struct HomeView {
     pub(super) terminal_preview_cache: PreviewCache,
     pub(super) container_terminal_preview_cache: PreviewCache,
 
+    /// Mouse wheel offset for the preview pane, in lines back from the bottom.
+    /// Reset to 0 whenever the selected session changes.
+    pub(super) preview_scroll_offset: u16,
+    pub(super) preview_area: Rect,
+    pub(super) diff_area: Rect,
+
     // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
     // Default terminal mode from config
@@ -224,6 +242,16 @@ pub struct HomeView {
 
     // Sound config for state transition sounds
     pub(super) sound_config: crate::sound::SoundConfig,
+
+    /// Resolved decay window from `Config.theme.idle_decay_minutes`. Read
+    /// at startup and re-resolved on settings reload. Used by render to
+    /// drive the breathe rattle and fresh-idle color, and by the `w`
+    /// keybind to gate which Idle sessions are still "actionable".
+    pub(super) idle_decay_window: std::time::Duration,
+
+    // When true, letter-based action hotkeys require SHIFT (guard against
+    // dictation / stray keystrokes triggering destructive actions).
+    pub(super) strict_hotkeys: bool,
 
     // Settings view
     pub(super) settings_view: Option<SettingsView>,
@@ -272,22 +300,16 @@ impl HomeView {
 
         // In unified mode, config comes from "default" profile
         let config_profile = active_profile.as_deref().unwrap_or("default");
-        let resolved = resolve_config(config_profile);
-        let default_terminal_mode = resolved
-            .as_ref()
-            .map(|config| match config.sandbox.default_terminal_mode {
-                DefaultTerminalMode::Host => TerminalMode::Host,
-                DefaultTerminalMode::Container => TerminalMode::Container,
-            })
-            .unwrap_or_default();
-        let sound_config = resolved
-            .as_ref()
-            .map(|config| config.sound.clone())
-            .unwrap_or_default();
-        let show_branch_in_tui = resolved
-            .as_ref()
-            .map(|config| config.worktree.show_branch_in_tui)
-            .unwrap_or(true);
+        let resolved = resolve_config_or_warn(config_profile);
+        let default_terminal_mode = match resolved.sandbox.default_terminal_mode {
+            DefaultTerminalMode::Host => TerminalMode::Host,
+            DefaultTerminalMode::Container => TerminalMode::Container,
+        };
+        let sound_config = resolved.sound.clone();
+        let strict_hotkeys = resolved.session.strict_hotkeys;
+        let show_branch_in_tui = resolved.worktree.show_branch_in_tui;
+        let idle_decay_window =
+            crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -337,11 +359,15 @@ impl HomeView {
             hooks_install_dialog: None,
             pending_hooks_install_data: None,
             welcome_dialog: None,
+            no_agents_dialog: None,
             changelog_dialog: None,
             info_dialog: None,
             profile_picker_dialog: None,
+            projects_dialog: None,
+            command_palette: None,
             #[cfg(feature = "serve")]
-            serve_dialog: None,
+            serve_view: None,
+            update_confirm_dialog: None,
             send_message_dialog: None,
             pending_send_session: None,
             pending_attach_after_warning: None,
@@ -364,10 +390,15 @@ impl HomeView {
             preview_cache: PreviewCache::default(),
             terminal_preview_cache: PreviewCache::default(),
             container_terminal_preview_cache: PreviewCache::default(),
+            preview_scroll_offset: 0,
+            preview_area: Rect::default(),
+            diff_area: Rect::default(),
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             show_branch_in_tui,
             sound_config,
+            strict_hotkeys,
+            idle_decay_window,
             settings_view: None,
             settings_close_confirm: false,
             diff_view: None,
@@ -388,8 +419,79 @@ impl HomeView {
         }
         if !orphan_ids.is_empty() {
             tracing::info!("Cleaned up {} orphaned creating sessions", orphan_ids.len());
-            let _ = view.save();
+            if let Err(e) = view.save() {
+                tracing::warn!("Failed to save view state: {e}");
+            }
         }
+
+        // Batch-sync instance IDs and captured session IDs to tmux hidden env
+        // so that build_exclusion_set() on other AoE instances can see them.
+        {
+            let mut set_batch: Vec<(String, String, String)> = Vec::new();
+            let mut unset_batch: Vec<(String, String)> = Vec::new();
+            for inst in &view.instances {
+                let tmux_name = match inst.tmux_session() {
+                    Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
+                    _ => continue,
+                };
+
+                set_batch.push((
+                    tmux_name.clone(),
+                    crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                    inst.id.clone(),
+                ));
+                if let Some(ref sid) = inst.agent_session_id {
+                    set_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                        sid.clone(),
+                    ));
+                } else {
+                    unset_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    ));
+                }
+            }
+            if !set_batch.is_empty() {
+                let batch_refs: Vec<(&str, &str, &str)> = set_batch
+                    .iter()
+                    .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
+                    .collect();
+                if let Err(e) = crate::tmux::env::set_hidden_env_batch(&batch_refs) {
+                    tracing::warn!("Batch env sync failed: {}", e);
+                }
+            }
+            if !unset_batch.is_empty() {
+                let batch_refs: Vec<(&str, &str)> = unset_batch
+                    .iter()
+                    .map(|(s, k)| (s.as_str(), k.as_str()))
+                    .collect();
+                if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&batch_refs) {
+                    tracing::warn!("Batch env unset failed: {}", e);
+                }
+            }
+        }
+
+        // Recover session IDs for pre-existing sessions via pollers.
+        for inst in &mut view.instances {
+            let has_live_tmux = inst
+                .tmux_session()
+                .map(|s| s.exists() && !s.is_pane_dead())
+                .unwrap_or(false);
+            if !has_live_tmux {
+                continue;
+            }
+
+            if inst.supports_session_poller() && inst.session_id_poller.is_none() {
+                inst.maybe_start_poller();
+            }
+        }
+        view.instance_map = view
+            .instances
+            .iter()
+            .map(|i| (i.id.clone(), i.clone()))
+            .collect();
 
         view.flat_items = view.build_flat_items();
         view.update_selected();
@@ -422,9 +524,22 @@ impl HomeView {
                     inst.last_error = prev.last_error.clone();
                     inst.last_error_check = prev.last_error_check;
                     inst.last_start_time = prev.last_start_time;
+                    inst.session_id_poller = prev.session_id_poller.clone();
                     inst.tool_session_probe = prev.tool_session_probe.clone();
                     inst.tool_session =
                         newest_tool_session(inst.tool_session.clone(), prev.tool_session.clone());
+                    // Carry the in-memory idle_entered_at across reloads
+                    // so a freshly-stopped session doesn't lose its
+                    // freshness state when the user toggles a setting
+                    // that triggers a reload mid-window.
+                    inst.idle_entered_at = prev.idle_entered_at;
+                    // Use in-memory session_id if present; fallback to disk.
+                    // In-memory state takes priority over disk: the poller
+                    // may have updated the ID since last save.
+                    inst.agent_session_id = prev
+                        .agent_session_id
+                        .clone()
+                        .or(inst.agent_session_id.take());
                 }
             }
             // Rebuild this profile's tree from disk, preserving any collapsed
@@ -461,9 +576,36 @@ impl HomeView {
             .iter()
             .map(|i| (i.id.clone(), i.clone()))
             .collect();
+        // Remember what the cursor was pointing at so we can follow it
+        let prev_selected_session = self.selected_session.clone();
+        let prev_selected_group = self.selected_group.clone();
+
         self.flat_items = self.build_flat_items();
 
-        if self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
+        // Try to restore cursor to the same session/group after rebuild
+        let mut restored = false;
+        if let Some(ref sid) = prev_selected_session {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Session { id, .. } = item {
+                    if id == sid {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
+            }
+        } else if let Some(ref gpath) = prev_selected_group {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Group { path, .. } = item {
+                    if path == gpath {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
             self.cursor = self.flat_items.len() - 1;
         }
 
@@ -491,39 +633,10 @@ impl HomeView {
     /// Apply any pending status updates from the background poller.
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
-        use crate::session::Status;
-
         if let Some(updates) = self.status_poller.try_recv_updates() {
             let mut any_change = false;
             for update in updates {
-                let old_status = self.get_instance(&update.id).map(|i| i.status);
-
-                let should_update = old_status.is_some_and(|s| {
-                    s != Status::Deleting
-                        && s != Status::Creating
-                        && s != Status::Stopped
-                        && update.status != Status::Stopped
-                });
-
-                if should_update {
-                    let new_status = update.status;
-                    let new_error = update.last_error.clone();
-                    self.mutate_instance(&update.id, |inst| {
-                        inst.status = new_status;
-                        inst.last_error = new_error;
-                    });
-                    any_change = true;
-
-                    if let Some(old) = old_status {
-                        if old != new_status {
-                            crate::sound::play_for_transition(old, new_status, &self.sound_config);
-                        }
-                    }
-                }
-
-                if self.apply_tool_session_update(&update) {
-                    any_change = true;
-                }
+                any_change |= self.apply_one_status_update(update);
             }
             self.pending_status_refresh = false;
             return any_change;
@@ -531,14 +644,52 @@ impl HomeView {
         false
     }
 
+    /// Apply a single status update from the poller. Extracted from the
+    /// channel-pulling loop in `apply_status_updates` so tests can drive
+    /// the apply path directly without having to push through the
+    /// background polling thread.
+    pub(super) fn apply_one_status_update(&mut self, update: StatusUpdate) -> bool {
+        use crate::session::Status;
+
+        let old_status = self.get_instance(&update.id).map(|i| i.status);
+        let should_update = old_status.is_some_and(|s| {
+            s != Status::Deleting
+                && s != Status::Creating
+                && s != Status::Stopped
+                && update.status != Status::Stopped
+        });
+        let mut any_change = false;
+        if should_update {
+            let new_status = update.status;
+            let new_error = update.last_error.clone();
+            let new_idle_entered_at = update.idle_entered_at;
+            self.mutate_instance(&update.id, |inst| {
+                inst.status = new_status;
+                inst.last_error = new_error;
+                // Propagate the timestamp the polling clone wrote;
+                // see StatusPoller for why this isn't a simple
+                // `inst.idle_entered_at = …` from inside the poll.
+                inst.idle_entered_at = new_idle_entered_at;
+            });
+
+            any_change = true;
+            if let Some(old) = old_status {
+                if old != new_status {
+                    crate::sound::play_for_transition(old, new_status, &self.sound_config);
+                }
+            }
+        }
+        if self.apply_tool_session_update(&update) {
+            any_change = true;
+        }
+        any_change
+    }
+
     /// Applies a tool_session update from the status poller to the in-memory
     /// instance, and persists to disk when the resolved tool_session actually
-    /// changed. Returns true iff the tool_session value changed (probe-only
-    /// updates return false and do not trigger a save).
-    pub(crate) fn apply_tool_session_update(
-        &mut self,
-        update: &super::status_poller::StatusUpdate,
-    ) -> bool {
+    /// changed. Returns true iff the tool_session value changed; probe-only
+    /// updates return false and do not trigger a save.
+    pub(crate) fn apply_tool_session_update(&mut self, update: &StatusUpdate) -> bool {
         if !update.tool_session_changed {
             return false;
         }
@@ -573,7 +724,9 @@ impl HomeView {
                 if let Err(e) = self.save() {
                     tracing::error!("Failed to save after deletion: {}", e);
                 }
-                let _ = self.reload();
+                if let Err(e) = self.reload() {
+                    tracing::warn!("Failed to reload session state: {e}");
+                }
             } else {
                 let error = result.error;
                 self.mutate_instance(&result.session_id, |inst| {
@@ -586,29 +739,83 @@ impl HomeView {
         false
     }
 
+    /// Apply any pending session ID updates from background pollers.
+    /// Returns true if any instance was updated.
+    pub fn apply_session_id_updates(&mut self) -> bool {
+        let mut updates: Vec<(String, String)> = Vec::new();
+
+        for inst in &self.instances {
+            if let Some((_id, session_id)) = inst
+                .session_id_poller
+                .as_ref()
+                .and_then(|p| p.lock().ok())
+                .and_then(|p| p.try_recv_session_update())
+            {
+                let Some(session_id) = crate::session::capture::validated_session_id(session_id)
+                else {
+                    continue;
+                };
+                if inst.agent_session_id.as_deref() != Some(session_id.as_str()) {
+                    updates.push((inst.id.clone(), session_id));
+                }
+                continue;
+            }
+        }
+
+        if !updates.is_empty() {
+            let prev: Vec<(String, Option<String>)> = updates
+                .iter()
+                .filter_map(|(id, _)| {
+                    self.get_instance(id)
+                        .map(|inst| (id.clone(), inst.agent_session_id.clone()))
+                })
+                .collect();
+
+            for (id, session_id) in &updates {
+                self.mutate_instance(id, |inst| {
+                    inst.agent_session_id = Some(session_id.clone());
+                });
+            }
+            if let Err(e) = self.save() {
+                tracing::error!("Failed to save after session ID update: {}", e);
+                for (id, old_val) in &prev {
+                    self.mutate_instance(id, |inst| {
+                        inst.agent_session_id = old_val.clone();
+                    });
+                }
+                return false;
+            }
+        }
+        !updates.is_empty()
+    }
+
     /// Request background session creation. Used for sandbox sessions to avoid blocking UI.
     /// Creates a stub instance in the session list with Status::Creating so the user
     /// can see progress in the preview pane while continuing to use the TUI.
     pub fn request_creation(
         &mut self,
-        data: NewSessionData,
+        mut data: NewSessionData,
         hooks: Option<crate::session::HooksConfig>,
     ) {
-        // Build a stub instance to show in the list while creation runs
-        let stub_title = if data.title.is_empty() {
-            data.worktree_branch
-                .as_deref()
-                .filter(|b| !b.is_empty())
-                .map(|b| b.to_string())
-                .unwrap_or_else(|| {
-                    std::path::Path::new(&data.path)
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "New session".to_string())
-                })
-        } else {
-            data.title.clone()
-        };
+        // Pre-resolve the title using the same logic the builder will run, so the
+        // stub instance, the background creation, and the eventual real instance
+        // all agree on the title (otherwise an empty title would show as the path
+        // basename in the stub but a civilization name in the final instance).
+        if data.title.is_empty() {
+            let existing_titles: Vec<&str> = self
+                .instances()
+                .iter()
+                .filter(|i| i.source_profile == data.profile)
+                .map(|i| i.title.as_str())
+                .collect();
+            data.title = crate::session::builder::resolve_title(
+                &data.title,
+                data.worktree_branch.as_deref(),
+                data.worktree_enabled,
+                &existing_titles,
+            );
+        }
+        let stub_title = data.title.clone();
         let mut stub = Instance::new(&stub_title, &data.path);
         stub.tool = if data.tool.is_empty() {
             "claude".to_string()
@@ -623,15 +830,22 @@ impl HomeView {
         // Set stub worktree_info so project-mode grouping works during creation.
         // The real worktree_info (with resolved main_repo_path) replaces this
         // once build_instance completes.
-        if let Some(ref branch) = data.worktree_branch {
-            if !branch.is_empty() {
-                stub.worktree_info = Some(crate::session::WorktreeInfo {
-                    branch: branch.clone(),
-                    main_repo_path: data.path.clone(),
-                    managed_by_aoe: false,
-                    created_at: chrono::Utc::now(),
-                });
-            }
+        let stub_branch = data
+            .worktree_branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| {
+                data.worktree_enabled
+                    .then(|| crate::session::builder::branch_name_from_title(&stub_title))
+            });
+        if let Some(branch) = stub_branch {
+            stub.worktree_info = Some(crate::session::WorktreeInfo {
+                branch,
+                main_repo_path: data.path.clone(),
+                managed_by_aoe: false,
+                created_at: chrono::Utc::now(),
+            });
         }
 
         let stub_id = stub.id.clone();
@@ -785,7 +999,9 @@ impl HomeView {
                     self.on_launch_hooks_ran.insert(session_id.clone());
                 }
 
-                let _ = self.reload();
+                if let Err(e) = self.reload() {
+                    tracing::warn!("Failed to reload session state: {e}");
+                }
                 self.new_dialog = None;
 
                 Some(session_id)
@@ -895,8 +1111,8 @@ impl HomeView {
 
         // Poll serve dialog for subprocess startup events.
         #[cfg(feature = "serve")]
-        if let Some(dialog) = &mut self.serve_dialog {
-            if dialog.tick() {
+        if let Some(view) = &mut self.serve_view {
+            if view.tick() {
                 changed = true;
             }
         }
@@ -928,9 +1144,28 @@ impl HomeView {
         changed
     }
 
+    /// Whether the user is currently looking at a surface where they're
+    /// likely to want to copy text (URLs, error messages, release notes).
+    /// The App uses this to release xterm mouse capture so the terminal's
+    /// native drag-to-select works without a modifier; mouse capture comes
+    /// back as soon as the surface is dismissed.
+    ///
+    /// Add new dialogs here only when their content is meant to be copied,
+    /// not for every modal: capture toggling has a small but visible cost
+    /// (the wheel-scroll on the dashboard preview won't work while it's
+    /// off).
+    pub fn wants_text_selection(&self) -> bool {
+        #[cfg(feature = "serve")]
+        let serve_open = self.serve_view.is_some();
+        #[cfg(not(feature = "serve"))]
+        let serve_open = false;
+
+        serve_open || self.info_dialog.is_some() || self.changelog_dialog.is_some()
+    }
+
     pub fn has_dialog(&self) -> bool {
         #[cfg(feature = "serve")]
-        let serve_open = self.serve_dialog.is_some();
+        let serve_open = self.serve_view.is_some();
         #[cfg(not(feature = "serve"))]
         let serve_open = false;
 
@@ -944,10 +1179,14 @@ impl HomeView {
             || self.hook_trust_dialog.is_some()
             || self.hooks_install_dialog.is_some()
             || self.welcome_dialog.is_some()
+            || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.info_dialog.is_some()
             || self.profile_picker_dialog.is_some()
+            || self.projects_dialog.is_some()
+            || self.command_palette.is_some()
             || self.send_message_dialog.is_some()
+            || self.update_confirm_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -966,12 +1205,23 @@ impl HomeView {
     fn save_list_width(&self) {
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
             config.app_state.home_list_width = Some(self.list_width);
-            let _ = save_config(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!("Failed to save config: {e}");
+            }
         }
     }
 
     pub fn show_welcome(&mut self) {
         self.welcome_dialog = Some(WelcomeDialog::new());
+    }
+
+    pub fn show_no_agents(&mut self) {
+        self.no_agents_dialog = Some(NoAgentsDialog::new());
+    }
+
+    /// Replace available tools (used after re-check from no-agents dialog).
+    pub fn set_available_tools(&mut self, tools: AvailableTools) {
+        self.available_tools = tools;
     }
 
     pub fn show_changelog(&mut self, from_version: Option<String>) {
@@ -1072,6 +1322,7 @@ impl HomeView {
         self.preview_cache = PreviewCache::default();
         self.terminal_preview_cache = PreviewCache::default();
         self.container_terminal_preview_cache = PreviewCache::default();
+        self.preview_scroll_offset = 0;
         // Clear search since match indices are invalid with new flat_items
         if self.search_active {
             self.search_active = false;
@@ -1125,6 +1376,11 @@ impl HomeView {
 
     pub fn set_instance_status(&mut self, id: &str, status: crate::session::Status) {
         self.mutate_instance(id, |inst| inst.status = status);
+    }
+
+    /// Stamp `last_accessed_at` on a session (user-initiated interaction).
+    pub fn stamp_last_accessed(&mut self, id: &str) {
+        self.mutate_instance(id, |inst| inst.touch_last_accessed());
     }
 
     pub fn save(&self) -> anyhow::Result<()> {
@@ -1262,6 +1518,15 @@ impl HomeView {
         Ok(())
     }
 
+    pub fn restart_instance_with_size_opts(
+        &mut self,
+        id: &str,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+    ) -> anyhow::Result<()> {
+        self.try_mutate_instance(id, |inst| inst.restart_with_size_opts(size, skip_on_launch))
+    }
+
     pub fn select_session_by_id(&mut self, session_id: &str) {
         for (idx, item) in self.flat_items.iter().enumerate() {
             if let Item::Session { id, .. } = item {
@@ -1286,18 +1551,16 @@ impl HomeView {
     /// Call this after settings are saved to pick up any changes.
     pub fn refresh_from_config(&mut self) {
         let profile = self.active_profile.as_deref().unwrap_or("default");
-        if let Ok(config) = resolve_config(profile) {
-            // Refresh default terminal mode for sandboxed sessions
-            self.default_terminal_mode = match config.sandbox.default_terminal_mode {
-                DefaultTerminalMode::Host => TerminalMode::Host,
-                DefaultTerminalMode::Container => TerminalMode::Container,
-            };
-
-            self.show_branch_in_tui = config.worktree.show_branch_in_tui;
-
-            // Refresh sound config
-            self.sound_config = config.sound.clone();
-        }
+        let config = resolve_config_or_warn(profile);
+        self.default_terminal_mode = match config.sandbox.default_terminal_mode {
+            DefaultTerminalMode::Host => TerminalMode::Host,
+            DefaultTerminalMode::Container => TerminalMode::Container,
+        };
+        self.sound_config = config.sound.clone();
+        self.show_branch_in_tui = config.worktree.show_branch_in_tui;
+        self.strict_hotkeys = config.session.strict_hotkeys;
+        self.idle_decay_window =
+            crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
     }
 
     /// Toggle terminal mode between Container and Host for a session
@@ -1319,10 +1582,7 @@ impl HomeView {
     }
 
     /// Attempt to fill in `tool_session` for instances that pre-date the
-    /// feature. Only instances where `tool_session::is_eligible` returns true
-    /// and `tool_session` is `None` are candidates. Per-instance errors are
-    /// suppressed; the method is best-effort. Returns `true` iff at least one
-    /// instance was updated and persisted.
+    /// feature. Per-instance errors are suppressed; the method is best-effort.
     pub fn backfill_tool_sessions(&mut self) -> anyhow::Result<bool> {
         use crate::session::tool_session;
 

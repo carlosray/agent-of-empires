@@ -42,7 +42,8 @@ To work on a new branch with its own directory:
 # CLI
 aoe add . -w feat/my-feature -b
 
-# TUI: press n, fill in the worktree branch field
+# TUI: press n, enter a title, enable Worktree
+# Optional: press Ctrl+P on Worktree and fill in Name
 ```
 
 This creates a new git branch, a worktree directory, and a session pointing at it. When you delete the session, AoE offers to clean up the worktree too.
@@ -83,9 +84,7 @@ In the TUI, select the tool from the dropdown in the new session dialog.
 | `q` | Quit |
 | `Ctrl+b d` | Detach from tmux session |
 
-## Use the Web Dashboard (experimental)
-
-> The web dashboard is included in release binaries and the install script but not yet in the Homebrew formula. If you installed via `brew install aoe`, see the [installation docs](installation.md#homebrew) for alternatives.
+## Use the Web Dashboard
 
 Prefer a browser? Run `aoe serve` to start the web dashboard:
 

@@ -112,7 +112,7 @@ delete_branch_on_cleanup = false
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `enabled` | `false` | Enable worktree support for new sessions |
+| `enabled` | `false` | Auto-enable worktree creation for new TUI sessions |
 | `path_template` | `../{repo-name}-worktrees/{branch}` | Path template for worktrees in regular repos |
 | `bare_repo_path_template` | `./{branch}` | Path template for worktrees in bare repos |
 | `auto_cleanup` | `true` | Prompt to remove worktree when deleting a session |
@@ -171,6 +171,7 @@ status_bar = "auto"
 mouse = "auto"
 rename_terminal_tab_on_attach = false
 dashboard_tab_title = "AoE"
+clipboard = "auto"
 ```
 
 | Option | Default | Description |
@@ -179,6 +180,7 @@ dashboard_tab_title = "AoE"
 | `mouse` | `"auto"` | Same modes as `status_bar`. Controls mouse support in aoe tmux sessions. |
 | `rename_terminal_tab_on_attach` | `false` | Best-effort terminal tab/window rename when AoE attaches to a session or terminal view |
 | `dashboard_tab_title` | `"AoE"` | Title to restore when AoE returns to the dashboard after attach. Blank values fall back to `"AoE"`. |
+| `clipboard` | `"auto"` | Same modes. Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) through tmux to your terminal. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` on the aoe tmux session. |
 
 ## Diff
 

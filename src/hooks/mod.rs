@@ -10,7 +10,7 @@ mod status_file;
 
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 pub use status_file::{cleanup_hook_status_dir, hook_status_dir, read_hook_status};
@@ -306,6 +306,383 @@ pub fn uninstall_settl_hooks() -> Result<bool> {
     Ok(true)
 }
 
+/// Hermes hook events and the AoE status they map to. Hermes uses an
+/// event-keyed YAML schema (`hooks: { event_name: [ {command, ...} ] }`),
+/// not the flat array settl uses.
+const HERMES_HOOKS: &[(&str, &str)] = &[
+    ("pre_llm_call", "running"),
+    ("pre_tool_call", "running"),
+    ("post_llm_call", "idle"),
+    ("pre_approval_request", "waiting"),
+    ("post_approval_response", "running"),
+    ("on_session_end", "idle"),
+];
+
+/// Install AoE status hooks into Hermes's `config.yaml`.
+///
+/// Reads the existing YAML, removes any prior AoE-managed hook entries
+/// (identified by the `aoe-hooks` marker in the command string), and inserts
+/// our status-writing hooks under the configured events. Also pre-populates
+/// `<config_dir>/shell-hooks-allowlist.json` so Hermes registers the hooks
+/// without prompting for first-use consent.
+pub fn install_hermes_hooks(config_path: &Path) -> Result<()> {
+    let mut config: serde_yaml::Value = if config_path.exists() {
+        let content = std::fs::read_to_string(config_path)?;
+        if content.trim().is_empty() {
+            serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+        } else {
+            serde_yaml::from_str(&content)
+                .with_context(|| format!("Failed to parse {}", config_path.display()))?
+        }
+    } else {
+        serde_yaml::Value::Mapping(serde_yaml::Mapping::new())
+    };
+
+    let root = config
+        .as_mapping_mut()
+        .ok_or_else(|| anyhow::anyhow!("Hermes config root is not a YAML mapping"))?;
+
+    let hooks_key = serde_yaml::Value::String("hooks".to_string());
+    let hooks_value = root
+        .entry(hooks_key.clone())
+        .or_insert_with(|| serde_yaml::Value::Mapping(serde_yaml::Mapping::new()));
+    if !hooks_value.is_mapping() {
+        *hooks_value = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+    let hooks_map = hooks_value.as_mapping_mut().expect("ensured mapping above");
+
+    for (event, status) in HERMES_HOOKS {
+        let event_key = serde_yaml::Value::String((*event).to_string());
+        let entries = hooks_map
+            .entry(event_key)
+            .or_insert_with(|| serde_yaml::Value::Sequence(Vec::new()));
+        if !entries.is_sequence() {
+            *entries = serde_yaml::Value::Sequence(Vec::new());
+        }
+        let arr = entries.as_sequence_mut().expect("ensured sequence above");
+
+        arr.retain(|hook| {
+            !hook
+                .as_mapping()
+                .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
+                .and_then(|c| c.as_str())
+                .is_some_and(is_aoe_hook_command)
+        });
+
+        let mut entry = serde_yaml::Mapping::new();
+        entry.insert(
+            serde_yaml::Value::String("command".into()),
+            serde_yaml::Value::String(hook_command(status)),
+        );
+        arr.push(serde_yaml::Value::Mapping(entry));
+    }
+
+    let formatted = serde_yaml::to_string(&config)?;
+    let config_dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("config path has no parent"))?;
+    let (allowlist_path, allowlist_formatted) = render_hermes_allowlist(config_dir)?;
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(config_path, formatted)?;
+
+    if let Some(parent) = allowlist_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&allowlist_path, allowlist_formatted)?;
+
+    tracing::info!("Installed AoE hooks in {}", config_path.display());
+    Ok(())
+}
+
+/// Remove AoE hooks from Hermes's `config.yaml`.
+pub fn uninstall_hermes_hooks(config_path: &Path) -> Result<bool> {
+    if !config_path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(config_path)?;
+    let mut config: serde_yaml::Value = if content.trim().is_empty() {
+        return Ok(false);
+    } else {
+        serde_yaml::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", config_path.display()))?
+    };
+
+    let Some(root) = config.as_mapping_mut() else {
+        return Ok(false);
+    };
+    let hooks_key = serde_yaml::Value::String("hooks".to_string());
+    let Some(hooks_value) = root.get_mut(&hooks_key) else {
+        return Ok(false);
+    };
+    let Some(hooks_map) = hooks_value.as_mapping_mut() else {
+        return Ok(false);
+    };
+
+    let mut modified = false;
+    let event_keys: Vec<serde_yaml::Value> = hooks_map.keys().cloned().collect();
+    for event_key in event_keys {
+        if let Some(arr) = hooks_map
+            .get_mut(&event_key)
+            .and_then(|v| v.as_sequence_mut())
+        {
+            let before = arr.len();
+            arr.retain(|hook| {
+                !hook
+                    .as_mapping()
+                    .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_aoe_hook_command)
+            });
+            if arr.len() != before {
+                modified = true;
+            }
+        }
+    }
+
+    if !modified {
+        return Ok(false);
+    }
+
+    let empty_events: Vec<serde_yaml::Value> = hooks_map
+        .iter()
+        .filter(|(_, v)| v.as_sequence().is_some_and(|a| a.is_empty()))
+        .map(|(k, _)| k.clone())
+        .collect();
+    for key in empty_events {
+        hooks_map.remove(&key);
+    }
+    if hooks_map.is_empty() {
+        root.remove(&hooks_key);
+    }
+
+    let formatted = serde_yaml::to_string(&config)?;
+    std::fs::write(config_path, formatted)?;
+    tracing::info!("Removed AoE hooks from {}", config_path.display());
+    Ok(true)
+}
+
+/// Pre-populate Hermes's per-user shell-hook allowlist so registration runs
+/// without prompting on the first session. Hermes keys consent on the exact
+/// `(event, command)` pair, so we add one entry per status we install.
+fn render_hermes_allowlist(config_dir: &Path) -> Result<(std::path::PathBuf, String)> {
+    let allowlist_path = config_dir.join("shell-hooks-allowlist.json");
+    let approved_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    let mut data: Value = if allowlist_path.exists() {
+        let content = std::fs::read_to_string(&allowlist_path)?;
+        serde_json::from_str(&content)
+            .with_context(|| format!("Failed to parse {}", allowlist_path.display()))?
+    } else {
+        serde_json::json!({"approvals": []})
+    };
+
+    let approvals = data
+        .as_object_mut()
+        .and_then(|o| {
+            o.entry("approvals")
+                .or_insert(Value::Array(Vec::new()))
+                .as_array_mut()
+        })
+        .ok_or_else(|| anyhow::anyhow!("allowlist root is not a JSON object with approvals[]"))?;
+
+    for (event, status) in HERMES_HOOKS {
+        let cmd = hook_command(status);
+        approvals.retain(|entry| {
+            !(entry.get("event").and_then(|v| v.as_str()) == Some(*event)
+                && entry.get("command").and_then(|v| v.as_str()) == Some(&cmd))
+        });
+        approvals.push(serde_json::json!({
+            "event": *event,
+            "command": cmd,
+            "approved_at": approved_at,
+            "script_mtime_at_approval": Value::Null,
+        }));
+    }
+
+    let formatted = serde_json::to_string_pretty(&data)?;
+    Ok((allowlist_path, formatted))
+}
+
+/// Kiro CLI hook events. Kiro uses lowercase camelCase event names and a flat
+/// `[{"command": "..."}]` structure in its agent config JSON.
+const KIRO_HOOKS: &[(&str, &str)] = &[
+    ("preToolUse", "running"),
+    ("userPromptSubmit", "running"),
+    ("stop", "idle"),
+];
+
+/// Default agent config path for Kiro CLI: `~/.kiro/agents/aoe-hooks.json`.
+/// We use a dedicated agent config file rather than modifying the user's
+/// default agent, so AoE hooks are isolated and easy to remove.
+pub const KIRO_HOOKS_AGENT_FILE: &str = ".kiro/agents/aoe-hooks.json";
+
+/// Install AoE status hooks into a Kiro CLI agent config file.
+///
+/// Writes a minimal agent config with hooks that write status to the
+/// AoE sidecar file. This function is pure file IO and is safe to call
+/// from any context (host install, sandbox provisioning, tests). To make
+/// the agent the active default on the host, call
+/// [`set_kiro_default_agent_if_builtin`] after this returns.
+pub fn install_kiro_hooks(agent_config_path: &Path) -> Result<()> {
+    let mut config: serde_json::Map<String, Value> = if agent_config_path.exists() {
+        let content = std::fs::read_to_string(agent_config_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::Map::new())
+    } else {
+        serde_json::Map::new()
+    };
+
+    // Kiro requires a name field for valid agent configs
+    config
+        .entry("name".to_string())
+        .or_insert_with(|| Value::String("aoe-hooks".to_string()));
+    // Wildcard tools so preToolUse hooks fire for all tool invocations
+    config
+        .entry("tools".to_string())
+        .or_insert_with(|| serde_json::json!(["*"]));
+
+    let mut hooks_obj: serde_json::Map<String, Value> = config
+        .get("hooks")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    for (event, status) in KIRO_HOOKS {
+        let entries = hooks_obj
+            .entry((*event).to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        if let Some(arr) = entries.as_array_mut() {
+            arr.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_aoe_hook_command)
+            });
+            arr.push(serde_json::json!({ "command": hook_command(status) }));
+        }
+    }
+
+    config.insert("hooks".to_string(), Value::Object(hooks_obj));
+
+    if let Some(parent) = agent_config_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
+    std::fs::write(agent_config_path, formatted)?;
+
+    tracing::info!("Installed AoE hooks in {}", agent_config_path.display());
+    Ok(())
+}
+
+/// Make `aoe-hooks` the active default Kiro agent if the user is still on
+/// Kiro's built-in default. Skipped when a user has chosen a custom default
+/// so we never silently override their preference. Best-effort: any failure
+/// (kiro-cli missing, unexpected output, command error) is logged and ignored.
+///
+/// Uses `kiro-cli settings chat.defaultAgent --format json` for structured
+/// output: returns `null` when unset, `"kiro_default"` for the built-in, or
+/// `"custom-name"` for a user-chosen agent.
+pub fn set_kiro_default_agent_if_builtin() {
+    let output = std::process::Command::new("kiro-cli")
+        .args(["settings", "chat.defaultAgent", "--format", "json"])
+        .output();
+    let current_default = output
+        .as_ref()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout.clone()).ok())
+        .unwrap_or_default();
+    // With --format json, unset returns "null", set returns "\"agent-name\""
+    let trimmed = current_default.trim();
+    let is_builtin_default =
+        trimmed.is_empty() || trimmed == "null" || trimmed == "\"kiro_default\"";
+
+    if is_builtin_default {
+        let set_result = std::process::Command::new("kiro-cli")
+            .args(["agent", "set-default", "aoe-hooks"])
+            .output();
+        match set_result {
+            Ok(o) if o.status.success() => {
+                tracing::info!("Set aoe-hooks as default Kiro agent for status detection");
+            }
+            Ok(o) => {
+                tracing::debug!(
+                    "kiro-cli agent set-default failed (non-fatal): {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+            }
+            Err(e) => {
+                tracing::debug!("kiro-cli not available for set-default: {}", e);
+            }
+        }
+    } else {
+        tracing::info!(
+            "Kiro has a custom default agent; skipping set-default. \
+             Run `kiro-cli agent set-default aoe-hooks` to enable status detection."
+        );
+    }
+}
+
+/// Remove AoE hooks from a Kiro CLI agent config file.
+/// Returns true if hooks were removed, false if nothing to do.
+pub fn uninstall_kiro_hooks(agent_config_path: &Path) -> Result<bool> {
+    if !agent_config_path.exists() {
+        return Ok(false);
+    }
+
+    let content = std::fs::read_to_string(agent_config_path)?;
+    let mut config: serde_json::Map<String, Value> =
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::Map::new());
+
+    let Some(hooks_value) = config.get_mut("hooks") else {
+        return Ok(false);
+    };
+    let Some(hooks_obj) = hooks_value.as_object_mut() else {
+        return Ok(false);
+    };
+
+    let mut modified = false;
+    let keys: Vec<String> = hooks_obj.keys().cloned().collect();
+    for key in keys {
+        if let Some(arr) = hooks_obj.get_mut(&key).and_then(|v| v.as_array_mut()) {
+            let before = arr.len();
+            arr.retain(|hook| {
+                !hook
+                    .get("command")
+                    .and_then(|c| c.as_str())
+                    .is_some_and(is_aoe_hook_command)
+            });
+            if arr.len() != before {
+                modified = true;
+            }
+        }
+    }
+
+    if !modified {
+        return Ok(false);
+    }
+
+    // Remove empty event arrays
+    hooks_obj.retain(|_, v| !v.as_array().is_some_and(|a| a.is_empty()));
+    if hooks_obj.is_empty() {
+        config.remove("hooks");
+    }
+
+    // If the file is now just `{}`, remove it entirely
+    if config.is_empty() {
+        std::fs::remove_file(agent_config_path)?;
+    } else {
+        let formatted = serde_json::to_string_pretty(&Value::Object(config))?;
+        std::fs::write(agent_config_path, formatted)?;
+    }
+
+    tracing::info!("Removed AoE hooks from {}", agent_config_path.display());
+    Ok(true)
+}
+
 /// Remove all AoE hooks from all known agent settings files and clean up
 /// the hook status base directory. Called during `aoe uninstall`.
 pub fn uninstall_all_hooks() {
@@ -317,6 +694,22 @@ pub fn uninstall_all_hooks() {
     }
 
     if let Some(home) = dirs::home_dir() {
+        // Remove Hermes YAML hooks
+        let hermes_config = home.join(".hermes").join("config.yaml");
+        match uninstall_hermes_hooks(&hermes_config) {
+            Ok(true) => println!("Removed AoE hooks from {}", hermes_config.display()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Failed to remove hermes hooks: {}", e),
+        }
+
+        // Remove Kiro CLI agent config hooks
+        let kiro_config = home.join(KIRO_HOOKS_AGENT_FILE);
+        match uninstall_kiro_hooks(&kiro_config) {
+            Ok(true) => println!("Removed AoE hooks from {}", kiro_config.display()),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("Failed to remove kiro hooks: {}", e),
+        }
+
         for agent in crate::agents::AGENTS {
             if let Some(hook_cfg) = &agent.hook_config {
                 let settings_path = home.join(hook_cfg.settings_rel_path);
@@ -802,5 +1195,317 @@ command = "echo user-hook"
             );
             assert!(cmd.contains("aoe-hooks"), "Hook should contain marker");
         }
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_creates_new_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".hermes").join("config.yaml");
+
+        install_hermes_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let hooks = config
+            .as_mapping()
+            .unwrap()
+            .get(serde_yaml::Value::String("hooks".into()))
+            .unwrap()
+            .as_mapping()
+            .unwrap();
+
+        for (event, _) in HERMES_HOOKS {
+            let entries = hooks
+                .get(serde_yaml::Value::String((*event).into()))
+                .unwrap_or_else(|| panic!("event {} missing", event))
+                .as_sequence()
+                .unwrap();
+            assert_eq!(entries.len(), 1, "event {} should have one entry", event);
+            let cmd = entries[0]
+                .as_mapping()
+                .and_then(|m| m.get(serde_yaml::Value::String("command".into())))
+                .and_then(|c| c.as_str())
+                .unwrap();
+            assert!(is_aoe_hook_command(cmd));
+        }
+
+        // Allowlist should be pre-populated alongside the config
+        let allowlist = tmp
+            .path()
+            .join(".hermes")
+            .join("shell-hooks-allowlist.json");
+        assert!(allowlist.exists(), "shell-hooks-allowlist.json missing");
+        let raw = std::fs::read_to_string(&allowlist).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let approvals = parsed["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), HERMES_HOOKS.len());
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_preserves_user_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"hooks:
+  pre_tool_call:
+    - command: "echo user-hook"
+      matcher: "terminal"
+hooks_auto_accept: false
+"#,
+        )
+        .unwrap();
+
+        install_hermes_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+
+        // Non-hook keys preserved
+        assert_eq!(
+            config["hooks_auto_accept"].as_bool(),
+            Some(false),
+            "hooks_auto_accept should remain false"
+        );
+
+        let pre_tool = config["hooks"]["pre_tool_call"].as_sequence().unwrap();
+        // 1 user hook + 1 AoE hook = 2
+        assert_eq!(pre_tool.len(), 2);
+        assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
+        assert!(is_aoe_hook_command(
+            pre_tool[1]["command"].as_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_rejects_invalid_yaml_without_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let original = "hooks:\n  pre_tool_call: [\n";
+        std::fs::write(&config_path, original).unwrap();
+
+        let result = install_hermes_hooks(&config_path);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&config_path).unwrap(), original);
+        assert!(!tmp.path().join("shell-hooks-allowlist.json").exists());
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_rejects_invalid_allowlist_without_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let allowlist_path = tmp.path().join("shell-hooks-allowlist.json");
+        let original_config = "model: claude-opus\n";
+        let original_allowlist = "{ invalid json";
+        std::fs::write(&config_path, original_config).unwrap();
+        std::fs::write(&allowlist_path, original_allowlist).unwrap();
+
+        let result = install_hermes_hooks(&config_path);
+
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config_path).unwrap(),
+            original_config
+        );
+        assert_eq!(
+            std::fs::read_to_string(&allowlist_path).unwrap(),
+            original_allowlist
+        );
+    }
+
+    #[test]
+    fn test_install_hermes_hooks_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+
+        install_hermes_hooks(&config_path).unwrap();
+        install_hermes_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let pre_tool = config["hooks"]["pre_tool_call"].as_sequence().unwrap();
+        assert_eq!(pre_tool.len(), 1, "reinstall should not duplicate");
+
+        // Allowlist also dedupes
+        let allowlist = tmp.path().join("shell-hooks-allowlist.json");
+        let raw = std::fs::read_to_string(&allowlist).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let approvals = parsed["approvals"].as_array().unwrap();
+        assert_eq!(approvals.len(), HERMES_HOOKS.len());
+    }
+
+    #[test]
+    fn test_uninstall_hermes_hooks_preserves_user_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            "hooks:\n  pre_tool_call:\n    - command: \"echo user-hook\"\n",
+        )
+        .unwrap();
+
+        install_hermes_hooks(&config_path).unwrap();
+        let modified = uninstall_hermes_hooks(&config_path).unwrap();
+        assert!(modified);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+        let pre_tool = config["hooks"]["pre_tool_call"].as_sequence().unwrap();
+        assert_eq!(pre_tool.len(), 1);
+        assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
+        // Other AoE-only events should be gone entirely
+        assert!(config["hooks"].get("post_llm_call").is_none());
+    }
+
+    #[test]
+    fn test_uninstall_hermes_hooks_nonexistent_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let modified = uninstall_hermes_hooks(&config_path).unwrap();
+        assert!(!modified);
+    }
+
+    #[test]
+    fn test_hermes_hook_commands_write_correct_status() {
+        for (event, expected_status) in HERMES_HOOKS {
+            let cmd = hook_command(expected_status);
+            assert!(
+                cmd.contains(&format!("printf {}", expected_status)),
+                "Hook for {} should write '{}': {}",
+                event,
+                expected_status,
+                cmd
+            );
+            assert!(cmd.contains("aoe-hooks"), "Hook should contain marker");
+        }
+    }
+
+    #[test]
+    fn test_hermes_approval_request_writes_waiting() {
+        let mapped: Vec<&str> = HERMES_HOOKS
+            .iter()
+            .filter(|(e, _)| *e == "pre_approval_request")
+            .map(|(_, s)| *s)
+            .collect();
+        assert_eq!(
+            mapped,
+            vec!["waiting"],
+            "pre_approval_request must map to waiting status"
+        );
+    }
+
+    #[test]
+    fn test_install_kiro_hooks_creates_new_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp
+            .path()
+            .join(".kiro")
+            .join("agents")
+            .join("aoe-hooks.json");
+
+        install_kiro_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        let hooks = config["hooks"].as_object().unwrap();
+
+        for (event, _) in KIRO_HOOKS {
+            let entries = hooks
+                .get(*event)
+                .unwrap_or_else(|| panic!("event {} missing", event))
+                .as_array()
+                .unwrap();
+            assert_eq!(entries.len(), 1, "event {} should have one entry", event);
+            let cmd = entries[0]["command"].as_str().unwrap();
+            assert!(is_aoe_hook_command(cmd));
+        }
+    }
+
+    #[test]
+    fn test_install_kiro_hooks_preserves_user_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("aoe-hooks.json");
+        std::fs::write(
+            &config_path,
+            r#"{"hooks": {"preToolUse": [{"command": "echo user-hook", "matcher": "shell"}]}}"#,
+        )
+        .unwrap();
+
+        install_kiro_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        let pre_tool = config["hooks"]["preToolUse"].as_array().unwrap();
+        // 1 user hook + 1 AoE hook = 2
+        assert_eq!(pre_tool.len(), 2);
+        assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
+        assert!(is_aoe_hook_command(
+            pre_tool[1]["command"].as_str().unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_install_kiro_hooks_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("aoe-hooks.json");
+
+        install_kiro_hooks(&config_path).unwrap();
+        install_kiro_hooks(&config_path).unwrap();
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        for (event, _) in KIRO_HOOKS {
+            let entries = config["hooks"][event].as_array().unwrap();
+            assert_eq!(
+                entries.len(),
+                1,
+                "event {} should still have exactly one AoE entry after double install",
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn test_uninstall_kiro_hooks_removes_aoe_entries() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("aoe-hooks.json");
+
+        install_kiro_hooks(&config_path).unwrap();
+        let modified = uninstall_kiro_hooks(&config_path).unwrap();
+        assert!(modified);
+        // File still exists (has name/tools fields) but hooks are gone
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        assert!(config.get("hooks").is_none());
+    }
+
+    #[test]
+    fn test_uninstall_kiro_hooks_preserves_user_hooks() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("aoe-hooks.json");
+        std::fs::write(
+            &config_path,
+            r#"{"hooks": {"preToolUse": [{"command": "echo user-hook"}]}}"#,
+        )
+        .unwrap();
+
+        install_kiro_hooks(&config_path).unwrap();
+        let modified = uninstall_kiro_hooks(&config_path).unwrap();
+        assert!(modified);
+
+        let content = std::fs::read_to_string(&config_path).unwrap();
+        let config: Value = serde_json::from_str(&content).unwrap();
+        let pre_tool = config["hooks"]["preToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 1);
+        assert_eq!(pre_tool[0]["command"].as_str().unwrap(), "echo user-hook");
+    }
+
+    #[test]
+    fn test_uninstall_kiro_hooks_nonexistent_file() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join("nonexistent.json");
+        let modified = uninstall_kiro_hooks(&config_path).unwrap();
+        assert!(!modified);
     }
 }

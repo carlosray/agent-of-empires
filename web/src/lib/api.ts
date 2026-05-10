@@ -4,23 +4,28 @@ import type {
   RichFileDiffResponse,
   AgentInfo,
   ProfileInfo,
-  DirEntry,
-  BranchInfo,
+  BrowseResponse,
   GroupInfo,
+  ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
 } from "./types";
 
-// --- Sessions ---
-
-export async function fetchSessions(): Promise<SessionResponse[] | null> {
+// GET a JSON endpoint; returns null on non-2xx or network/parse errors.
+async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> {
   try {
-    const res = await fetch("/api/sessions");
+    const res = await fetch(url, init);
     if (!res.ok) return null;
-    return await res.json();
+    return (await res.json()) as T;
   } catch {
     return null;
   }
+}
+
+// --- Sessions ---
+
+export function fetchSessions(): Promise<SessionResponse[] | null> {
+  return fetchJson<SessionResponse[]>("/api/sessions");
 }
 
 export interface EnsureSessionResult {
@@ -80,43 +85,33 @@ export async function ensureTerminal(
   }
 }
 
-export async function getSessionDiffFiles(
+export function getSessionDiffFiles(
   id: string,
 ): Promise<RichDiffFilesResponse | null> {
-  try {
-    const res = await fetch(`/api/sessions/${id}/diff/files`);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
+  return fetchJson<RichDiffFilesResponse>(`/api/sessions/${id}/diff/files`);
 }
 
-export async function getSessionFileDiff(
+export function getSessionFileDiff(
   id: string,
   filePath: string,
 ): Promise<RichFileDiffResponse | null> {
-  try {
-    const res = await fetch(
-      `/api/sessions/${id}/diff/file?path=${encodeURIComponent(filePath)}`,
-    );
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
+  return fetchJson<RichFileDiffResponse>(
+    `/api/sessions/${id}/diff/file?path=${encodeURIComponent(filePath)}`,
+  );
 }
 
 // --- Settings ---
 
-export async function getSettings(): Promise<Record<string, unknown> | null> {
-  try {
-    const res = await fetch("/api/settings");
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
+export interface SettingsResponse {
+  theme?: {
+    idle_decay_minutes?: number;
+  };
+  [key: string]: unknown;
+}
+
+export function fetchSettings(profile?: string): Promise<SettingsResponse | null> {
+  const params = profile ? `?profile=${encodeURIComponent(profile)}` : "";
+  return fetchJson<SettingsResponse>(`/api/settings${params}`);
 }
 
 export async function updateSettings(
@@ -134,6 +129,101 @@ export async function updateSettings(
   }
 }
 
+// --- Profile management ---
+
+export async function createProfile(name: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/profiles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteProfile(name: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/profiles/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function renameProfile(
+  name: string,
+  newName: string,
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/profiles/${encodeURIComponent(name)}/rename`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ new_name: newName }),
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function setDefaultProfile(name: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/default-profile", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export function getProfileSettings(
+  name: string,
+): Promise<Record<string, unknown> | null> {
+  return fetchJson<Record<string, unknown>>(
+    `/api/profiles/${encodeURIComponent(name)}/settings`,
+  );
+}
+
+export async function updateProfileSettings(
+  name: string,
+  updates: Record<string, unknown>,
+): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `/api/profiles/${encodeURIComponent(name)}/settings`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(updates),
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// --- Themes & Sounds ---
+
+export async function fetchThemes(): Promise<string[]> {
+  return (await fetchJson<string[]>("/api/themes")) ?? [];
+}
+
+export async function fetchSounds(): Promise<string[]> {
+  return (await fetchJson<string[]>("/api/sounds")) ?? [];
+}
+
 // --- About / server info ---
 
 export interface ServerAbout {
@@ -143,16 +233,14 @@ export interface ServerAbout {
   read_only: boolean;
   behind_tunnel: boolean;
   profile: string;
+  /** True when cockpit is available for new sessions (master switch
+   *  is on AND AOE_EXPERIMENTAL_COCKPIT=1 is set). When false, every
+   *  new session is tmux. */
+  experimental_cockpit: boolean;
 }
 
-export async function fetchAbout(): Promise<ServerAbout | null> {
-  try {
-    const res = await fetch("/api/about");
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
+export function fetchAbout(): Promise<ServerAbout | null> {
+  return fetchJson<ServerAbout>("/api/about");
 }
 
 // --- Devices ---
@@ -165,92 +253,104 @@ export interface DeviceInfo {
   request_count: number;
 }
 
-export async function fetchDevices(): Promise<DeviceInfo[] | null> {
-  try {
-    const res = await fetch("/api/devices");
-    if (!res.ok) return null;
-    return await res.json();
-  } catch {
-    return null;
-  }
-}
-
-// --- Themes ---
-
-export async function fetchThemes(): Promise<string[]> {
-  try {
-    const res = await fetch("/api/themes");
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
-  }
+export function fetchDevices(): Promise<DeviceInfo[] | null> {
+  return fetchJson<DeviceInfo[]>("/api/devices");
 }
 
 // --- Wizard APIs ---
 
 export async function fetchAgents(): Promise<AgentInfo[]> {
-  try {
-    const res = await fetch("/api/agents");
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
-  }
+  return (await fetchJson<AgentInfo[]>("/api/agents")) ?? [];
 }
 
 export async function fetchProfiles(): Promise<ProfileInfo[]> {
-  try {
-    const res = await fetch("/api/profiles");
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
-  }
+  return (await fetchJson<ProfileInfo[]>("/api/profiles")) ?? [];
 }
 
-export async function browseFilesystem(path: string): Promise<DirEntry[]> {
-  try {
-    const res = await fetch(
-      `/api/filesystem/browse?path=${encodeURIComponent(path)}`,
-    );
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
-  }
+export async function getHomePath(): Promise<string | null> {
+  const data = await fetchJson<{ path?: string }>("/api/filesystem/home");
+  return data?.path ?? null;
 }
 
-export async function fetchBranches(path: string): Promise<BranchInfo[]> {
-  try {
-    const res = await fetch(
-      `/api/git/branches?path=${encodeURIComponent(path)}`,
-    );
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
-  }
+export async function browseFilesystem(
+  path: string,
+  limit?: number,
+): Promise<BrowseResponse & { ok: boolean }> {
+  const params = new URLSearchParams({ path });
+  if (limit != null) params.set("limit", String(limit));
+  const data = await fetchJson<BrowseResponse>(`/api/filesystem/browse?${params}`);
+  if (!data) return { entries: [], has_more: false, ok: false };
+  return { ...data, ok: true };
 }
 
 export async function fetchGroups(): Promise<GroupInfo[]> {
+  return (await fetchJson<GroupInfo[]>("/api/groups")) ?? [];
+}
+
+export async function fetchProjects(scope?: "global" | "profile"): Promise<ProjectInfo[]> {
+  const url = scope ? `/api/projects?scope=${scope}` : "/api/projects";
+  return (await fetchJson<ProjectInfo[]>(url)) ?? [];
+}
+
+export async function createProject(body: {
+  path: string;
+  name?: string;
+  scope?: "global" | "profile";
+  allow_override?: boolean;
+}): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
-    const res = await fetch("/api/groups");
-    if (!res.ok) return [];
-    return await res.json();
-  } catch {
-    return [];
+    const res = await fetch("/api/projects", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return { ok: false, error: data.message || `Server error (${res.status})` };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    const project = (await res.json()) as ProjectInfo;
+    return { ok: true, project };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function deleteProject(
+  name: string,
+  scope: "global" | "profile",
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const res = await fetch(
+      `/api/projects/${encodeURIComponent(name)}?scope=${scope}`,
+      { method: "DELETE" },
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return { ok: false, error: data.message || `Server error (${res.status})` };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
   }
 }
 
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
-  try {
-    const res = await fetch("/api/docker/status");
-    if (!res.ok) return { available: false, runtime: null };
-    return await res.json();
-  } catch {
-    return { available: false, runtime: null };
-  }
+  return (
+    (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {
+      available: false,
+      runtime: null,
+    }
+  );
 }
 
 export async function createSession(
@@ -287,18 +387,61 @@ export async function createSession(
   }
 }
 
+// --- Clone ---
+
+export async function cloneRepo(
+  url: string,
+  opts?: { destination?: string; shallow?: boolean },
+): Promise<{ ok: boolean; path?: string; error?: string }> {
+  try {
+    const body: Record<string, unknown> = { url };
+    if (opts?.destination) body.destination = opts.destination;
+    if (opts?.shallow) body.shallow = true;
+    const res = await fetch("/api/git/clone", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      return {
+        ok: false,
+        error: data.message || `Clone failed (${res.status})`,
+      };
+    }
+    return { ok: true, path: data.path };
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
+    };
+  }
+}
+
 // --- Login ---
 
 export async function loginStatus(): Promise<{
   required: boolean;
   authenticated: boolean;
 }> {
+  return (
+    (await fetchJson<{ required: boolean; authenticated: boolean }>(
+      "/api/login/status",
+    )) ?? { required: false, authenticated: true }
+  );
+}
+
+/** Verify the auth token via a session-exempt endpoint (`/api/login/status`).
+ *  Returning `true` means the token authenticated; the caller still has to
+ *  consult `loginStatus()` to decide between the main app and LoginPage.
+ *  Used by the token entry page so a valid-token-but-needs-passphrase paste
+ *  is accepted instead of being misread as a token rejection. */
+export async function verifyToken(): Promise<boolean> {
   try {
     const res = await fetch("/api/login/status");
-    if (!res.ok) return { required: false, authenticated: true };
-    return await res.json();
+    return res.ok;
   } catch {
-    return { required: false, authenticated: true };
+    return false;
   }
 }
 
@@ -343,5 +486,70 @@ export async function renameSession(
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+/** Three-preset helper for the sidebar context menu:
+ *  - "off":     set all three overrides to false (silence this session)
+ *  - "default": clear all three overrides (inherit server defaults)
+ *  - "all":     set all three overrides to true (notify on any event)
+ *  Sends all three fields in one PATCH to avoid multi-request ordering. */
+export async function setSessionNotifications(
+  id: string,
+  preset: "off" | "default" | "all",
+): Promise<boolean> {
+  const value =
+    preset === "off" ? false : preset === "all" ? true : null;
+  try {
+    const res = await fetch(`/api/sessions/${id}/notifications`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        notify_on_waiting: value,
+        notify_on_idle: value,
+        notify_on_error: value,
+      }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export interface DeleteSessionOptions {
+  delete_worktree?: boolean;
+  delete_branch?: boolean;
+  delete_sandbox?: boolean;
+  force_delete?: boolean;
+}
+
+export interface DeleteSessionResult {
+  ok: boolean;
+  error?: string;
+}
+
+export async function deleteSession(
+  id: string,
+  options: DeleteSessionOptions = {},
+): Promise<DeleteSessionResult> {
+  try {
+    const res = await fetch(`/api/sessions/${id}`, {
+      method: "DELETE",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(options),
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      return {
+        ok: false,
+        error: data.message || `Server error (${res.status})`,
+      };
+    }
+    return { ok: true };
+  } catch (e) {
+    return {
+      ok: false,
+      error: `Network error: ${e instanceof Error ? e.message : "connection failed"}`,
+    };
   }
 }

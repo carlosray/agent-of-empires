@@ -74,7 +74,7 @@ pub struct DiffView {
 impl DiffView {
     /// Create a new diff view for a repository
     pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
-        let config = Config::load().unwrap_or_default();
+        let config = Config::load_or_warn();
 
         // Determine base branch
         let base_branch = config
@@ -242,6 +242,29 @@ impl DiffView {
         if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
             config.app_state.diff_file_list_width = Some(self.file_list_width);
             let _ = save_config(&config);
+        }
+    }
+
+    /// Minimal DiffView for unit tests. Centralised so new fields only need
+    /// a default value in one place.
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        Self {
+            repo_path: std::path::PathBuf::from("/tmp/fake"),
+            base_branch: "main".to_string(),
+            files: Vec::new(),
+            selected_file: 0,
+            diff_cache: HashMap::new(),
+            scroll_offset: 0,
+            visible_lines: 20,
+            total_lines: 0,
+            branch_select: None,
+            error_message: None,
+            success_message: None,
+            context_lines: 3,
+            show_help: false,
+            file_list_width: 35,
+            warning_dialog: None,
         }
     }
 }

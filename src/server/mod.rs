@@ -5,7 +5,11 @@
 
 pub mod api;
 pub mod auth;
+#[cfg(feature = "serve")]
+pub mod cockpit_ws;
 pub mod login;
+pub mod push;
+pub mod push_send;
 pub mod rate_limit;
 pub mod tunnel;
 pub mod ws;
@@ -17,8 +21,24 @@ use std::time::Duration;
 use axum::Router;
 use rust_embed::Embed;
 use serde::Serialize;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 use tracing::info;
+
+use self::push::{PushState, StatusChange, STATUS_CHANNEL_CAPACITY};
+
+#[cfg(feature = "serve")]
+const COCKPIT_CHANNEL_CAPACITY: usize = 256;
+
+/// One frame on the per-AppState cockpit broadcast channel: the cockpit
+/// session id plus the serialised cockpit Event JSON. Subscribed
+/// WebSocket clients filter on the session id.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CockpitBroadcastFrame {
+    pub session_id: String,
+    pub seq: u64,
+    pub event: serde_json::Value,
+}
 
 use crate::session::Instance;
 use crate::session::Storage;
@@ -106,6 +126,14 @@ impl TokenManager {
         self.state.read().await.lifetime.as_secs()
     }
 
+    /// Clear the previous token after the grace period has expired.
+    /// Used by the rotation task after the 5-minute grace window.
+    pub async fn clear_previous(&self) {
+        let mut state = self.state.write().await;
+        state.previous = None;
+        state.grace_expires = None;
+    }
+
     /// Rotate: generate new token, move current to previous with grace period.
     pub async fn rotate(&self) {
         let mut state = self.state.write().await;
@@ -117,7 +145,7 @@ impl TokenManager {
 
         // Persist to disk
         if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.token"), &new_token);
+            write_secret_file(&app_dir.join("serve.token"), &new_token).await;
         }
 
         info!("Auth token rotated (previous token valid for 5 more minutes)");
@@ -146,6 +174,21 @@ impl TokenManager {
 
 // ── AppState ────────────────────────────────────────────────────────────────
 
+/// Per-profile cleanup defaults with a refresh timestamp. Re-resolved from
+/// disk after `CLEANUP_DEFAULTS_TTL`.
+pub struct CleanupDefaultsCache {
+    pub refreshed_at: std::time::Instant,
+    pub entries: std::collections::HashMap<String, api::CleanupDefaults>,
+}
+
+pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl CleanupDefaultsCache {
+    pub fn stale(&self) -> bool {
+        self.refreshed_at.elapsed() >= CLEANUP_DEFAULTS_TTL
+    }
+}
+
 /// Shared application state accessible by all request handlers.
 pub struct AppState {
     pub profile: String,
@@ -161,6 +204,83 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Cached per-profile cleanup defaults for the delete dialog, with a
+    /// timestamp so we re-resolve after config changes (see
+    /// `CLEANUP_DEFAULTS_TTL`).
+    pub cleanup_defaults_cache: RwLock<CleanupDefaultsCache>,
+    /// Cached remote owner per repo path. Remote owners don't change, so
+    /// entries live for the lifetime of the process.
+    pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// Broadcasts session status transitions to consumers (currently the
+    /// push-notification module). Emitted from `status_poll_loop` after
+    /// each tmux scrape when `old != new`. Keep the Sender around even
+    /// when no receivers exist so callers can emit without checking.
+    pub status_tx: broadcast::Sender<StatusChange>,
+    /// Web Push state: VAPID keypair, subscription store, VAPID subject.
+    /// None when `web.notifications_enabled` is false at startup (the
+    /// feature is fully off and endpoints return 404).
+    pub push: Option<Arc<PushState>>,
+    /// Cached value of `web.notifications_enabled` at startup. Changes
+    /// to the config flag require a server restart to take effect; this
+    /// is a documented limitation of the toggle for v1.
+    pub push_enabled: bool,
+    /// Snapshot of the resolved WebConfig at startup. Consumed by the
+    /// push consumer task to evaluate per-event-type defaults.
+    pub web_config: crate::session::config::WebConfig,
+    /// Broadcasts cockpit events to subscribed WebSocket clients. The
+    /// channel carries `(session_id, serialized event JSON)` frames so
+    /// clients can filter by session. Empty when no clients are
+    /// connected; senders never need to check before emitting.
+    #[cfg(feature = "serve")]
+    pub cockpit_events_tx: broadcast::Sender<CockpitBroadcastFrame>,
+    /// Per-session replay buffer of cockpit frames. Populated on every
+    /// `ChannelSink::publish`; consulted by
+    /// `GET /api/sessions/{id}/cockpit/replay?since={seq}` so a
+    /// reconnecting WebSocket client can recover any frames it missed
+    /// during a brief network blip without dropping the conversation.
+    /// Sync mutex (not async) so the publish path stays sync-only and
+    /// preserves seq ordering; both pushers and the snapshot reader
+    /// hold the lock for very brief operations.
+    #[cfg(feature = "serve")]
+    pub cockpit_replay: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::cockpit::replay_buffer::ReplayBuffer>,
+        >,
+    >,
+    /// Per-session replay-buffer sizing pulled from `[cockpit]` config
+    /// at startup. Lazy-initialised entries in `cockpit_replay` use
+    /// these caps.
+    #[cfg(feature = "serve")]
+    pub cockpit_replay_caps: (usize, usize),
+    /// Snapshot of `config.cockpit.enabled` taken at startup. Acts
+    /// as the documented master kill switch: when false, the
+    /// reconciler skips auto-spawn and every cockpit-spawning REST
+    /// path refuses with 503. Toggling the value in `config.toml`
+    /// requires `aoe serve` to restart, mirroring how
+    /// `web.notifications_enabled` works elsewhere.
+    #[cfg(feature = "serve")]
+    pub cockpit_master_enabled: bool,
+    /// Owns the per-session ACP agent subprocesses.
+    #[cfg(feature = "serve")]
+    pub cockpit_supervisor:
+        Arc<crate::cockpit::supervisor::Supervisor<crate::cockpit::supervisor::ChannelSink>>,
+    /// Per-tmux-session primary WebSocket client. Maps tmux session name
+    /// to the client ID that most recently sent keyboard input. Only the
+    /// primary client's resize messages are applied to its PTY, preventing
+    /// multiple browser viewports from fighting over the tmux window size.
+    pub session_primaries: Arc<RwLock<std::collections::HashMap<String, String>>>,
+    /// Per-tmux-session refcount of clients currently asking the pane's
+    /// process tree to be paused (SIGSTOP). Incremented by `pause_output`,
+    /// decremented by `resume_output` and on WebSocket disconnect. The
+    /// pane's process is SIGSTOP-ed on 0→N transitions and SIGCONT-ed on
+    /// N→0, so two mobile clients scrolling concurrently don't have one's
+    /// `resume_output` un-pause the other's scrollback read.
+    pub session_pause_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    /// Epoch-millis timestamp of the most recent authenticated API request.
+    /// Updated by auth middleware on every successful auth. The push consumer
+    /// checks this to suppress notifications when someone is actively using
+    /// the web dashboard (on any device).
+    pub last_web_activity: std::sync::atomic::AtomicI64,
 }
 
 impl AppState {
@@ -180,9 +300,71 @@ impl AppState {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
+
+    /// Record that an authenticated web client just made a request.
+    pub fn touch_web_activity(&self) {
+        self.last_web_activity
+            .store(epoch_millis(), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns true if an authenticated web request arrived within `threshold`.
+    pub fn web_active_within(&self, threshold: std::time::Duration) -> bool {
+        let last = self
+            .last_web_activity
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 {
+            return false;
+        }
+        let elapsed_ms = epoch_millis() - last;
+        elapsed_ms >= 0 && (elapsed_ms as u64) < threshold.as_millis() as u64
+    }
+}
+
+fn epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 // ── Server ──────────────────────────────────────────────────────────────────
+
+/// Raise the soft `RLIMIT_NOFILE` so the server can sustain many WS
+/// terminals at once. macOS's default soft cap of 256 is exhausted
+/// quickly: each WS terminal consumes ~3 file descriptors (PTY master +
+/// cloned reader + writer) plus tokio plumbing, so a handful of mobile
+/// reconnect bursts leaves `openpty` and the child-spawn `dup` calls
+/// failing with EMFILE.
+///
+/// Targets the smaller of 8192 and the hard limit. Setting soft = hard
+/// directly is unreliable on macOS where the hard limit reports as
+/// `RLIM_INFINITY` but the kernel caps allocation at
+/// `kern.maxfilesperproc`; clamping to a known-good value avoids the
+/// `setrlimit` rejection.
+#[cfg(unix)]
+fn raise_fd_limit() {
+    use nix::sys::resource::{getrlimit, setrlimit, Resource};
+    const TARGET: u64 = 8192;
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) => {
+            let target = TARGET.min(hard).max(soft);
+            if target > soft {
+                if let Err(e) = setrlimit(Resource::RLIMIT_NOFILE, target, hard) {
+                    tracing::warn!("Failed to raise RLIMIT_NOFILE to {}: {}", target, e);
+                } else {
+                    info!(
+                        "Raised RLIMIT_NOFILE soft limit from {} to {}",
+                        soft, target
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!("Failed to read RLIMIT_NOFILE: {}", e),
+    }
+}
+
+#[cfg(not(unix))]
+fn raise_fd_limit() {}
 
 pub struct ServerConfig<'a> {
     pub profile: &'a str,
@@ -193,6 +375,7 @@ pub struct ServerConfig<'a> {
     pub remote: bool,
     pub tunnel_name: Option<&'a str>,
     pub tunnel_url: Option<&'a str>,
+    pub no_tailscale: bool,
     pub is_daemon: bool,
     pub passphrase: Option<&'a str>,
 }
@@ -207,9 +390,13 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         remote,
         tunnel_name,
         tunnel_url,
+        no_tailscale,
         is_daemon,
         passphrase,
     } = config;
+
+    raise_fd_limit();
+
     let instances = load_all_instances()?;
 
     // Load or generate auth token
@@ -220,7 +407,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         );
         None
     } else {
-        Some(load_or_generate_token()?)
+        Some(load_or_generate_token().await?)
     };
 
     let token_lifetime = if remote {
@@ -237,6 +424,97 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         info!("Passphrase login enabled (second-factor authentication)");
     }
 
+    // Persist the plaintext passphrase so the TUI can display it on
+    // reopen, including after a TUI restart or when the daemon was
+    // started from the CLI. Owner-only perms; cleaned up on shutdown.
+    if let Some(pp) = passphrase {
+        if let Ok(app_dir) = crate::session::get_app_dir() {
+            write_secret_file(&app_dir.join("serve.passphrase"), pp).await;
+        }
+    }
+
+    // Push notifications: initialize only when the operator flag is on at
+    // startup. Flipping it later requires a server restart to take effect.
+    let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    let push_enabled = config.web.notifications_enabled;
+    let push_state = if push_enabled {
+        match crate::session::get_app_dir() {
+            Ok(dir) => match PushState::init(&dir) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(
+                        "Push notifications disabled: failed to init VAPID/state: {}",
+                        e
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Push notifications disabled: app_dir unavailable: {}", e);
+                None
+            }
+        }
+    } else {
+        info!("Push notifications disabled by web.notifications_enabled=false");
+        None
+    };
+
+    #[cfg(feature = "serve")]
+    let cockpit_events_tx = broadcast::channel(COCKPIT_CHANNEL_CAPACITY).0;
+    #[cfg(feature = "serve")]
+    let cockpit_replay: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::cockpit::replay_buffer::ReplayBuffer>,
+        >,
+    > = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    #[cfg(feature = "serve")]
+    let cockpit_replay_caps = (
+        config.cockpit.replay_events as usize,
+        config.cockpit.replay_bytes as usize,
+    );
+    #[cfg(feature = "serve")]
+    let cockpit_master_enabled = config.cockpit.enabled;
+    #[cfg(feature = "serve")]
+    let cockpit_supervisor = {
+        let push_for_sink = push_state.clone();
+        let push_enabled_for_sink = push_enabled;
+        let on_approval =
+            std::sync::Arc::new(move |session_id: &str, title: &str, destructive: bool| {
+                let session_id = session_id.to_string();
+                let title = title.to_string();
+                let push = push_for_sink.clone();
+                tokio::spawn(async move {
+                    if let Some(_push) = push {
+                        if push_enabled_for_sink {
+                            // We re-enter the cockpit_ws helper when we have
+                            // an AppState in scope; the standalone trigger
+                            // here just logs intent. The full server-driven
+                            // path lives at cockpit_ws::trigger_approval_push,
+                            // invoked from the API handler that receives
+                            // the cockpit broadcast.
+                            tracing::debug!(
+                                target: "cockpit.supervisor",
+                                session = %session_id,
+                                title = %title,
+                                destructive,
+                                "approval event observed (push delivery handled via api layer)"
+                            );
+                        }
+                    }
+                });
+            }) as std::sync::Arc<dyn Fn(&str, &str, bool) + Send + Sync>;
+        let sink = std::sync::Arc::new(crate::cockpit::supervisor::ChannelSink {
+            tx: cockpit_events_tx.clone(),
+            on_approval,
+            replay: cockpit_replay.clone(),
+            replay_caps: cockpit_replay_caps,
+        });
+        std::sync::Arc::new(crate::cockpit::supervisor::Supervisor::with_capacity(
+            sink,
+            config.cockpit.max_concurrent_workers,
+        ))
+    };
+
     let state = Arc::new(AppState {
         profile: profile.to_string(),
         read_only,
@@ -247,17 +525,97 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         devices: RwLock::new(Vec::new()),
         behind_tunnel: remote,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
+        cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
+            // Seed with an already-stale timestamp so the first request
+            // forces a fresh resolve instead of handing out an empty map.
+            refreshed_at: std::time::Instant::now() - CLEANUP_DEFAULTS_TTL,
+            entries: std::collections::HashMap::new(),
+        }),
+        remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
+        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+        status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
+        #[cfg(feature = "serve")]
+        cockpit_events_tx: cockpit_events_tx.clone(),
+        #[cfg(feature = "serve")]
+        cockpit_replay: cockpit_replay.clone(),
+        #[cfg(feature = "serve")]
+        cockpit_replay_caps,
+        #[cfg(feature = "serve")]
+        cockpit_master_enabled,
+        #[cfg(feature = "serve")]
+        cockpit_supervisor: cockpit_supervisor.clone(),
+        push: push_state,
+        push_enabled,
+        web_config: config.web.clone(),
+        last_web_activity: std::sync::atomic::AtomicI64::new(0),
     });
 
     let app = build_router(state.clone());
+
+    // Cockpit workers for persisted sessions get auto-spawned by the
+    // reconciler in `status_poll_loop`. The poll interval's first tick
+    // fires immediately, so on cold startup this is equivalent to the
+    // old in-place loop here, while also covering sessions added via
+    // `aoe add --cockpit` while serve is already running. The
+    // reconciler short-circuits when `cockpit.enabled = false`.
+
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let local_port = listener.local_addr()?.port();
 
-    // Start tunnel if remote mode
+    // Start tunnel if remote mode. Preference order:
+    //  1. User-specified named Cloudflare tunnel (stable, explicit choice).
+    //  2. Tailscale Funnel if tailscale is installed and logged in
+    //     (stable .ts.net URL, installable PWAs keep working).
+    //  3. Cloudflare quick tunnel (fallback; URL rotates per restart,
+    //     which breaks installed PWAs).
+    // Capture the Tailscale probe result before the branch so the
+    // debug log shows why we did or didn't take the Tailscale path.
+    // The probe itself also logs details about each underlying call.
+    let tailscale_ok = if remote && !no_tailscale {
+        let available = tunnel::tailscale_available().await;
+        tracing::debug!(
+            no_tailscale,
+            tailscale_available = available,
+            "tunnel: choosing transport"
+        );
+        available
+    } else {
+        if remote && no_tailscale {
+            tracing::debug!("tunnel: --no-tailscale set, skipping Tailscale auto-detection");
+        }
+        false
+    };
+
     let tunnel_handle = if remote {
         let handle = if let (Some(name), Some(url)) = (tunnel_name, tunnel_url) {
             tunnel::TunnelHandle::spawn_named(name, url, local_port).await?
+        } else if tailscale_ok {
+            info!("Tailscale detected; using Tailscale Funnel for stable HTTPS origin");
+            // Do NOT fall back to Cloudflare on Tailscale failure: the
+            // user is on the Tailscale path because they want the
+            // stable-URL benefit, and silently downgrading to a rotating
+            // Cloudflare URL would break the feature they wanted. Bail
+            // with the real error; the user fixes Tailscale or passes
+            // --no-tailscale to explicitly opt into Cloudflare.
+            tunnel::TunnelHandle::spawn_tailscale(local_port)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Tailscale Funnel setup failed: {e}\n\n\
+                         aoe detected a logged-in Tailscale on this host and did not \
+                         fall back to Cloudflare, because doing so silently would \
+                         give you a rotating URL that breaks installed PWAs (the \
+                         reason Tailscale is the preferred transport).\n\n\
+                         Ways to move forward:\n  \
+                         - Fix the Tailscale issue above and re-run `aoe serve --remote`.\n  \
+                         - Re-run with `aoe serve --remote --no-tailscale` to use \
+                         Cloudflare intentionally (quick-tunnel URL rotates on restart).\n  \
+                         - Re-run with `--tunnel-name <name> --tunnel-url <host>` \
+                         to use a named Cloudflare tunnel."
+                    )
+                })?
         } else {
             tunnel::TunnelHandle::spawn_quick(local_port).await?
         };
@@ -270,17 +628,43 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
         // Print QR code unless running as daemon
         if !is_daemon {
+            eprintln!(
+                "Remote access via {} (URL is {}).",
+                match handle.mode_label() {
+                    "tailscale" => "Tailscale Funnel",
+                    "tunnel" => "Cloudflare tunnel",
+                    other => other,
+                },
+                if handle.is_stable_origin() {
+                    "stable across restarts"
+                } else {
+                    "temporary; rotates on restart"
+                }
+            );
             tunnel::print_qr_code(&tunnel_url_with_token);
+            if !handle.is_stable_origin() {
+                eprintln!(
+                    "\nNote: this Cloudflare quick tunnel URL changes on every restart.\n\
+                     Installed PWAs (home-screen apps) break when the URL changes.\n\
+                     For a stable installable dashboard, install Tailscale and run\n\
+                     `tailscale up` on this host before `aoe serve --remote`, or use\n\
+                     a named Cloudflare tunnel via --tunnel-name/--tunnel-url.\n"
+                );
+            }
         }
 
         // Write tunnel URL for daemon discovery. Single-line content:
         // backward-compatible with any consumer that does `head -1 serve.url`,
         // and the TUI parses both single- and multi-URL formats.
         if let Ok(app_dir) = crate::session::get_app_dir() {
-            write_secret_file(&app_dir.join("serve.url"), &tunnel_url_with_token);
+            write_secret_file(&app_dir.join("serve.url"), &tunnel_url_with_token).await;
             // serve.mode lets the TUI reattach to a running daemon and
-            // know whether to render "Serving (tunnel)" vs "(local)".
-            let _ = std::fs::write(app_dir.join("serve.mode"), "tunnel\n");
+            // render the right transport label: "tunnel" for Cloudflare,
+            // "tailscale" for Tailscale Funnel, "local" for local-only.
+            let mode = format!("{}\n", handle.mode_label());
+            if let Err(e) = tokio::fs::write(app_dir.join("serve.mode"), mode).await {
+                tracing::debug!("Failed to write serve.mode: {e}");
+            }
         }
 
         // Start health monitor (uses CancellationToken internally)
@@ -338,8 +722,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 contents.push_str(url);
                 contents.push('\n');
             }
-            write_secret_file(&app_dir.join("serve.url"), &contents);
-            let _ = std::fs::write(app_dir.join("serve.mode"), "local\n");
+            write_secret_file(&app_dir.join("serve.url"), &contents).await;
+            if let Err(e) = tokio::fs::write(app_dir.join("serve.mode"), "local\n").await {
+                tracing::debug!("Failed to write serve.mode: {e}");
+            }
         }
 
         None
@@ -351,17 +737,125 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         status_poll_loop(poll_state).await;
     });
 
+    // Push-notification consumer: subscribes to status_tx, applies
+    // dwell + cooldown, sends pushes. No-op when push_state is None
+    // (feature disabled via web.notifications_enabled=false).
+    push::spawn_consumer(state.clone());
+
     rate_limiter.spawn_cleanup_task();
     login_manager.spawn_cleanup_task();
 
     if remote {
-        token_manager.spawn_rotation_task();
+        // Inline the rotation loop here rather than calling
+        // token_manager.spawn_rotation_task() so we can also invalidate
+        // push subscriptions whose owner hash is no longer valid after
+        // rotation. Behavior otherwise matches the original: wait one
+        // lifetime, rotate, wait 300s grace, clear previous.
+        let rot_state = state.clone();
+        // The tunnel URL is stable across the daemon's lifetime (Tailscale
+        // and named CF tunnels are stable; quick CF rotates only on
+        // restart, which is outside this task's scope). Capture once so
+        // the rotation task can rebuild `serve.url` with the new token.
+        let rot_base_url: Option<String> = tunnel_handle.as_ref().map(|h| h.url.clone());
+        tokio::spawn(async move {
+            loop {
+                let lifetime = rot_state.token_manager.lifetime_secs().await;
+                tokio::time::sleep(std::time::Duration::from_secs(lifetime)).await;
+
+                // Capture the hashes of the current and (about-to-be)
+                // previous tokens BEFORE rotating, so we know which
+                // owner-hashes are still valid in the store.
+                let pre_rotate_current = rot_state.token_manager.current_token().await;
+                rot_state.token_manager.rotate().await;
+                let post_rotate_current = rot_state.token_manager.current_token().await;
+
+                // Refresh `serve.url` so the TUI display and the QR-code
+                // URL stay in sync with the rotated token. Without this
+                // the TUI keeps showing `?token=<old>`, which is invalid
+                // 5 minutes after rotation (end of grace period).
+                if let (Some(base_url), Some(token)) =
+                    (rot_base_url.as_ref(), post_rotate_current.as_ref())
+                {
+                    let url_with_token = format!("{}/?token={}", base_url, token);
+                    if let Ok(app_dir) = crate::session::get_app_dir() {
+                        write_secret_file(&app_dir.join("serve.url"), &url_with_token).await;
+                    }
+                }
+
+                if let Some(push) = rot_state.push.as_ref() {
+                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
+                    if let Some(t) = &post_rotate_current {
+                        valid_hashes.push(push::sha256_token(t));
+                    }
+                    if let Some(t) = &pre_rotate_current {
+                        // The old token remains in the grace period (5m)
+                        // so devices that haven't yet picked up the new
+                        // token should keep receiving pushes.
+                        valid_hashes.push(push::sha256_token(t));
+                    }
+                    // In no-auth mode the token is None and we use a
+                    // zero hash; preserve that so zero-hash subs survive.
+                    if valid_hashes.is_empty() {
+                        valid_hashes.push([0u8; 32]);
+                    }
+                    match push.store.retain_owners(&valid_hashes).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(
+                            removed = n,
+                            "push: dropped subscriptions whose owner-hash is no longer valid after rotation"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "push: retain_owners failed"),
+                    }
+                }
+
+                // After grace period, the previous token becomes invalid.
+                // Clear it AND drop any subscriptions that were bound
+                // only to the old hash (retain_owners with only the new).
+                tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                // Clear previous token inside TokenManager. Reuse its
+                // internal state access via a tiny helper on the manager.
+                rot_state.token_manager.clear_previous().await;
+
+                if let Some(push) = rot_state.push.as_ref() {
+                    let mut valid_hashes: Vec<[u8; 32]> = Vec::new();
+                    if let Some(t) = rot_state.token_manager.current_token().await {
+                        valid_hashes.push(push::sha256_token(&t));
+                    }
+                    if valid_hashes.is_empty() {
+                        valid_hashes.push([0u8; 32]);
+                    }
+                    let _ = push.store.retain_owners(&valid_hashes).await;
+                }
+            }
+        });
     }
 
-    // Graceful shutdown with tunnel cleanup
+    // Graceful shutdown: SIGINT (Ctrl-C), SIGTERM (`aoe serve --stop`),
+    // and SIGHUP (parent session died). Without these, the default handler
+    // kills the process immediately, skipping PID/URL file cleanup.
     let shutdown_signal = async {
-        let _ = tokio::signal::ctrl_c().await;
-        info!("Shutting down...");
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).ok();
+            let mut sighup = signal(SignalKind::hangup()).ok();
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    info!("Received SIGINT, shutting down...");
+                }
+                _ = async { match sigterm { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
+                    info!("Received SIGTERM, shutting down...");
+                }
+                _ = async { match sighup { Some(ref mut s) => { s.recv().await; } None => std::future::pending().await } } => {
+                    info!("Received SIGHUP, shutting down...");
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+            info!("Shutting down...");
+        }
     };
 
     axum::serve(
@@ -371,30 +865,47 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     .with_graceful_shutdown(shutdown_signal)
     .await?;
 
+    // Tear down every cockpit ACP worker so the spawned `claude-agent-acp`
+    // wrappers (and their SDK children) don't outlive the daemon.
+    cockpit_supervisor.shutdown_all().await;
+
     // Clean up tunnel (cancels health monitor, then sends SIGTERM to cloudflared)
     if let Some(handle) = tunnel_handle {
         handle.shutdown().await;
+    }
+
+    if let Ok(app_dir) = crate::session::get_app_dir() {
+        let _ = tokio::fs::remove_file(app_dir.join("serve.passphrase")).await;
     }
 
     Ok(())
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    use axum::routing::{get, patch, post};
+    use axum::routing::{delete, get, patch, post};
 
-    Router::new()
+    let app = Router::new()
         // Sessions
         .route(
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
         )
-        .route("/api/sessions/{id}", patch(api::rename_session))
+        .route(
+            "/api/sessions/{id}",
+            patch(api::rename_session).delete(api::delete_session),
+        )
         .route(
             "/api/sessions/{id}/diff/files",
             get(api::session_diff_files),
         )
         .route("/api/sessions/{id}/diff/file", get(api::session_diff_file))
         .route("/api/sessions/{id}/ensure", post(api::ensure_session))
+        .route("/api/sessions/{id}/send", post(api::send_message))
+        .route("/api/sessions/{id}/output", get(api::read_output))
+        .route(
+            "/api/sessions/{id}/notifications",
+            patch(api::update_session_notifications),
+        )
         .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
         .route(
             "/api/sessions/{id}/container-terminal",
@@ -402,11 +913,28 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         // Agents
         .route("/api/agents", get(api::list_agents))
-        // Wizard support
-        .route("/api/profiles", get(api::list_profiles))
+        // Profiles
+        .route(
+            "/api/profiles",
+            get(api::list_profiles).post(api::create_profile),
+        )
+        .route("/api/profiles/{name}", delete(api::delete_profile))
+        .route(
+            "/api/profiles/{name}/settings",
+            get(api::get_profile_settings).patch(api::update_profile_settings),
+        )
+        .route("/api/profiles/{name}/rename", patch(api::rename_profile))
+        .route("/api/default-profile", patch(api::default_profile))
         .route("/api/filesystem/browse", get(api::browse_filesystem))
+        .route("/api/filesystem/home", get(api::filesystem_home))
         .route("/api/git/branches", get(api::list_branches))
+        .route("/api/git/clone", post(api::clone_repo))
         .route("/api/groups", get(api::list_groups))
+        .route(
+            "/api/projects",
+            get(api::list_projects).post(api::create_project),
+        )
+        .route("/api/projects/{name}", delete(api::delete_project))
         .route("/api/docker/status", get(api::docker_status))
         // Settings + themes
         .route(
@@ -414,6 +942,16 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_settings).patch(api::update_settings),
         )
         .route("/api/themes", get(api::list_themes))
+        .route("/api/sounds", get(api::list_sounds))
+        // Push notifications
+        .route("/api/push/status", get(push::get_status))
+        .route(
+            "/api/push/vapid-public-key",
+            get(push::get_vapid_public_key),
+        )
+        .route("/api/push/subscribe", post(push::subscribe))
+        .route("/api/push/unsubscribe", post(push::unsubscribe))
+        .route("/api/push/test", post(push::test))
         // Login (second-factor auth)
         .route("/api/login", post(login::login_handler))
         .route("/api/logout", post(login::logout_handler))
@@ -428,7 +966,44 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/sessions/{id}/container-terminal/ws",
             get(ws::container_terminal_ws),
+        );
+
+    #[cfg(feature = "serve")]
+    let app = app
+        .route("/sessions/{id}/cockpit/ws", get(cockpit_ws::cockpit_ws))
+        .route("/api/sessions/{id}/cockpit/spawn", post(api::spawn_cockpit))
+        .route("/api/sessions/{id}/cockpit", delete(api::shutdown_cockpit))
+        .route(
+            "/api/sessions/{id}/cockpit/prompt",
+            post(api::cockpit_prompt),
         )
+        .route(
+            "/api/sessions/{id}/cockpit/cancel",
+            post(api::cockpit_cancel),
+        )
+        .route("/api/sessions/{id}/cockpit/files", get(api::cockpit_files))
+        .route(
+            "/api/sessions/{id}/cockpit/replay",
+            get(api::cockpit_replay),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/mode",
+            post(api::cockpit_set_mode),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/enable",
+            post(api::cockpit_enable),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/disable",
+            post(api::cockpit_disable),
+        )
+        .route(
+            "/api/sessions/{id}/cockpit/approvals/{nonce}",
+            post(api::resolve_approval),
+        );
+
+    app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
         .route("/assets/{*path}", get(serve_asset))
         .route("/manifest.json", get(serve_public_file))
@@ -446,6 +1021,34 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Content-Security-Policy for the dashboard.
+///
+/// - `default-src 'self'`: deny everything we don't explicitly allow.
+/// - `script-src 'self' 'wasm-unsafe-eval'`: wterm compiles WebAssembly;
+///   the `wasm-unsafe-eval` source is the CSP3 opt-in for WASM compilation.
+/// - `style-src 'self' 'unsafe-inline'`: React writes to element.style at
+///   runtime (terminal theme vars, font-size updates) and Tailwind v4 emits
+///   inline `<style>` blocks in dev. Blocking inline styles breaks wterm.
+/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com`:
+///   repo-owner avatars are loaded from `github.com/{user}.png` which 302s
+///   to `avatars.githubusercontent.com`; CSP checks both URLs across the
+///   redirect, so both hosts must be allowed. `data:` covers inline icons.
+/// - `font-src 'self'`: Geist fonts are bundled under /fonts/.
+/// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
+/// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
+/// - `base-uri 'self'`, `form-action 'self'`, `object-src 'none'`: tighten
+///   the usual attack surfaces on injection bugs.
+const CSP: &str = "default-src 'self'; \
+    script-src 'self' 'wasm-unsafe-eval'; \
+    style-src 'self' 'unsafe-inline'; \
+    img-src 'self' data: https://github.com https://avatars.githubusercontent.com; \
+    font-src 'self'; \
+    connect-src 'self' ws: wss:; \
+    frame-ancestors 'none'; \
+    base-uri 'self'; \
+    form-action 'self'; \
+    object-src 'none'";
+
 /// Middleware that adds security headers to all responses.
 async fn security_headers(
     request: axum::extract::Request,
@@ -456,6 +1059,7 @@ async fn security_headers(
     headers.insert("x-frame-options", "DENY".parse().unwrap());
     headers.insert("x-content-type-options", "nosniff".parse().unwrap());
     headers.insert("referrer-policy", "no-referrer".parse().unwrap());
+    headers.insert("content-security-policy", CSP.parse().unwrap());
     response
 }
 
@@ -571,23 +1175,23 @@ pub fn discover_tagged_ips() -> Vec<(IpKind, std::net::Ipv4Addr)> {
 
 /// Write a file with owner-only permissions (0600) to protect secrets.
 #[cfg(unix)]
-fn write_secret_file(path: &std::path::Path, contents: &str) {
-    use std::os::unix::fs::OpenOptionsExt;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
+async fn write_secret_file(path: &std::path::Path, contents: &str) {
+    use tokio::io::AsyncWriteExt;
+    let opts = tokio::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .open(path)
-    {
-        use std::io::Write;
-        let _ = file.write_all(contents.as_bytes());
+        .await;
+    if let Ok(mut file) = opts {
+        let _ = file.write_all(contents.as_bytes()).await;
     }
 }
 
 #[cfg(not(unix))]
-fn write_secret_file(path: &std::path::Path, contents: &str) {
-    let _ = std::fs::write(path, contents);
+async fn write_secret_file(path: &std::path::Path, contents: &str) {
+    let _ = tokio::fs::write(path, contents).await;
 }
 
 /// Generate a cryptographically random 64-character hex token (256 bits of entropy).
@@ -610,18 +1214,18 @@ fn is_valid_token_format(token: &str) -> bool {
 
 /// Load an existing auth token from disk if it's less than 24 hours old,
 /// otherwise generate a fresh one and persist it.
-fn load_or_generate_token() -> anyhow::Result<String> {
+async fn load_or_generate_token() -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
     let token_path = app_dir.join("serve.token");
 
     // Try to reuse existing token if fresh enough
-    if let Ok(metadata) = std::fs::metadata(&token_path) {
+    if let Ok(metadata) = tokio::fs::metadata(&token_path).await {
         if let Ok(modified) = metadata.modified() {
             let age = std::time::SystemTime::now()
                 .duration_since(modified)
                 .unwrap_or_default();
             if age < std::time::Duration::from_secs(24 * 60 * 60) {
-                if let Ok(token) = std::fs::read_to_string(&token_path) {
+                if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
                     let token = token.trim().to_string();
                     if !token.is_empty() && is_valid_token_format(&token) {
                         return Ok(token);
@@ -632,7 +1236,7 @@ fn load_or_generate_token() -> anyhow::Result<String> {
     }
 
     let token = generate_token();
-    write_secret_file(&token_path, &token);
+    write_secret_file(&token_path, &token).await;
     Ok(token)
 }
 
@@ -664,11 +1268,129 @@ fn load_all_instances() -> anyhow::Result<Vec<Instance>> {
     Ok(all)
 }
 
-/// Background task that periodically refreshes session statuses.
+/// Reconcile cockpit workers against the on-disk session list. Spawns a
+/// worker for every cockpit-mode session that doesn't already have one,
+/// recording the attempt in `attempted` so a permanently-failing spawn
+/// (e.g. `claude-agent-acp` not installed) doesn't retry every 2s tick.
+/// Pruning `attempted` to live ids first lets a delete + recreate of
+/// the same id spawn again.
+///
+/// Covers three entry points to "cockpit session exists, no worker
+/// running": cold serve startup (first tick fires immediately), `aoe
+/// add --cockpit` while serve is running (next tick after the disk
+/// write), and any race where serve starts before a session file is
+/// fully written.
+#[cfg(feature = "serve")]
+async fn reconcile_cockpit_workers(
+    state: &Arc<AppState>,
+    attempted: &mut std::collections::HashSet<String>,
+) {
+    // Honor `cockpit.enabled = false` from config.toml — the persistent
+    // master switch. Snapshotted at startup; flipping it requires
+    // `aoe serve` to restart, mirroring how `web.notifications_enabled`
+    // works. To stop cockpit on a running daemon: `aoe serve --stop`,
+    // toggle the field, then start again.
+    if !state.cockpit_master_enabled {
+        return;
+    }
+
+    let targets: Vec<_> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.cockpit_mode)
+            .map(|i| {
+                (
+                    i.id.clone(),
+                    i.tool.clone(),
+                    i.cockpit_agent.clone(),
+                    i.cockpit_model.clone(),
+                    i.project_path.clone(),
+                )
+            })
+            .collect()
+    };
+
+    let live: std::collections::HashSet<&String> = targets.iter().map(|t| &t.0).collect();
+    attempted.retain(|id| live.contains(id));
+
+    for (id, tool, agent_override, model, project_path) in targets {
+        if attempted.contains(&id) {
+            continue;
+        }
+        if state.cockpit_supervisor.is_running(&id).await {
+            // A REST-triggered spawn (POST /api/sessions or
+            // /api/cockpit/sessions/:id/enable) already owns the worker;
+            // record the id so we don't poll is_running every tick.
+            attempted.insert(id);
+            continue;
+        }
+        // Mark before spawning so the next 2s tick doesn't double-spawn
+        // while AcpClient::spawn is still negotiating with the agent.
+        attempted.insert(id.clone());
+        // Persisted cockpit-mode sessions auto-spawn even when
+        // `AOE_EXPERIMENTAL_COCKPIT` is unset (the env-var gate is for
+        // *new* sessions, not pre-existing ones). Log a warning per
+        // session so operators who unset the env var on a daemon with
+        // existing cockpit sessions know why those are still running.
+        // The `attempted` set bounds this to one log line per session
+        // per daemon lifetime.
+        if !crate::cockpit::experimental_enabled() {
+            tracing::warn!(
+                target: "cockpit.supervisor",
+                session = %id,
+                "auto-spawning persisted cockpit-mode session while \
+                 AOE_EXPERIMENTAL_COCKPIT is not set. To stop cockpit \
+                 from running existing sessions, set \
+                 `cockpit.enabled = false` in config.toml and restart \
+                 `aoe serve`. To stop just this one, switch its \
+                 substrate to tmux from the dashboard."
+            );
+        }
+        let supervisor = state.cockpit_supervisor.clone();
+        let agent = supervisor
+            .pick_agent_for_tool(&tool, agent_override.as_deref())
+            .await;
+        let cwd = std::path::PathBuf::from(project_path);
+        tokio::spawn(async move {
+            if let Err(e) = supervisor
+                .spawn(id.clone(), &agent, cwd, vec![], vec![], model)
+                .await
+            {
+                let message = format!("Failed to start cockpit agent {agent:?}: {e}");
+                tracing::warn!(
+                    target: "cockpit.supervisor",
+                    session = %id,
+                    agent = %agent,
+                    "auto-spawn reconciler failed: {message}"
+                );
+                supervisor.publish_startup_error(&id, message);
+            }
+        });
+    }
+}
+
+/// Background task that periodically refreshes session statuses. On each
+/// tick, diffs pre- and post-refresh statuses and emits a `StatusChange`
+/// on `state.status_tx` for every transition. Keeping the diff here,
+/// rather than pushing it into `Instance::update_status_with_metadata`,
+/// leaves the session module free of any broadcast-channel dependency
+/// and keeps TUI/CLI callers unchanged.
 async fn status_poll_loop(state: Arc<AppState>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    #[cfg(feature = "serve")]
+    let mut attempted_cockpit_spawns: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     loop {
         interval.tick().await;
+
+        // Snapshot prior statuses so we can detect transitions without
+        // holding the lock across the blocking tmux work.
+        let prev: std::collections::HashMap<String, crate::session::Status> = {
+            let instances = state.instances.read().await;
+            instances.iter().map(|i| (i.id.clone(), i.status)).collect()
+        };
+
         // Run blocking tmux subprocess calls in a dedicated thread
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances().unwrap_or_default();
@@ -687,7 +1409,29 @@ async fn status_poll_loop(state: Arc<AppState>) {
         .await;
 
         if let Ok(instances) = updated {
+            // Emit transitions before swapping in the new snapshot so
+            // consumers see events in the same order regardless of when
+            // they read state.instances themselves.
+            let now = chrono::Utc::now();
+            for inst in &instances {
+                if let Some(old) = prev.get(&inst.id) {
+                    if *old != inst.status {
+                        // send() errors only when there are no receivers;
+                        // that's fine, we emit best-effort.
+                        let _ = state.status_tx.send(StatusChange {
+                            instance_id: inst.id.clone(),
+                            instance_title: inst.title.clone(),
+                            old: *old,
+                            new: inst.status,
+                            at: now,
+                        });
+                    }
+                }
+            }
             *state.instances.write().await = instances;
+
+            #[cfg(feature = "serve")]
+            reconcile_cockpit_workers(&state, &mut attempted_cockpit_spawns).await;
         }
     }
 }
@@ -766,6 +1510,49 @@ mod tests {
         let mut v = [IpKind::Loopback, IpKind::Lan, IpKind::Tailscale];
         v.sort();
         assert_eq!(v, [IpKind::Tailscale, IpKind::Lan, IpKind::Loopback]);
+    }
+
+    #[test]
+    fn csp_parses_as_valid_header_value() {
+        // Catches typos that would make the header unparseable.
+        // security_headers() calls `.parse().unwrap()` at request time;
+        // this test surfaces any regression at `cargo test` time instead.
+        let parsed: axum::http::HeaderValue = CSP.parse().expect("CSP must parse");
+        let rendered = parsed.to_str().expect("CSP must be ASCII");
+        // Spot-check load-bearing directives so a future edit that
+        // accidentally drops one fails loudly.
+        for needle in [
+            "default-src 'self'",
+            "'wasm-unsafe-eval'",
+            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com",
+            "connect-src 'self' ws: wss:",
+            "frame-ancestors 'none'",
+        ] {
+            assert!(
+                rendered.contains(needle),
+                "CSP is missing required directive fragment `{needle}`"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_defaults_cache_stale_within_ttl_is_false() {
+        let cache = CleanupDefaultsCache {
+            refreshed_at: std::time::Instant::now(),
+            entries: std::collections::HashMap::new(),
+        };
+        assert!(!cache.stale());
+    }
+
+    #[test]
+    fn cleanup_defaults_cache_stale_past_ttl_is_true() {
+        let cache = CleanupDefaultsCache {
+            refreshed_at: std::time::Instant::now()
+                - CLEANUP_DEFAULTS_TTL
+                - std::time::Duration::from_millis(1),
+            entries: std::collections::HashMap::new(),
+        };
+        assert!(cache.stale());
     }
 
     #[tokio::test]

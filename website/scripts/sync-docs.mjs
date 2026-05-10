@@ -59,7 +59,7 @@ const PAGES = [
     dest: "guides/remote-phone-access.md",
     title: "Remote Access from Your Phone",
     description:
-      "Access your Agent of Empires sessions from your phone via a one-keystroke Cloudflare Tunnel with QR pairing.",
+      "Access your Agent of Empires sessions from your phone via Tailscale Funnel or Cloudflare Tunnel with QR pairing.",
   },
   {
     source: "docs/guides/worktrees.md",
@@ -67,6 +67,27 @@ const PAGES = [
     title: "Worktrees Reference",
     description:
       "Git worktree commands and configuration reference for Agent of Empires.",
+  },
+  {
+    source: "docs/guides/agent-override.md",
+    dest: "guides/agent-override.md",
+    title: "Agent Command Overrides",
+    description:
+      "Override agent commands with custom scripts or sandboxed wrappers in Agent of Empires.",
+  },
+  {
+    source: "docs/guides/session-resume.md",
+    dest: "guides/session-resume.md",
+    title: "Session Resume (Claude)",
+    description:
+      "Persist and resume Claude Code conversations across reboots, upgrades, and runtime rotations.",
+  },
+  {
+    source: "docs/guides/multi-repo-workspaces.md",
+    dest: "guides/multi-repo-workspaces.md",
+    title: "Multi-Repo Workspaces",
+    description:
+      "Drive a single Agent of Empires session across several git repositories with the project registry and multi-select pickers.",
   },
 
   // --- Docs pages (docs/ → pages/docs/) ---
@@ -96,6 +117,13 @@ const PAGES = [
     dest: "docs/development.md",
     title: "Development",
     description: "Build, run, and test Agent of Empires from source.",
+  },
+  {
+    source: "docs/development/adding-agents.md",
+    dest: "docs/development/adding-agents.md",
+    title: "Adding a New Agent",
+    description:
+      "Step-by-step guide for adding support for a new AI coding agent to AoE.",
   },
   {
     source: "docs/sounds.md",
@@ -146,6 +174,20 @@ const PAGES = [
     description:
       "Rename the outer terminal tab on attach and restore a dashboard title when returning to AoE.",
   },
+  {
+    source: "docs/cockpit.md",
+    dest: "docs/cockpit.md",
+    title: "Cockpit (Native Agent Rendering)",
+    description:
+      "Mobile-first native rendering of AI agent state via the Agent Client Protocol (ACP). Plan panels, tool-call cards, swipe-to-approve, multi-provider support.",
+  },
+  {
+    source: "docs/api.md",
+    dest: "docs/api.md",
+    title: "HTTP API Reference",
+    description:
+      "REST endpoints for driving Agent of Empires sessions from external orchestrators.",
+  },
 ];
 
 // Every known docs path → website URL, used for link rewriting.
@@ -156,12 +198,15 @@ const URL_MAP = {
   "docs/quick-start.md": "/docs/quick-start/",
   "docs/sounds.md": "/docs/sounds/",
   "docs/development.md": "/docs/development/",
+  "docs/development/adding-agents.md": "/docs/development/adding-agents/",
   "docs/guides/configuration.md": "/docs/guides/configuration/",
   "docs/cli/reference.md": "/docs/cli/reference/",
   "docs/fork-features/index.md": "/docs/fork-features/",
   "docs/fork-features/git-branch-display.md": "/docs/fork-features/git-branch-display/",
   "docs/fork-features/tool-session-tracking.md": "/docs/fork-features/tool-session-tracking/",
   "docs/fork-features/terminal-tab-title.md": "/docs/fork-features/terminal-tab-title/",
+  "docs/cockpit.md": "/docs/cockpit/",
+  "docs/api.md": "/docs/api/",
   // Guides
   "docs/guides/diff-view.md": "/guides/diff-view/",
   "docs/guides/repo-config.md": "/guides/repo-config/",
@@ -170,6 +215,9 @@ const URL_MAP = {
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
   "docs/guides/remote-phone-access.md": "/guides/remote-phone-access/",
   "docs/guides/worktrees.md": "/guides/worktrees/",
+  "docs/guides/agent-override.md": "/guides/agent-override/",
+  "docs/guides/session-resume.md": "/guides/session-resume/",
+  "docs/guides/multi-repo-workspaces.md": "/guides/multi-repo-workspaces/",
 };
 
 const GITHUB_BASE =
@@ -220,9 +268,15 @@ function rewriteLinks(content, sourceDir) {
     }
   );
 
-  // Rewrite relative image/asset paths to absolute (assets/ → /assets/)
-  // The build copies docs/assets/* to website/public/assets/
-  content = content.replace(/\]\(assets\//g, "](/assets/");
+  // Rewrite relative image/asset paths to absolute (/assets/...).
+  // The build copies docs/assets/* to website/public/assets/. Both
+  // `assets/foo.png` (used by root-level docs like docs/index.md) and
+  // `../assets/foo.png` (used by guides at docs/guides/foo.md) map to
+  // the same place, so normalize both to `/assets/`. This catches
+  // markdown links, markdown images (![alt](..) contains ](..)), and
+  // HTML-less references alike. `(?:\.\.\/)*` handles any depth of
+  // parent-directory hops so deeper-nested docs future-proof through.
+  content = content.replace(/\]\((?:\.\.\/)*assets\//g, "](/assets/");
 
   return content;
 }

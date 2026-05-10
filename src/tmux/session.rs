@@ -6,13 +6,14 @@ use std::process::Command;
 use super::{
     refresh_session_cache, session_exists_from_cache,
     utils::{
-        append_mouse_on_args, append_pane_base_index_args, append_remain_on_exit_args,
-        is_pane_dead, is_pane_running_shell,
+        append_clipboard_passthrough_args, append_mouse_on_args, append_pane_base_index_args,
+        append_remain_on_exit_args, append_window_size_args, is_pane_dead, is_pane_running_shell,
     },
     SESSION_PREFIX,
 };
 use crate::cli::truncate_id;
 use crate::process;
+use crate::session::config::should_apply_tmux_clipboard;
 use crate::session::Status;
 
 pub struct Session {
@@ -36,6 +37,10 @@ impl Session {
     pub fn generate_name(id: &str, title: &str) -> String {
         let safe_title = sanitize_session_name(title);
         format!("{}{}_{}", SESSION_PREFIX, safe_title, truncate_id(id, 8))
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn exists(&self) -> bool {
@@ -68,6 +73,10 @@ impl Session {
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
+        append_window_size_args(&mut args, &self.name);
+        if should_apply_tmux_clipboard() {
+            append_clipboard_passthrough_args(&mut args, &self.name);
+        }
 
         let output = Command::new("tmux").args(&args).output()?;
 
@@ -281,6 +290,15 @@ impl Session {
     /// terminals send for Shift+Enter) so the coding agent inserts a newline
     /// rather than submitting after each line.
     pub fn send_keys(&self, text: &str) -> Result<()> {
+        self.send_keys_with_delay(text, 0)
+    }
+
+    /// Like [`send_keys`](Self::send_keys), but waits `enter_delay_ms` between
+    /// the literal text and the final Enter. Agents with paste-burst detection
+    /// (e.g. Codex) swallow Enter keys that arrive within their burst window,
+    /// treating them as newlines instead of submit. The delay lets the
+    /// suppression window expire before Enter is sent.
+    pub fn send_keys_with_delay(&self, text: &str, enter_delay_ms: u64) -> Result<()> {
         if !self.exists() {
             bail!("Session does not exist: {}", self.name);
         }
@@ -289,11 +307,17 @@ impl Session {
 
         let lines: Vec<&str> = text.lines().collect();
         for (i, line) in lines.iter().enumerate() {
-            Self::tmux_send(&target, &["-l", line])?;
+            // `--` ends option parsing so lines beginning with `-` (markdown
+            // bullets, CLI flags in prompts) are not misread as tmux flags.
+            Self::tmux_send(&target, &["-l", "--", line])?;
             if i < lines.len() - 1 {
                 // ESC + CR: what terminals send for Shift+Enter (inserts newline)
                 Self::tmux_send(&target, &["-H", "1b", "0d"])?;
             }
+        }
+
+        if enter_delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(enter_delay_ms));
         }
 
         // Enter to submit
