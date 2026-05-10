@@ -441,6 +441,7 @@ fn parse_output_text(content: &str) -> Text<'static> {
 
 fn shorten_path(path: &str) -> String {
     let path_buf = std::path::PathBuf::from(path);
+    let had_trailing_slash = path.len() > 1 && path.ends_with(std::path::MAIN_SEPARATOR);
 
     if let Some(home) = dirs::home_dir() {
         if let (Ok(canonical_path), Ok(canonical_home)) =
@@ -449,10 +450,10 @@ fn shorten_path(path: &str) -> String {
             let path_str = canonical_path.to_string_lossy();
             if let Some(home_str) = canonical_home.to_str() {
                 if let Some(stripped) = path_str.strip_prefix(home_str) {
-                    return format!("~{}", stripped);
+                    return restore_trailing_slash(format!("~{}", stripped), had_trailing_slash);
                 }
             }
-            return path_str.into_owned();
+            return restore_trailing_slash(path_str.into_owned(), had_trailing_slash);
         }
 
         if let Some(home_str) = home.to_str() {
@@ -464,9 +465,97 @@ fn shorten_path(path: &str) -> String {
     path.to_string()
 }
 
+fn restore_trailing_slash(mut path: String, had_trailing_slash: bool) -> String {
+    if had_trailing_slash && !path.ends_with(std::path::MAIN_SEPARATOR) {
+        path.push(std::path::MAIN_SEPARATOR);
+    }
+    path
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{
+        save_repo_config, Instance, RepoConfig, SessionConfigOverride, ToolSession,
+    };
+    use chrono::Utc;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use tempfile::tempdir;
+
+    fn render_preview(instance: &Instance) -> String {
+        let backend = TestBackend::new(80, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let theme = Theme::default();
+
+        terminal
+            .draw(|frame| {
+                Preview::render_with_cache(frame, frame.area(), instance, "", &theme, false);
+            })
+            .unwrap();
+
+        let mut rendered = String::new();
+        for cell in terminal.backend().buffer().content() {
+            rendered.push_str(cell.symbol());
+        }
+        rendered
+    }
+
+    fn instance_with_tool_session(project_path: &std::path::Path) -> Instance {
+        let mut instance = Instance::new("Tracked", &project_path.to_string_lossy());
+        instance.tool = "codex".to_string();
+        instance.source_profile = "default".to_string();
+        instance.tool_session = Some(ToolSession {
+            display_id: "session-123".to_string(),
+            resume_target: "session-123".to_string(),
+            source_ref: "codex:/tmp/rollout.jsonl".to_string(),
+            updated_at: Utc::now(),
+        });
+        instance
+    }
+
+    #[test]
+    fn test_preview_renders_session_id_when_tracking_enabled() {
+        let dir = tempdir().unwrap();
+        save_repo_config(
+            dir.path(),
+            &RepoConfig {
+                session: Some(SessionConfigOverride {
+                    tool_session_tracking: Some(true),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let instance = instance_with_tool_session(dir.path());
+
+        let rendered = render_preview(&instance);
+
+        assert!(rendered.contains("Session ID: session-123"));
+    }
+
+    #[test]
+    fn test_preview_hides_session_id_when_tracking_disabled() {
+        let dir = tempdir().unwrap();
+        save_repo_config(
+            dir.path(),
+            &RepoConfig {
+                session: Some(SessionConfigOverride {
+                    tool_session_tracking: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let instance = instance_with_tool_session(dir.path());
+
+        let rendered = render_preview(&instance);
+
+        assert!(!rendered.contains("Session ID:"));
+        assert!(!rendered.contains("session-123"));
+    }
 
     #[test]
     fn test_shorten_path_with_home() {

@@ -37,6 +37,17 @@ AoE refreshes the mapping in two places:
 
 When AoE must restore a broken tmux session, it uses the stored resume target instead of starting a brand-new tool session, as long as the mapping is still safe.
 
+## Tool Support
+
+Each supported tool exposes its active session differently, so AoE uses the strongest local signal available for that tool:
+
+- `claude`: reads the per-pane session file written under the Claude sessions directory. This is tied to the tmux pane process and is the strongest mapping.
+- `codex`: follows the foreground process and its descendants, then reads the active rollout JSONL file that native Codex keeps open. Subagent rollouts are ignored.
+- `opencode`: reads the local OpenCode database and matches sessions by project directory after the tool has written its first row.
+- `pi`: scans local Pi session files for the project after the first AI response has completed.
+
+Claude and Codex can usually be resolved immediately for existing running tmux sessions. OpenCode and Pi can only be resolved after their own local artifacts exist.
+
 ## Safety Rules
 
 This feature prefers correctness over guessing.
@@ -71,3 +82,24 @@ This setting is also available in the settings TUI under the `Session` category 
 - v1 supports host-run built-in `claude`, `codex`, `opencode`, and `pi`.
 - The mapping is best-effort and local-only. If tool state cannot be read safely, AoE falls back cleanly to normal behavior.
 - Existing stored mappings may remain on disk while the feature is disabled, but AoE ignores them until tracking is enabled again.
+
+## Regression Coverage
+
+Keep these checks green when changing session restore, tmux status polling, reload behavior, or Preview rendering:
+
+```bash
+cargo test --lib session::tool_session::tests
+cargo test --lib tui::home::tests::test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_change
+cargo test --lib tui::home::tests::test_reload_preserves_unsaved_runtime_tool_session
+cargo test --lib tui::app::tests::test_apply_tool_session_state_change_does_not_clear_on_probe_only_change
+cargo test --lib tui::components::preview::tests
+```
+
+The focused tests lock the important contracts:
+
+- discovery does not bind to stale or unrelated tool artifacts
+- probe-only refreshes do not clear an existing mapping
+- reload preserves runtime tool-session fields before storage catches up
+- Preview shows the session ID only when tracking is enabled
+
+Run the normal formatting, clippy, and library test gates before merging changes in this area.
