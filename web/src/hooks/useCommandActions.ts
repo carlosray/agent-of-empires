@@ -15,6 +15,7 @@ interface Args {
   onSelectSession: (sessionId: string) => void;
   onToggleDiff: () => void;
   onOpenSettings: () => void;
+  onOpenArchive: () => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onGoDashboard: () => void;
@@ -31,6 +32,7 @@ export function useCommandActions({
   onSelectSession,
   onToggleDiff,
   onOpenSettings,
+  onOpenArchive,
   onOpenHelp,
   onOpenAbout,
   onGoDashboard,
@@ -75,6 +77,14 @@ export function useCommandActions({
       keywords: ["hide", "show", "nav"],
       shortcut: IS_MAC ? "⌘B" : "Ctrl+B",
       perform: onToggleSidebar,
+    });
+
+    actions.push({
+      id: "action:archive",
+      title: "Open archive",
+      group: "Actions",
+      keywords: ["deleted", "restore", "sessions"],
+      perform: onOpenArchive,
     });
 
     actions.push({
@@ -139,6 +149,7 @@ export function useCommandActions({
     onSelectSession,
     onToggleDiff,
     onOpenSettings,
+    onOpenArchive,
     onOpenHelp,
     onOpenAbout,
     onGoDashboard,

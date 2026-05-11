@@ -51,6 +51,7 @@ Running one AI agent is easy. Running five of them across different branches, ke
 - **Diff view**: review git changes and edit files without leaving the TUI ([guide](https://www.agent-of-empires.com/guides/diff-view/))
 - **Session resume**: persist and resume Claude conversations across reboots and upgrades ([guide](https://www.agent-of-empires.com/guides/session-resume/))
 - **Profiles**: separate workspaces for different projects or clients ([guide](https://www.agent-of-empires.com/docs/guides/configuration/#profiles))
+- **Session archive**: deleted sessions are archived by default and can be viewed or safely restored later ([fork doc](https://www.agent-of-empires.com/docs/fork-features/session-archive/))
 
 ## Web Dashboard (Beta, stabilization in progress)
 

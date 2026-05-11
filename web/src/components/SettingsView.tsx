@@ -26,6 +26,7 @@ import { UpdateSettings } from "./settings/UpdateSettings";
 import { TmuxSettings } from "./settings/TmuxSettings";
 import { LoggingSettings } from "./settings/LoggingSettings";
 import { ProfileSelector } from "./settings/ProfileSelector";
+import { ArchiveSettings } from "./ArchiveSettings";
 
 type TabId =
   | "session"
@@ -220,6 +221,7 @@ export function SettingsView({
               checked={(session.strict_hotkeys as boolean) ?? false}
               onChange={(v) => saveField("session", session, "strict_hotkeys", v)}
             />
+            <ArchiveSettings />
             <ToggleField
               label="Agent status hooks"
               description="Install status-detection hooks into agent settings files for reliable status tracking"

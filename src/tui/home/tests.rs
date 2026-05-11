@@ -6,13 +6,17 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{HomeView, ViewMode};
-use crate::session::{save_config, Config, Instance, Item, Storage};
+use crate::session::{save_config, ArchiveCleanupOptions, Config, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
 use crate::tui::dialogs::{InfoDialog, NewSessionDialog};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
+}
+
+fn key_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+    KeyEvent::new(code, modifiers)
 }
 
 fn setup_test_home(temp: &TempDir) {
@@ -872,6 +876,75 @@ fn test_t_toggles_view_mode() {
 
 #[test]
 #[serial]
+fn test_a_toggles_archive_view() {
+    let env = create_test_env_empty();
+    let mut view = env.view;
+
+    assert_eq!(view.view_mode, ViewMode::Agent);
+
+    view.handle_key(key(KeyCode::Char('a')), None);
+    assert_eq!(view.view_mode, ViewMode::Archive);
+
+    view.handle_key(key(KeyCode::Char('a')), None);
+    assert_eq!(view.view_mode, ViewMode::Agent);
+}
+
+#[test]
+#[serial]
+fn test_archive_view_uses_same_grouping_and_sort_order() {
+    use crate::session::config::{GroupByMode, SortOrder};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let storage = Storage::new("test").unwrap();
+
+    let mut active_a = Instance::new("Alpha", "/tmp/active-alpha");
+    active_a.group_path = "work".to_string();
+    let mut active_b = Instance::new("Beta", "/tmp/active-beta");
+    active_b.group_path = "work".to_string();
+    storage.save(&[active_b, active_a]).unwrap();
+
+    let mut archived_a = Instance::new("Alpha", "/tmp/archive-alpha");
+    archived_a.group_path = "work".to_string();
+    let mut archived_b = Instance::new("Beta", "/tmp/archive-beta");
+    archived_b.group_path = "work".to_string();
+    storage
+        .archive_instance(&archived_b, ArchiveCleanupOptions::default(), 100, None)
+        .unwrap();
+    storage
+        .archive_instance(&archived_a, ArchiveCleanupOptions::default(), 100, None)
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    view.group_by = GroupByMode::Manual;
+    view.sort_order = SortOrder::AZ;
+
+    fn labels(view: &HomeView, items: &[Item]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                Item::Group { name, .. } => format!("group:{name}"),
+                Item::Session { id, .. } => view
+                    .get_display_instance(id)
+                    .map(|instance| format!("session:{}", instance.title))
+                    .unwrap_or_else(|| "session:?".to_string()),
+            })
+            .collect()
+    }
+
+    view.view_mode = ViewMode::Agent;
+    let active_items = view.build_flat_items();
+    let active_labels = labels(&view, &active_items);
+    view.view_mode = ViewMode::Archive;
+    let archive_items = view.build_flat_items();
+    let archive_labels = labels(&view, &archive_items);
+
+    assert_eq!(active_labels, archive_labels);
+}
+
+#[test]
+#[serial]
 fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
@@ -944,6 +1017,48 @@ fn test_d_shows_info_dialog_in_terminal_view() {
     view.handle_key(key(KeyCode::Char('d')), None);
     assert!(view.info_dialog.is_some());
     assert!(view.unified_delete_dialog.is_none());
+}
+
+#[test]
+#[serial]
+fn test_ctrl_d_opens_permanent_delete_dialog() {
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+
+    view.handle_key(
+        key_with_modifiers(KeyCode::Char('d'), KeyModifiers::CONTROL),
+        None,
+    );
+
+    assert!(view.unified_delete_dialog.is_some());
+    assert!(!view.delete_dialog_allow_archive);
+}
+
+#[test]
+#[serial]
+fn test_d_respects_disabled_archive_setting() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let mut config = Config::default();
+    config.session.archive_on_delete = false;
+    save_config(&config).unwrap();
+
+    let storage = Storage::new("test").unwrap();
+    storage
+        .save(&[Instance::new("session", "/tmp/session")])
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(view.unified_delete_dialog.is_some());
+    assert!(!view.delete_dialog_allow_archive);
 }
 
 #[test]

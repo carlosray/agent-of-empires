@@ -68,6 +68,7 @@ import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { ArchiveView } from "./components/ArchiveView";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
 
@@ -175,12 +176,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const projectsMatch = useMatch("/projects");
+  const archiveMatch = useMatch("/archive");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const showProjects = projectsMatch !== null;
+  const showArchive = archiveMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
-  const { sessions, error, injectSession, setSessionStatus } = useSessions();
+  const { sessions, error, refresh, injectSession, setSessionStatus } = useSessions();
   const workspaces = useWorkspaces(sessions);
   const { groups, toggleRepoCollapsed } = useRepoGroups(workspaces);
 
@@ -330,6 +333,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
+  const [deletingPermanent, setDeletingPermanent] = useState(false);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
 
   const refreshServerAbout = useCallback(async () => {
@@ -346,7 +350,13 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     : null;
   const deletingSession = deletingWorkspace?.sessions[0] ?? null;
 
-  const handleDeleteSession = useCallback((workspaceId: string) => {
+  const handleArchiveSession = useCallback((workspaceId: string) => {
+    setDeletingPermanent(false);
+    setDeletingWorkspaceId(workspaceId);
+  }, []);
+
+  const handlePermanentDeleteSession = useCallback((workspaceId: string) => {
+    setDeletingPermanent(true);
     setDeletingWorkspaceId(workspaceId);
   }, []);
 
@@ -363,7 +373,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       navigate("/");
     }
 
-    const result = await deleteSession(sessionId, options);
+    const result = await deleteSession(sessionId, {
+      ...options,
+      permanent: deletingPermanent,
+    });
     if (!result.ok) {
       // Revert status on failure
       setSessionStatus(sessionId, "Error");
@@ -376,8 +389,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // remount before fetchReplay clears it.
     clearCockpitCache(sessionId);
 
-    toastBus.handler?.info("Session deleted");
-  }, [deletingSession, activeSessionId, setSessionStatus, navigate]);
+    toastBus.handler?.info(deletingPermanent ? "Session deleted" : "Session archived");
+    setDeletingPermanent(false);
+  }, [deletingSession, activeSessionId, deletingPermanent, setSessionStatus, navigate]);
 
   const handleCreateSession = useCallback((repoPath: string) => {
     const projectSessions = sessions
@@ -420,6 +434,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     if (window.innerWidth < 768) setSidebarOpen(false);
   }, [navigate]);
 
+  const handleOpenArchive = useCallback(() => {
+    navigate("/archive");
+    if (window.innerWidth < 768) setSidebarOpen(false);
+  }, [navigate]);
+
   const handleOpenProjects = useCallback(() => {
     navigate("/projects");
     if (window.innerWidth < 768) setSidebarOpen(false);
@@ -434,6 +453,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [navigate, activeSessionId]);
 
   const handleCloseSettings = useCallback(() => {
+    if (activeSessionId) {
+      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
+    } else {
+      navigate("/");
+    }
+  }, [navigate, activeSessionId]);
+
+  const handleCloseArchive = useCallback(() => {
     if (activeSessionId) {
       navigate(`/session/${encodeURIComponent(activeSessionId)}`);
     } else {
@@ -543,7 +570,14 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           }
           setShowSessionWizard(false);
           setShowHelp(false);
-          if (showSettings) handleCloseSettings();
+          if (showSettings) {
+            handleCloseSettings();
+            return;
+          }
+          if (showArchive) {
+            handleCloseArchive();
+            return;
+          }
           setShowAbout(false);
           setSelectedFile(null);
         },
@@ -554,7 +588,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onToggleRightPanel: () => setDiffCollapsed((c) => !c),
         onToggleTerminalFocus: handleToggleTerminalFocus,
       }),
-      [toggleDiff, showPalette, deletingWorkspaceId, showSettings, handleCloseSettings, navigate, handleToggleTerminalFocus],
+      [toggleDiff, showPalette, deletingWorkspaceId, showSettings, showArchive, handleCloseSettings, handleCloseArchive, navigate, handleToggleTerminalFocus],
     ),
   );
 
@@ -567,6 +601,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onSelectSession: handleSelectSession,
     onToggleDiff: toggleDiff,
     onOpenSettings: handleOpenSettings,
+    onOpenArchive: handleOpenArchive,
     onOpenHelp: handleOpenHelp,
     onOpenAbout: handleOpenAbout,
     onGoDashboard: handleGoDashboard,
@@ -592,6 +627,15 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         <ProjectsView
           onClose={handleCloseProjects}
           readOnly={serverAbout?.read_only}
+        />
+      );
+    }
+
+    if (showArchive) {
+      return (
+        <ArchiveView
+          onClose={handleCloseArchive}
+          onRestored={() => void refresh()}
         />
       );
     }
@@ -752,6 +796,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         onOpenPalette={() => setShowPalette(true)}
         onToggleDiff={toggleDiff}
         diffCollapsed={diffCollapsed}
+        onOpenSettings={handleOpenSettings}
+        onOpenArchive={handleOpenArchive}
         onOpenHelp={handleOpenHelp}
         onOpenAbout={handleOpenAbout}
         onLogout={onLogout}
@@ -764,7 +810,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       <UpdateBanner />
 
       <div className="flex flex-1 min-h-0">
-        {!showSettings && !showProjects && (
+        {!showSettings && !showProjects && !showArchive && (
           <WorkspaceSidebar
             groups={groups}
             activeId={activeWorkspace?.id ?? null}
@@ -776,7 +822,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             onCreateSession={handleCreateSession}
             onSettings={handleOpenSettings}
             onProjects={handleOpenProjects}
-            onDeleteSession={handleDeleteSession}
+            onArchiveSession={handleArchiveSession}
+            onPermanentDeleteSession={handlePermanentDeleteSession}
+            onDeleteSession={handleArchiveSession}
             readOnly={serverAbout?.read_only}
           />
         )}
@@ -816,8 +864,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           hasManagedWorktree={deletingSession.has_managed_worktree}
           isSandboxed={deletingSession.is_sandboxed}
           cleanupDefaults={deletingSession.cleanup_defaults}
+          permanent={deletingPermanent}
           onConfirm={handleConfirmDelete}
-          onCancel={() => setDeletingWorkspaceId(null)}
+          onCancel={() => {
+            setDeletingWorkspaceId(null);
+            setDeletingPermanent(false);
+          }}
         />
       )}
 

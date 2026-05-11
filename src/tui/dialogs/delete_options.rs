@@ -43,12 +43,26 @@ pub struct UnifiedDeleteDialog {
     session_title: String,
     config: DeleteDialogConfig,
     options: DeleteOptions,
+    archive_on_confirm: bool,
     focus: FocusElement,
     focusable_elements: Vec<FocusElement>,
 }
 
 impl UnifiedDeleteDialog {
     pub fn new(session_title: String, config: DeleteDialogConfig, profile: &str) -> Self {
+        Self::new_with_mode(session_title, config, profile, true)
+    }
+
+    pub fn new_permanent(session_title: String, config: DeleteDialogConfig, profile: &str) -> Self {
+        Self::new_with_mode(session_title, config, profile, false)
+    }
+
+    fn new_with_mode(
+        session_title: String,
+        config: DeleteDialogConfig,
+        profile: &str,
+        archive_on_confirm: bool,
+    ) -> Self {
         let user_config = match config.project_path.as_ref() {
             Some(p) => crate::session::repo_config::resolve_config_with_repo_or_warn(
                 profile,
@@ -79,6 +93,7 @@ impl UnifiedDeleteDialog {
             session_title,
             config,
             options,
+            archive_on_confirm,
             focus: initial_focus,
             focusable_elements,
         }
@@ -251,7 +266,11 @@ impl UnifiedDeleteDialog {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.error))
-            .title(" Delete Session ")
+            .title(if self.archive_on_confirm {
+                " Archive Session "
+            } else {
+                " Permanently Delete "
+            })
             .title_style(Style::default().fg(theme.error).bold());
 
         let inner = block.inner(dialog_area);
@@ -280,7 +299,11 @@ impl UnifiedDeleteDialog {
 
         let mut chunk_idx = 0;
 
-        let message = format!("Delete \"{}\"?", self.session_title);
+        let message = if self.archive_on_confirm {
+            format!("Archive \"{}\"?", self.session_title)
+        } else {
+            format!("Permanently delete \"{}\"?", self.session_title)
+        };
         frame.render_widget(
             Paragraph::new(message)
                 .style(Style::default().fg(theme.text))

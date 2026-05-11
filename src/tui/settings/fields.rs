@@ -91,6 +91,8 @@ pub enum FieldKey {
     // Session
     DefaultTool,
     StrictHotkeys,
+    ArchiveOnDelete,
+    ArchiveMaxEntries,
     AgentExtraArgs,
     AgentCommandOverride,
     AgentStatusHooks,
@@ -258,6 +260,13 @@ impl SettingField {
             (FieldKey::CheckIntervalHours, FieldValue::Number(n)) => {
                 validate_check_interval(*n)?;
                 Ok(())
+            }
+            (FieldKey::ArchiveMaxEntries, FieldValue::Number(n)) => {
+                if *n == 0 {
+                    Err("Archive max entries must be at least 1".to_string())
+                } else {
+                    Ok(())
+                }
             }
             (FieldKey::MemoryLimit, FieldValue::OptionalText(Some(v))) => {
                 crate::session::validate_memory_limit(v)?;
@@ -1446,6 +1455,18 @@ fn build_session_fields(
         session.and_then(|s| s.tool_session_tracking),
     );
 
+    let (archive_on_delete, archive_on_delete_override) = resolve_value(
+        scope,
+        global.session.archive_on_delete,
+        session.and_then(|s| s.archive_on_delete),
+    );
+
+    let (archive_max_entries, archive_max_entries_override) = resolve_value(
+        scope,
+        global.session.archive_max_entries,
+        session.and_then(|s| s.archive_max_entries),
+    );
+
     // Agent extra args: HashMap -> Vec<String> of "key=value" items for List field
     let (extra_args_map, extra_args_override) = resolve_value(
         scope,
@@ -1592,6 +1613,30 @@ fn build_session_fields(
             inherited_display: inherited_if(
                 strict_hotkeys_override,
                 FieldValue::Bool(global.session.strict_hotkeys),
+            ),
+        },
+        SettingField {
+            key: FieldKey::ArchiveOnDelete,
+            label: "Archive on Delete",
+            description: "Archive deleted sessions so they can be viewed or restored",
+            value: FieldValue::Bool(archive_on_delete),
+            category: SettingsCategory::Session,
+            has_override: archive_on_delete_override,
+            inherited_display: inherited_if(
+                archive_on_delete_override,
+                FieldValue::Bool(global.session.archive_on_delete),
+            ),
+        },
+        SettingField {
+            key: FieldKey::ArchiveMaxEntries,
+            label: "Archive Max Entries",
+            description: "Maximum archived sessions kept per profile",
+            value: FieldValue::Number(archive_max_entries),
+            category: SettingsCategory::Session,
+            has_override: archive_max_entries_override,
+            inherited_display: inherited_if(
+                archive_max_entries_override,
+                FieldValue::Number(global.session.archive_max_entries),
             ),
         },
         SettingField {
@@ -1983,6 +2028,12 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         }
         (FieldKey::YoloModeDefault, FieldValue::Bool(v)) => config.session.yolo_mode_default = *v,
         (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => config.session.strict_hotkeys = *v,
+        (FieldKey::ArchiveOnDelete, FieldValue::Bool(v)) => {
+            config.session.archive_on_delete = *v;
+        }
+        (FieldKey::ArchiveMaxEntries, FieldValue::Number(v)) => {
+            config.session.archive_max_entries = *v;
+        }
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             config.session.agent_status_hooks = *v;
         }
@@ -2409,6 +2460,16 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::StrictHotkeys, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| s.strict_hotkeys = val);
+        }
+        (FieldKey::ArchiveOnDelete, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.session, |s, val| {
+                s.archive_on_delete = val;
+            });
+        }
+        (FieldKey::ArchiveMaxEntries, FieldValue::Number(v)) => {
+            set_profile_override(*v, &mut config.session, |s, val| {
+                s.archive_max_entries = val;
+            });
         }
         (FieldKey::AgentStatusHooks, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.session, |s, val| {

@@ -11,6 +11,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe list`↴](#aoe-list)
 * [`aoe logs`↴](#aoe-logs)
 * [`aoe log-level`↴](#aoe-log-level)
+* [`aoe archive`↴](#aoe-archive)
+* [`aoe archive list`↴](#aoe-archive-list)
+* [`aoe archive show`↴](#aoe-archive-show)
+* [`aoe archive restore`↴](#aoe-archive-restore)
+* [`aoe archive delete`↴](#aoe-archive-delete)
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
@@ -91,6 +96,7 @@ Run without arguments to launch the TUI dashboard.
 * `list` — List all sessions
 * `logs` — View the configured AoE log file with a pretty viewer
 * `log-level` — Get or set the running daemon's log filter at runtime. Pass a bare level (debug/info/...) for the safe expansion, or `--filter <expr>` for raw EnvFilter syntax. `--get` prints the current filter. Changes are ephemeral and lost on daemon restart
+* `archive` — View, restore, or permanently delete archived sessions
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
@@ -221,6 +227,70 @@ Get or set the running daemon's log filter at runtime. Pass a bare level (debug/
 
 
 
+## `aoe archive`
+
+View, restore, or permanently delete archived sessions
+
+**Usage:** `aoe archive <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List archived sessions
+* `show` — Show archived session details
+* `restore` — Restore an archived session
+* `delete` — Permanently delete an archived session
+
+
+
+## `aoe archive list`
+
+List archived sessions
+
+**Usage:** `aoe archive list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output as JSON
+* `--all` — List archived sessions from all profiles
+
+
+
+## `aoe archive show`
+
+Show archived session details
+
+**Usage:** `aoe archive show <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Archived session ID, ID prefix, title, or path
+
+
+
+## `aoe archive restore`
+
+Restore an archived session
+
+**Usage:** `aoe archive restore <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Archived session ID, ID prefix, title, or path
+
+
+
+## `aoe archive delete`
+
+Permanently delete an archived session
+
+**Usage:** `aoe archive delete <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Archived session ID, ID prefix, title, or path
+
+
+
 ## `aoe remove`
 
 Remove a session
@@ -237,6 +307,7 @@ Remove a session
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
+* `--permanent` — Permanently delete instead of archiving
 
 
 

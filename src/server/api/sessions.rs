@@ -10,7 +10,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::session::{EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
+use crate::session::deletion::{perform_deletion, DeletionRequest};
+use crate::session::{
+    ArchivedSession, EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage,
+};
 
 use super::validate_no_shell_injection;
 use super::AppState;
@@ -130,6 +133,45 @@ pub struct CleanupDefaults {
     pub delete_worktree: bool,
     pub delete_branch: bool,
     pub delete_sandbox: bool,
+}
+
+#[derive(Serialize)]
+pub struct ArchivedSessionResponse {
+    pub id: String,
+    pub title: String,
+    pub project_path: String,
+    pub group_path: String,
+    pub tool: String,
+    pub profile: String,
+    pub created_at: String,
+    pub archived_at: String,
+    pub last_status: String,
+    pub can_restore: bool,
+    pub restore_blocker: Option<String>,
+}
+
+impl From<&ArchivedSession> for ArchivedSessionResponse {
+    fn from(entry: &ArchivedSession) -> Self {
+        let project_path = std::path::Path::new(&entry.instance.project_path);
+        let can_restore = entry.instance.project_path.is_empty() || project_path.exists();
+        Self {
+            id: entry.id.clone(),
+            title: entry.instance.title.clone(),
+            project_path: entry.instance.project_path.clone(),
+            group_path: entry.instance.group_path.clone(),
+            tool: entry.instance.tool.clone(),
+            profile: entry.source_profile.clone(),
+            created_at: entry.instance.created_at.to_rfc3339(),
+            archived_at: entry.archived_at.to_rfc3339(),
+            last_status: format!("{:?}", entry.last_status),
+            can_restore,
+            restore_blocker: if can_restore {
+                None
+            } else {
+                Some("Project path no longer exists".to_string())
+            },
+        }
+    }
 }
 
 impl SessionResponse {
@@ -389,6 +431,189 @@ pub async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<Vec<Sessi
     Json(sessions)
 }
 
+pub async fn list_archive(
+    State(_state): State<Arc<AppState>>,
+) -> Json<Vec<ArchivedSessionResponse>> {
+    let entries = load_all_archived_sessions().unwrap_or_default();
+    Json(entries.iter().map(ArchivedSessionResponse::from).collect())
+}
+
+pub async fn restore_archived_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let (profile, entry) = match find_archived_session(&id) {
+        Ok(found) => found,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_found", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let storage = match Storage::new(&profile) {
+        Ok(storage) => storage,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "storage_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let (mut instances, groups) = match storage.load_with_groups() {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "storage_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    if let Err(e) = entry.validate_restore(&instances) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "restore_failed", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    let restored = match entry.restore_instance() {
+        Ok(restored) => restored,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "restore_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    instances.push(restored.clone());
+    let group_tree = crate::session::GroupTree::new_with_groups(&instances, &groups);
+    if let Err(e) = storage.save_with_groups(&instances, &group_tree) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "storage_failed", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+    if let Err(e) = storage.delete_archived_session(&entry.id) {
+        tracing::warn!("Restored session but failed to remove archive entry: {e}");
+    }
+
+    let mut state_instances = state.instances.write().await;
+    state_instances.push(restored.clone());
+
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(SessionResponse::from_instance(
+                &restored,
+                crate::claude_settings::read_tui_fullscreen(),
+            ))
+            .unwrap(),
+        ),
+    )
+        .into_response()
+}
+
+pub async fn delete_archived_session(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+
+    let (profile, entry) = match find_archived_session(&id) {
+        Ok(found) => found,
+        Err(e) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not_found", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    let storage = match Storage::new(&profile) {
+        Ok(storage) => storage,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "storage_failed", "message": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(e) = storage.delete_archived_session(&entry.id) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "storage_failed", "message": e.to_string()})),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "deleted"})),
+    )
+        .into_response()
+}
+
+fn archive_profiles() -> Vec<String> {
+    let mut profiles = crate::session::list_profiles().unwrap_or_default();
+    if !profiles.iter().any(|profile| profile == "default") {
+        profiles.push("default".to_string());
+    }
+    profiles
+}
+
+fn load_all_archived_sessions() -> anyhow::Result<Vec<ArchivedSession>> {
+    let mut entries = Vec::new();
+    for profile in archive_profiles() {
+        let storage = Storage::new(&profile)?;
+        entries.extend(storage.load_archive()?);
+    }
+    entries.sort_by(|left, right| right.archived_at.cmp(&left.archived_at));
+    Ok(entries)
+}
+
+fn find_archived_session(id: &str) -> anyhow::Result<(String, ArchivedSession)> {
+    for profile in archive_profiles() {
+        let storage = Storage::new(&profile)?;
+        let entries = storage.load_archive()?;
+        if let Some(entry) = entries
+            .iter()
+            .find(|entry| entry.id == id || entry.id.starts_with(id))
+        {
+            return Ok((profile, entry.clone()));
+        }
+    }
+    anyhow::bail!("Archived session not found: {}", id)
+}
+
 // --- Rename session ---
 
 #[derive(Deserialize)]
@@ -612,6 +837,10 @@ pub struct DeleteSessionBody {
     pub delete_sandbox: bool,
     #[serde(default)]
     pub force_delete: bool,
+    #[serde(default)]
+    pub permanent: bool,
+    #[serde(default)]
+    pub archive: Option<bool>,
 }
 
 pub async fn delete_session(
@@ -647,7 +876,19 @@ pub async fn delete_session(
         );
     };
 
-    let profile = instance.source_profile.clone();
+    let profile = if instance.source_profile.is_empty() {
+        state.profile.clone()
+    } else {
+        instance.source_profile.clone()
+    };
+    let config = crate::session::repo_config::resolve_config_with_repo(
+        &profile,
+        std::path::Path::new(&instance.project_path),
+    )
+    .or_else(|_| crate::session::resolve_config(&profile))
+    .unwrap_or_default();
+    let archive_on_success =
+        !body.permanent && body.archive.unwrap_or(config.session.archive_on_delete);
 
     // Mark as Deleting so polling clients see the status change
     {
@@ -688,40 +929,96 @@ pub async fn delete_session(
     // Run deletion on a blocking thread (may do git/docker/tmux operations)
     let deletion_id = id.clone();
     let deletion_result = tokio::task::spawn_blocking(move || {
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
+        perform_deletion(&DeletionRequest {
             session_id: deletion_id,
             instance,
             delete_worktree: body.delete_worktree,
             delete_branch: body.delete_branch,
             delete_sandbox: body.delete_sandbox,
             force_delete: body.force_delete,
+            archive_on_success,
+            archive_max_entries: config.session.archive_max_entries,
         })
     })
     .await;
 
     match deletion_result {
         Ok(result) if result.success => {
-            // Remove from in-memory state and persist
-            let mut instances = state.instances.write().await;
-            instances.retain(|i| i.id != id);
+            let storage = match Storage::new(&profile) {
+                Ok(storage) => storage,
+                Err(e) => {
+                    tracing::error!("Failed to open storage after deletion: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "storage_failed",
+                            "message": e.to_string(),
+                        })),
+                    );
+                }
+            };
 
-            if let Ok(storage) = Storage::new(&profile) {
-                let profile_instances: Vec<_> = instances
-                    .iter()
-                    .filter(|i| i.source_profile == profile)
-                    .cloned()
-                    .collect();
-                if let Err(e) = storage.save(&profile_instances) {
-                    tracing::error!("Failed to save after deletion: {e}");
+            if result.archive_on_success {
+                if let Err(e) = storage.archive_instance(
+                    &result.instance,
+                    result.cleanup.clone(),
+                    result.archive_max_entries,
+                    None,
+                ) {
+                    tracing::error!("Failed to archive deleted session: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "archive_failed",
+                            "message": e.to_string(),
+                        })),
+                    );
                 }
             }
+
+            let (mut profile_instances, groups) = match storage.load_with_groups() {
+                Ok(data) => data,
+                Err(e) => {
+                    tracing::error!("Failed to load sessions after deletion: {e}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "error": "storage_failed",
+                            "message": e.to_string(),
+                        })),
+                    );
+                }
+            };
+            profile_instances.retain(|i| i.id != id);
+            let group_tree =
+                crate::session::GroupTree::new_with_groups(&profile_instances, &groups);
+            if let Err(e) = storage.save_with_groups(&profile_instances, &group_tree) {
+                tracing::error!("Failed to save after deletion: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "storage_failed",
+                        "message": e.to_string(),
+                    })),
+                );
+            }
+
+            // Remove from in-memory state after persistence succeeds.
+            let mut instances = state.instances.write().await;
+            instances.retain(|i| i.id != id);
 
             // Clean up per-instance lock entry
             state.instance_locks.write().await.remove(&id);
 
             (
                 StatusCode::OK,
-                Json(serde_json::json!({ "status": "deleted" })),
+                Json(serde_json::json!({
+                    "status": if result.archive_on_success {
+                        "archived"
+                    } else {
+                        "deleted"
+                    },
+                })),
             )
         }
         Ok(result) => {

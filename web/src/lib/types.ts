@@ -92,6 +92,20 @@ export interface CleanupDefaults {
   delete_sandbox: boolean;
 }
 
+export interface ArchivedSessionResponse {
+  id: string;
+  title: string;
+  project_path: string;
+  group_path: string;
+  tool: string;
+  profile: string;
+  created_at: string;
+  archived_at: string;
+  last_status: SessionStatus;
+  can_restore: boolean;
+  restore_blocker: string | null;
+}
+
 export type SessionStatus =
   | "Running"
   | "Waiting"

@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
 use super::add::AddArgs;
+use super::archive::ArchiveCommands;
 #[cfg(feature = "serve")]
 use super::cockpit::CockpitCommands;
 use super::group::GroupCommands;
@@ -84,6 +85,12 @@ pub enum Commands {
     /// current filter. Changes are ephemeral and lost on daemon restart.
     #[cfg(feature = "serve")]
     LogLevel(LogLevelArgs),
+
+    /// View, restore, or permanently delete archived sessions
+    Archive {
+        #[command(subcommand)]
+        command: ArchiveCommands,
+    },
 
     /// Remove a session
     #[command(alias = "rm")]

@@ -7,7 +7,7 @@ use crate::session::config::SortOrder;
 use crate::tui::styles::Theme;
 
 const DIALOG_WIDTH: u16 = 50;
-const DIALOG_HEIGHT: u16 = 44;
+const DIALOG_HEIGHT: u16 = 48;
 #[cfg(test)]
 const BORDER_HEIGHT: u16 = 2;
 #[cfg(test)]
@@ -39,8 +39,9 @@ fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str
                     ("Ctrl+N", "New from selection"),
                     ("X", "Stop session"),
                     ("B", "Refresh branch label"),
-                    ("D", "Delete session/group"),
-                    ("R", "Rename session/group"),
+                    ("D", "Archive session/group"),
+                    ("Ctrl+Shift+D", "Permanent delete"),
+                    ("R", "Rename or restore"),
                     ("M", "Send message to agent"),
                 ],
             ),
@@ -48,6 +49,7 @@ fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str
                 "Views",
                 vec![
                     ("T", "Toggle Agent/Terminal view"),
+                    ("A", "Toggle Archive view"),
                     ("C", "Toggle container/host (sandbox)"),
                     ("Ctrl+D", "Diff view (git changes)"),
                     ("H/L", "Resize list panel"),
@@ -96,8 +98,9 @@ fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str
                     ("N", "New from selection"),
                     ("x", "Stop session"),
                     ("B", "Refresh branch label"),
-                    ("d", "Delete session/group"),
-                    ("r", "Rename session/group"),
+                    ("d", "Archive session/group"),
+                    ("Ctrl+d", "Permanent delete"),
+                    ("r", "Rename or restore"),
                     ("m", "Send message to agent"),
                 ],
             ),
@@ -105,6 +108,7 @@ fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str
                 "Views",
                 vec![
                     ("t", "Toggle Agent/Terminal view"),
+                    ("a", "Toggle Archive view"),
                     ("c", "Toggle container/host (sandbox)"),
                     ("D", "Diff view (git changes)"),
                     ("H/L", "Resize list panel"),

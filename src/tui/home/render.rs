@@ -348,10 +348,16 @@ impl HomeView {
                 self.active_profile_display(),
                 group_suffix
             ),
+            ViewMode::Archive => format!(
+                " Archive [{}]{} ",
+                self.active_profile_display(),
+                group_suffix
+            ),
         };
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Agent => (theme.border, theme.title),
             ViewMode::Terminal => (theme.terminal_border, theme.terminal_border),
+            ViewMode::Archive => (theme.border, theme.dimmed),
         };
         let block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::BOTTOM)
@@ -364,14 +370,28 @@ impl HomeView {
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
-        if self.instances().is_empty() && !self.has_any_groups() {
-            let empty_text = vec![
-                Line::from(""),
-                Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
-                Line::from(""),
-                Line::from("Press 'n' to create one").style(Style::default().fg(theme.hint)),
-                Line::from("or 'aoe add .'").style(Style::default().fg(theme.hint)),
-            ];
+        let visible_count = if self.view_mode == ViewMode::Archive {
+            self.archived_sessions.len()
+        } else {
+            self.instances().len()
+        };
+        if visible_count == 0 && !self.has_any_groups_for_view() {
+            let empty_text = if self.view_mode == ViewMode::Archive {
+                vec![
+                    Line::from(""),
+                    Line::from("No archived sessions").style(Style::default().fg(theme.dimmed)),
+                    Line::from(""),
+                    Line::from("Press 'a' to return").style(Style::default().fg(theme.hint)),
+                ]
+            } else {
+                vec![
+                    Line::from(""),
+                    Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
+                    Line::from(""),
+                    Line::from("Press 'n' to create one").style(Style::default().fg(theme.hint)),
+                    Line::from("or 'aoe add .'").style(Style::default().fg(theme.hint)),
+                ]
+            };
             let para = Paragraph::new(empty_text).alignment(Alignment::Center);
             frame.render_widget(para, inner);
             return;
@@ -506,7 +526,7 @@ impl HomeView {
                 (icon, text, style)
             }
             Item::Session { id, .. } => {
-                if let Some(inst) = self.get_instance(id) {
+                if let Some(inst) = self.get_display_instance(id) {
                     match self.view_mode {
                         ViewMode::Agent => {
                             // For Idle sessions, decay color from `fresh_idle`
@@ -575,6 +595,10 @@ impl HomeView {
                             let style = Style::default().fg(color);
                             (icon, Cow::Owned(inst.title.clone()), style)
                         }
+                        ViewMode::Archive => {
+                            let style = Style::default().fg(theme.dimmed);
+                            (ICON_STOPPED, Cow::Owned(inst.title.clone()), style)
+                        }
                     }
                 } else {
                     (
@@ -600,7 +624,7 @@ impl HomeView {
         ));
 
         if let Item::Session { id, .. } = item {
-            if let Some(inst) = self.get_instance(id) {
+            if let Some(inst) = self.get_display_instance(id) {
                 if let Some(ws_info) = &inst.workspace_info {
                     let suffix = if self.show_branch_in_tui {
                         inst.display_branch
@@ -659,20 +683,21 @@ impl HomeView {
                 // existing container/host badge in Agent view; the
                 // Terminal view keeps its existing badging because
                 // the host terminal still works against the worktree.
-                let badge_text: Option<&'static str> =
-                    if inst.is_cockpit_mode() && self.view_mode != ViewMode::Terminal {
-                        // Renamed from `[web]` now that the TUI renders
-                        // cockpit sessions natively; `[cockpit]` better
-                        // describes the substrate the badge marks.
-                        Some(" [cockpit]")
-                    } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
-                        Some(match self.get_terminal_mode(id) {
-                            TerminalMode::Container => " [container]",
-                            TerminalMode::Host => " [host]",
-                        })
-                    } else {
-                        None
-                    };
+                let badge_text: Option<&'static str> = if self.view_mode == ViewMode::Archive {
+                    Some(" [archived]")
+                } else if inst.is_cockpit_mode() && self.view_mode != ViewMode::Terminal {
+                    // Renamed from `[web]` now that the TUI renders
+                    // cockpit sessions natively; `[cockpit]` better
+                    // describes the substrate the badge marks.
+                    Some(" [cockpit]")
+                } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
+                    Some(match self.get_terminal_mode(id) {
+                        TerminalMode::Container => " [container]",
+                        TerminalMode::Host => " [host]",
+                    })
+                } else {
+                    None
+                };
                 let badge_width = badge_text.map_or(0, |s| s.len());
 
                 let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
@@ -703,7 +728,12 @@ impl HomeView {
                 }
 
                 if let Some(badge) = badge_text {
-                    line_spans.push(Span::styled(badge, Style::default().fg(theme.sandbox)));
+                    let badge_color = if self.view_mode == ViewMode::Archive {
+                        theme.dimmed
+                    } else {
+                        theme.sandbox
+                    };
+                    line_spans.push(Span::styled(badge, Style::default().fg(badge_color)));
                 }
                 if column_fits {
                     line_spans.push(Span::raw(" ".repeat(LAST_ACTIVITY_RIGHT_MARGIN)));
@@ -856,6 +886,7 @@ impl HomeView {
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Agent => (theme.border, theme.title),
             ViewMode::Terminal => (theme.terminal_border, theme.terminal_border),
+            ViewMode::Archive => (theme.border, theme.dimmed),
         };
 
         let mut block = Block::default()
@@ -910,6 +941,7 @@ impl HomeView {
             let title = match self.view_mode {
                 ViewMode::Agent => " Preview ",
                 ViewMode::Terminal => " Terminal Preview ",
+                ViewMode::Archive => " Archive Details ",
             };
             block = block
                 .title(title)
@@ -1022,6 +1054,75 @@ impl HomeView {
                     }
                 } else {
                     let hint = Paragraph::new("Select a session to preview terminal")
+                        .style(Style::default().fg(theme.dimmed))
+                        .alignment(Alignment::Center);
+                    frame.render_widget(hint, inner);
+                }
+            }
+            ViewMode::Archive => {
+                if let Some(id) = &self.selected_session {
+                    if let Some(entry) = self.get_archived_session(id) {
+                        let project_exists =
+                            std::path::Path::new(&entry.instance.project_path).exists();
+                        let lines = vec![
+                            Line::from(vec![
+                                Span::styled("Title:   ", Style::default().fg(theme.dimmed)),
+                                Span::styled(
+                                    &entry.instance.title,
+                                    Style::default().fg(theme.text).bold(),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Path:    ", Style::default().fg(theme.dimmed)),
+                                Span::styled(
+                                    &entry.instance.project_path,
+                                    Style::default().fg(theme.text),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Profile: ", Style::default().fg(theme.dimmed)),
+                                Span::styled(
+                                    &entry.source_profile,
+                                    Style::default().fg(theme.text),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
+                                Span::styled(
+                                    format!("{:?}", entry.last_status),
+                                    Style::default().fg(theme.text),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Saved:   ", Style::default().fg(theme.dimmed)),
+                                Span::styled(
+                                    entry
+                                        .archived_at
+                                        .format("%Y-%m-%d %H:%M:%S UTC")
+                                        .to_string(),
+                                    Style::default().fg(theme.text),
+                                ),
+                            ]),
+                            Line::from(vec![
+                                Span::styled("Restore: ", Style::default().fg(theme.dimmed)),
+                                Span::styled(
+                                    if project_exists {
+                                        "available"
+                                    } else {
+                                        "path missing"
+                                    },
+                                    Style::default().fg(if project_exists {
+                                        theme.running
+                                    } else {
+                                        theme.error
+                                    }),
+                                ),
+                            ]),
+                        ];
+                        frame.render_widget(Paragraph::new(lines), inner);
+                    }
+                } else {
+                    let hint = Paragraph::new("Select an archived session")
                         .style(Style::default().fg(theme.dimmed))
                         .alignment(Alignment::Center);
                     frame.render_widget(hint, inner);
@@ -1237,12 +1338,27 @@ impl HomeView {
         groups.push((2, mk(if strict { "N" } else { "n" }, "New")));
 
         if self.selected_session.is_some() {
-            groups.push((3, mk(if strict { "M" } else { "m" }, "Msg")));
+            if self.view_mode == ViewMode::Archive {
+                groups.push((3, mk(if strict { "R" } else { "r" }, "Restore")));
+            } else {
+                groups.push((3, mk(if strict { "M" } else { "m" }, "Msg")));
+            }
         }
         if !self.flat_items.is_empty() {
-            groups.push((3, mk(if strict { "D" } else { "d" }, "Del")));
+            groups.push((
+                3,
+                mk(
+                    if strict { "D" } else { "d" },
+                    if self.view_mode == ViewMode::Archive {
+                        "Delete"
+                    } else {
+                        "Del"
+                    },
+                ),
+            ));
         }
 
+        groups.push((4, mk(if strict { "A" } else { "a" }, "Archive")));
         groups.push((4, mk_key("/")));
         groups.push((4, mk(if strict { "^D" } else { "D" }, "Diff")));
         groups.push((1, mk("^K", "Cmds")));

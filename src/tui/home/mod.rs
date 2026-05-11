@@ -15,8 +15,8 @@ use tui_input::Input;
 
 use crate::session::{
     config::{load_config, save_config, GroupByMode, SortOrder},
-    flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn, DefaultTerminalMode, Group,
-    GroupTree, Instance, Item, Storage,
+    flatten_tree, flatten_tree_all_profiles, resolve_config, resolve_config_or_warn,
+    ArchivedSession, DefaultTerminalMode, Group, GroupTree, Instance, Item, Storage,
 };
 use crate::tmux::AvailableTools;
 
@@ -73,6 +73,7 @@ pub enum ViewMode {
     #[default]
     Agent,
     Terminal,
+    Archive,
 }
 
 /// Terminal mode for sandboxed sessions (container vs host)
@@ -144,7 +145,10 @@ pub struct HomeView {
     pub(super) active_profile: Option<String>,
     instances: Vec<Instance>,
     instance_map: HashMap<String, Instance>,
+    archived_sessions: Vec<ArchivedSession>,
+    archive_map: HashMap<String, ArchivedSession>,
     pub(super) group_trees: HashMap<String, GroupTree>,
+    pub(super) archive_group_trees: HashMap<String, GroupTree>,
     pub(super) flat_items: Vec<Item>,
 
     // UI state
@@ -164,6 +168,7 @@ pub struct HomeView {
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
+    pub(super) delete_dialog_allow_archive: bool,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
     pub(super) group_rename_context: Option<GroupRenameContext>,
@@ -197,6 +202,8 @@ pub struct HomeView {
     pub(super) pending_stop_session: Option<String>,
     /// Session to force-remove after the confirmation dialog is accepted
     pub(super) pending_force_remove_session: Option<String>,
+    /// Archived session to permanently delete after confirmation
+    pub(super) pending_archive_delete_session: Option<String>,
     /// Branch refresh to apply after the confirmation dialog is accepted
     pub(super) pending_branch_refresh: Option<BranchRefreshContext>,
     // Search
@@ -278,7 +285,9 @@ impl HomeView {
 
         let mut storages = HashMap::new();
         let mut all_instances = Vec::new();
+        let mut all_archived = Vec::new();
         let mut group_trees = HashMap::new();
+        let mut archive_group_trees = HashMap::new();
 
         let profile_names = match &active_profile {
             Some(name) => vec![name.clone()],
@@ -294,12 +303,31 @@ impl HomeView {
             let tree = GroupTree::new_with_groups(&instances, &groups);
             group_trees.insert(profile_name.clone(), tree);
             all_instances.extend(instances);
+
+            let mut archived = storage.load_archive()?;
+            for entry in &mut archived {
+                entry.source_profile = profile_name.clone();
+                entry.instance.source_profile = profile_name.clone();
+            }
+            let archived_instances: Vec<Instance> = archived
+                .iter()
+                .map(|entry| entry.instance.clone())
+                .collect();
+            archive_group_trees.insert(
+                profile_name.clone(),
+                GroupTree::new_with_groups(&archived_instances, &[]),
+            );
+            all_archived.extend(archived);
             storages.insert(profile_name.clone(), storage);
         }
 
         let instance_map: HashMap<String, Instance> = all_instances
             .iter()
             .map(|i| (i.id.clone(), i.clone()))
+            .collect();
+        let archive_map: HashMap<String, ArchivedSession> = all_archived
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.clone()))
             .collect();
 
         // In unified mode, config comes from "default" profile
@@ -341,7 +369,10 @@ impl HomeView {
             active_profile,
             instances: all_instances,
             instance_map,
+            archived_sessions: all_archived,
+            archive_map,
             group_trees,
+            archive_group_trees,
             flat_items: Vec::new(),
             cursor: 0,
             selected_session: None,
@@ -355,6 +386,7 @@ impl HomeView {
             new_dialog: None,
             confirm_dialog: None,
             unified_delete_dialog: None,
+            delete_dialog_allow_archive: true,
             group_delete_options_dialog: None,
             rename_dialog: None,
             group_rename_context: None,
@@ -378,6 +410,7 @@ impl HomeView {
             pending_attach_after_warning: None,
             pending_stop_session: None,
             pending_force_remove_session: None,
+            pending_archive_delete_session: None,
             pending_branch_refresh: None,
             search_active: false,
             search_query: Input::default(),
@@ -508,6 +541,7 @@ impl HomeView {
         use crate::session::list_profiles;
 
         let mut all_instances = Vec::new();
+        let mut all_archived = Vec::new();
 
         // Re-discover profiles in "all" mode
         if self.active_profile.is_none() {
@@ -559,13 +593,38 @@ impl HomeView {
             }
             self.group_trees.insert(profile_name.clone(), new_tree);
             all_instances.extend(instances);
+
+            let config = resolve_config(profile_name).unwrap_or_default();
+            let mut archived = storage.prune_archive(config.session.archive_max_entries)?;
+            for entry in &mut archived {
+                entry.source_profile = profile_name.clone();
+                entry.instance.source_profile = profile_name.clone();
+            }
+            let archived_instances: Vec<Instance> = archived
+                .iter()
+                .map(|entry| entry.instance.clone())
+                .collect();
+            let mut archive_tree = GroupTree::new_with_groups(&archived_instances, &[]);
+            if let Some(old_tree) = self.archive_group_trees.get(profile_name) {
+                for g in old_tree.get_all_groups() {
+                    if g.collapsed {
+                        archive_tree.set_collapsed(&g.path, true);
+                    }
+                }
+            }
+            self.archive_group_trees
+                .insert(profile_name.clone(), archive_tree);
+            all_archived.extend(archived);
         }
 
         // Remove trees for profiles that no longer exist
         let storage_keys: Vec<String> = self.storages.keys().cloned().collect();
         self.group_trees.retain(|k, _| storage_keys.contains(k));
+        self.archive_group_trees
+            .retain(|k, _| storage_keys.contains(k));
 
         self.instances = all_instances;
+        self.archived_sessions = all_archived;
 
         // Re-inject any in-flight Creating stub that won't be on disk
         if let Some(ref stub_id) = self.creating_stub_id {
@@ -585,6 +644,11 @@ impl HomeView {
         let prev_selected_session = self.selected_session.clone();
         let prev_selected_group = self.selected_group.clone();
 
+        self.archive_map = self
+            .archived_sessions
+            .iter()
+            .map(|entry| (entry.id.clone(), entry.clone()))
+            .collect();
         self.flat_items = self.build_flat_items();
 
         // Try to restore cursor to the same session/group after rebuild
@@ -729,6 +793,36 @@ impl HomeView {
 
         if let Some(result) = self.deletion_poller.try_recv_result() {
             if result.success {
+                if result.archive_on_success {
+                    let profile = if result.instance.source_profile.is_empty() {
+                        "default"
+                    } else {
+                        &result.instance.source_profile
+                    };
+                    let archive_result = self
+                        .storages
+                        .get(profile)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("Storage not found for profile '{}'", profile)
+                        })
+                        .and_then(|storage| {
+                            storage.archive_instance(
+                                &result.instance,
+                                result.cleanup.clone(),
+                                result.archive_max_entries,
+                                None,
+                            )
+                        });
+
+                    if let Err(e) = archive_result {
+                        tracing::error!("Failed to archive deleted session: {}", e);
+                        self.mutate_instance(&result.session_id, |inst| {
+                            inst.status = Status::Error;
+                            inst.last_error = Some(format!("Failed to archive session: {}", e));
+                        });
+                        return true;
+                    }
+                }
                 self.remove_instance(&result.session_id);
                 self.rebuild_group_trees();
 
@@ -1286,6 +1380,52 @@ impl HomeView {
         self.instance_map.get(id)
     }
 
+    pub fn get_archived_session(&self, id: &str) -> Option<&ArchivedSession> {
+        self.archive_map.get(id)
+    }
+
+    pub fn get_display_instance(&self, id: &str) -> Option<&Instance> {
+        if self.view_mode == ViewMode::Archive {
+            self.archive_map.get(id).map(|entry| &entry.instance)
+        } else {
+            self.instance_map.get(id)
+        }
+    }
+
+    fn archive_instances(&self) -> Vec<Instance> {
+        self.archived_sessions
+            .iter()
+            .map(|entry| {
+                let mut instance = entry.instance.clone();
+                instance.source_profile = entry.source_profile.clone();
+                instance.status = crate::session::Status::Stopped;
+                instance
+            })
+            .collect()
+    }
+
+    fn instances_for_view(&self) -> Vec<Instance> {
+        if self.view_mode == ViewMode::Archive {
+            self.archive_instances()
+        } else {
+            self.instances.clone()
+        }
+    }
+
+    fn group_trees_for_view(&self) -> &HashMap<String, GroupTree> {
+        if self.view_mode == ViewMode::Archive {
+            &self.archive_group_trees
+        } else {
+            &self.group_trees
+        }
+    }
+
+    fn has_any_groups_for_view(&self) -> bool {
+        self.group_trees_for_view()
+            .values()
+            .any(|tree| !tree.get_all_groups().is_empty())
+    }
+
     /// Returns true if any session has an animated status (Running, Waiting, Starting,
     /// Creating), which means the TUI needs periodic redraws for spinner animation.
     pub fn has_animated_sessions(&self) -> bool {
@@ -1299,42 +1439,44 @@ impl HomeView {
     }
 
     pub(super) fn build_flat_items(&self) -> Vec<Item> {
+        let instances = self.instances_for_view();
+        let group_trees = self.group_trees_for_view();
+
         if self.group_by == GroupByMode::Project {
-            return self.build_flat_items_by_project();
+            return self.build_flat_items_by_project(&instances);
         }
 
         if let Some(profile) = &self.active_profile {
-            let filtered: Vec<Instance> = self
-                .instances
+            let filtered: Vec<Instance> = instances
                 .iter()
                 .filter(|i| i.source_profile == *profile)
                 .cloned()
                 .collect();
-            match self.group_trees.get(profile) {
+            match group_trees.get(profile) {
                 Some(tree) => flatten_tree(tree, &filtered, self.sort_order),
                 None => Vec::new(),
             }
         } else if self.storages.len() <= 1 {
-            match self.group_trees.values().next() {
-                Some(tree) => flatten_tree(tree, &self.instances, self.sort_order),
+            match group_trees.values().next() {
+                Some(tree) => flatten_tree(tree, &instances, self.sort_order),
                 None => Vec::new(),
             }
         } else {
-            flatten_tree_all_profiles(&self.instances, &self.group_trees, self.sort_order)
+            flatten_tree_all_profiles(&instances, group_trees, self.sort_order)
         }
     }
 
-    fn build_flat_items_by_project(&self) -> Vec<Item> {
+    fn build_flat_items_by_project(&self, instances: &[Instance]) -> Vec<Item> {
         // In project mode, always merge all sessions into one tree regardless of
         // profile count. Project grouping unifies by repo across profiles.
         let base_instances: Vec<Instance> = if let Some(profile) = &self.active_profile {
-            self.instances
+            instances
                 .iter()
                 .filter(|i| i.source_profile == *profile)
                 .cloned()
                 .collect()
         } else {
-            self.instances.clone()
+            instances.to_vec()
         };
 
         let grouped: Vec<Instance> = base_instances
@@ -1514,7 +1656,7 @@ impl HomeView {
             match item {
                 crate::session::Item::Session { id, .. } => {
                     return self
-                        .get_instance(id.as_str())
+                        .get_display_instance(id.as_str())
                         .map(|i| i.source_profile.clone());
                 }
                 crate::session::Item::Group { profile, path, .. } => {
@@ -1523,7 +1665,7 @@ impl HomeView {
                     }
                     // Fallback for single-profile mode: find any instance in this group
                     return self
-                        .instances
+                        .instances_for_view()
                         .iter()
                         .find(|i| {
                             i.group_path == *path || i.group_path.starts_with(&format!("{}/", path))
@@ -1541,13 +1683,6 @@ impl HomeView {
             .values()
             .flat_map(|t| t.get_all_groups())
             .collect()
-    }
-
-    /// Check if any profile has groups, without collecting them all.
-    pub(super) fn has_any_groups(&self) -> bool {
-        self.group_trees
-            .values()
-            .any(|t| !t.get_all_groups().is_empty())
     }
 
     /// Centralized instance addition: adds to both the `instances` vec

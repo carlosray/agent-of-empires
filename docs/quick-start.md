@@ -76,7 +76,10 @@ In the TUI, select the tool from the dropdown in the new session dialog.
 |-----|--------|
 | `n` | New session |
 | `Enter` | Attach to session |
-| `d` | Delete session |
+| `d` | Archive session |
+| `Ctrl+d` | Permanently delete session |
+| `a` | Toggle Archive view |
+| `r` | Restore selected archived session in Archive view |
 | `t` | Toggle Agent/Terminal view |
 | `D` | Open diff view |
 | `/` | Search sessions |

@@ -1,5 +1,6 @@
 //! Session management module
 
+mod archive;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
@@ -18,6 +19,7 @@ mod storage;
 pub(crate) mod tool_session;
 
 pub use crate::sound::{SoundConfig, SoundConfigOverride};
+pub use archive::{ArchiveCleanupOptions, ArchivedSession};
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_update_settings, load_config, save_config, Config, ContainerRuntimeName,

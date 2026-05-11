@@ -411,7 +411,7 @@ pub struct AppStateConfig {
 }
 
 /// Session-related configuration defaults
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// Default coding tool for new sessions (claude, opencode, vibe, codex)
     /// If not set or tool is unavailable, falls back to first available tool
@@ -439,6 +439,14 @@ pub struct SessionConfig {
     /// Track underlying tool sessions for supported agents and reuse them on restore.
     #[serde(default)]
     pub tool_session_tracking: bool,
+
+    /// Archive sessions when deleting them instead of removing their metadata permanently.
+    #[serde(default = "default_true")]
+    pub archive_on_delete: bool,
+
+    /// Maximum number of archived sessions to keep per profile.
+    #[serde(default = "default_archive_max_entries")]
+    pub archive_max_entries: u64,
 
     /// User-defined custom agents: name -> launch command
     /// (e.g., "lenovo-claude" = "ssh -t lenovo claude").
@@ -513,6 +521,24 @@ impl SessionConfig {
                     crate::agents::agent_names().join(", ")
                 );
             }
+        }
+    }
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            default_tool: None,
+            yolo_mode_default: false,
+            agent_extra_args: HashMap::new(),
+            agent_command_override: HashMap::new(),
+            agent_status_hooks: true,
+            tool_session_tracking: false,
+            archive_on_delete: true,
+            archive_max_entries: default_archive_max_entries(),
+            custom_agents: HashMap::new(),
+            agent_detect_as: HashMap::new(),
+            strict_hotkeys: false,
         }
     }
 }
@@ -680,6 +706,10 @@ impl Default for UpdatesConfig {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_archive_max_entries() -> u64 {
+    100
 }
 
 fn default_check_interval() -> u64 {

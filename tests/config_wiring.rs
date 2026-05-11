@@ -123,6 +123,19 @@ fn test_default_config_has_auto_cleanup_true() {
 }
 
 #[test]
+fn test_default_config_archives_on_delete_with_limit() {
+    let config = Config::default();
+    assert!(
+        config.session.archive_on_delete,
+        "Default session.archive_on_delete should be true"
+    );
+    assert_eq!(
+        config.session.archive_max_entries, 100,
+        "Default session.archive_max_entries should keep a bounded archive"
+    );
+}
+
+#[test]
 #[serial]
 fn test_config_roundtrip_preserves_auto_cleanup() {
     let _temp = setup_temp_home();
@@ -234,6 +247,21 @@ fn test_agent_command_override_roundtrip() {
         Some(&"--port 8080".to_string()),
         "agent_extra_args should survive save/load roundtrip"
     );
+}
+
+#[test]
+#[serial]
+fn test_archive_settings_roundtrip() {
+    let _temp = setup_temp_home();
+
+    let mut config = Config::default();
+    config.session.archive_on_delete = false;
+    config.session.archive_max_entries = 7;
+    save_config(&config).unwrap();
+
+    let loaded = Config::load().unwrap();
+    assert!(!loaded.session.archive_on_delete);
+    assert_eq!(loaded.session.archive_max_entries, 7);
 }
 
 #[test]
