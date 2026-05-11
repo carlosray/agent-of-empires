@@ -20,6 +20,7 @@ The active session list remains in `sessions.json`. Archive writes create `archi
 
 - `d` archives an active session when `session.archive_on_delete = true`.
 - `Ctrl+d` permanently deletes an active session and bypasses the archive.
+- In strict key mode, `Ctrl+Shift+D` is the permanent delete shortcut because `Ctrl+D` opens Diff View.
 - `a` toggles Archive View.
 - Archive View uses the same grouping and sorting controls as Agent View and Terminal View.
 - In Archive View, `r` restores the selected archived session when safe.
@@ -44,6 +45,16 @@ aoe remove <id-or-title> --permanent
 ```
 
 The web dashboard exposes an Archive view and session context actions for Archive and Delete permanently.
+
+## Deleting From tmux
+
+AoE stores the active AoE session id in tmux as a hidden `AOE_INSTANCE_ID` environment variable. A custom tmux binding can use that id to archive the current session from inside the attached agent session:
+
+```text
+bind-key X run-shell -b 'id=$(tmux show-environment -h -t "#{session_name}" AOE_INSTANCE_ID | sed -n "s/^AOE_INSTANCE_ID=//p"); test -n "$id" && aoe remove "$id"'
+```
+
+With the default settings, this archives the session and closes the tmux session. To bypass the archive, use `aoe remove --permanent "$id"` in the binding.
 
 ## Settings
 
