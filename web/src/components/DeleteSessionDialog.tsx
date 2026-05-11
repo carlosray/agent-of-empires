@@ -8,6 +8,7 @@ interface Props {
   hasManagedWorktree: boolean;
   isSandboxed: boolean;
   cleanupDefaults: CleanupDefaults;
+  permanent?: boolean;
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
   onCancel: () => void;
 }
@@ -18,6 +19,7 @@ export function DeleteSessionDialog({
   hasManagedWorktree,
   isSandboxed,
   cleanupDefaults,
+  permanent = false,
   onConfirm,
   onCancel,
 }: Props) {
@@ -65,14 +67,14 @@ export function DeleteSessionDialog({
         {/* Header */}
         <div className="px-5 py-4 border-b border-surface-700">
           <h2 className="text-sm font-semibold text-status-error">
-            Delete Session
+            {permanent ? "Delete Session Permanently" : "Archive Session"}
           </h2>
         </div>
 
         {/* Body */}
         <div className="px-5 py-4 space-y-3">
           <p className="text-[13px] text-text-secondary">
-            Delete{" "}
+            {permanent ? "Permanently delete " : "Archive "}
             <span className="font-mono text-text-primary">{sessionTitle}</span>?
           </p>
 
@@ -136,7 +138,7 @@ export function DeleteSessionDialog({
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}
-            {deleting ? "Deleting..." : "Delete"}
+            {deleting ? (permanent ? "Deleting..." : "Archiving...") : (permanent ? "Delete" : "Archive")}
           </button>
         </div>
       </div>

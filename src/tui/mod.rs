@@ -3,7 +3,7 @@
 mod app;
 mod components;
 mod creation_poller;
-mod deletion_poller;
+pub(crate) mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 mod home;

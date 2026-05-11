@@ -114,10 +114,13 @@ To override the generated name, focus Worktree and press `Ctrl+P`, then fill in 
 | Key | Action |
 |-----|--------|
 | `t` | Toggle between Agent View and Terminal View |
+| `a` | Toggle Archive View |
 | `D` | Open [Diff View](diff-view.md) to review git changes |
 | `Enter` | Attach to agent (Agent View) or terminal (Terminal View) |
 | `n` | Create new session |
-| `d` | Delete session (Agent View only) |
+| `d` | Archive session (Agent View only), permanently delete archived session in Archive View |
+| `Ctrl+d` | Permanently delete active session |
+| `r` | Restore selected archived session in Archive View |
 | `?` | Show help |
 | `Ctrl+b d` | Detach from tmux (return to aoe) |
 

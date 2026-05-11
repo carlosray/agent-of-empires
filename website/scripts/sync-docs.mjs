@@ -168,6 +168,13 @@ const PAGES = [
       "Opt-in tracking of underlying agent sessions so AoE can show the current tool session ID and reuse it when restoring tmux.",
   },
   {
+    source: "docs/fork-features/session-archive.md",
+    dest: "docs/fork-features/session-archive.md",
+    title: "Session Archive",
+    description:
+      "Archive deleted sessions by default, view them separately, restore safe metadata, or permanently delete archived entries.",
+  },
+  {
     source: "docs/fork-features/terminal-tab-title.md",
     dest: "docs/fork-features/terminal-tab-title.md",
     title: "Terminal Tab Titles on Attach",
@@ -204,6 +211,7 @@ const URL_MAP = {
   "docs/fork-features/index.md": "/docs/fork-features/",
   "docs/fork-features/git-branch-display.md": "/docs/fork-features/git-branch-display/",
   "docs/fork-features/tool-session-tracking.md": "/docs/fork-features/tool-session-tracking/",
+  "docs/fork-features/session-archive.md": "/docs/fork-features/session-archive/",
   "docs/fork-features/terminal-tab-title.md": "/docs/fork-features/terminal-tab-title/",
   "docs/cockpit.md": "/docs/cockpit/",
   "docs/api.md": "/docs/api/",

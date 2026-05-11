@@ -9,6 +9,7 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  ArchivedSessionResponse,
 } from "./types";
 
 // GET a JSON endpoint; returns null on non-2xx or network/parse errors.
@@ -26,6 +27,32 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<T | null> 
 
 export function fetchSessions(): Promise<SessionResponse[] | null> {
   return fetchJson<SessionResponse[]>("/api/sessions");
+}
+
+export async function fetchArchive(): Promise<ArchivedSessionResponse[] | null> {
+  return fetchJson<ArchivedSessionResponse[]>("/api/archive");
+}
+
+export async function restoreArchivedSession(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/archive/${id}/restore`, {
+      method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function deleteArchivedSession(id: string): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/archive/${id}`, {
+      method: "DELETE",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 export interface EnsureSessionResult {
@@ -521,6 +548,8 @@ export interface DeleteSessionOptions {
   delete_branch?: boolean;
   delete_sandbox?: boolean;
   force_delete?: boolean;
+  permanent?: boolean;
+  archive?: boolean;
 }
 
 export interface DeleteSessionResult {

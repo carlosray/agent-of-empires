@@ -894,6 +894,12 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}",
             patch(api::rename_session).delete(api::delete_session),
         )
+        .route("/api/archive", get(api::list_archive))
+        .route("/api/archive/{id}", delete(api::delete_archived_session))
+        .route(
+            "/api/archive/{id}/restore",
+            post(api::restore_archived_session),
+        )
         .route(
             "/api/sessions/{id}/diff/files",
             get(api::session_diff_files),

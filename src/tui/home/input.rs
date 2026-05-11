@@ -342,6 +342,7 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_force_remove_session = None;
+                    self.pending_archive_delete_session = None;
                     self.pending_branch_refresh = None;
                 }
                 DialogResult::Submit(_) => {
@@ -359,6 +360,15 @@ impl HomeView {
                         if let Some(session_id) = self.pending_force_remove_session.take() {
                             if let Err(e) = self.force_remove_session(&session_id) {
                                 tracing::error!("Failed to force remove session: {}", e);
+                            }
+                        }
+                    } else if action == "delete_archived_session" {
+                        if let Some(session_id) = self.pending_archive_delete_session.take() {
+                            if let Err(e) = self.delete_archived_session(&session_id) {
+                                self.info_dialog = Some(InfoDialog::new(
+                                    "Archive Delete",
+                                    &format!("Failed to delete archived session: {}", e),
+                                ));
                             }
                         }
                     } else if action == "quit_during_creation" {
@@ -393,12 +403,20 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
+                    self.delete_dialog_allow_archive = true;
                 }
                 DialogResult::Submit(options) => {
+                    let allow_archive = self.delete_dialog_allow_archive;
                     self.unified_delete_dialog = None;
-                    if let Err(e) = self.delete_selected(&options) {
+                    let result = if allow_archive {
+                        self.delete_selected(&options)
+                    } else {
+                        self.delete_selected_permanently(&options)
+                    };
+                    if let Err(e) = result {
                         tracing::error!("Failed to delete session: {}", e);
                     }
+                    self.delete_dialog_allow_archive = true;
                 }
             }
             return None;
@@ -686,12 +704,29 @@ impl HomeView {
                 self.view_mode = match self.view_mode {
                     ViewMode::Agent => ViewMode::Terminal,
                     ViewMode::Terminal => ViewMode::Agent,
+                    ViewMode::Archive => ViewMode::Agent,
                 };
+                self.flat_items = self.build_flat_items();
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
+            }
+            KeyCode::Char('a') => {
+                self.view_mode = if self.view_mode == ViewMode::Archive {
+                    ViewMode::Agent
+                } else {
+                    ViewMode::Archive
+                };
+                self.flat_items = self.build_flat_items();
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
             }
             KeyCode::Char('T') => {
+                if self.view_mode == ViewMode::Archive {
+                    return None;
+                }
                 // Quick-attach to paired terminal from any view
                 if let Some(id) = &self.selected_session {
-                    if let Some(inst) = self.get_instance(id) {
+                    if let Some(inst) = self.get_display_instance(id) {
                         if matches!(inst.status, Status::Deleting | Status::Creating) {
                             return None;
                         }
@@ -934,6 +969,24 @@ impl HomeView {
                 self.refresh_selected_branch();
             }
             KeyCode::Char('d') => {
+                let allow_archive = !key.modifiers.contains(KeyModifiers::CONTROL);
+                if self.view_mode == ViewMode::Archive {
+                    if let Some(session_id) = &self.selected_session {
+                        if let Some(entry) = self.get_archived_session(session_id) {
+                            let message = format!(
+                                "Permanently delete archived session '{}'?",
+                                entry.instance.title
+                            );
+                            self.pending_archive_delete_session = Some(session_id.clone());
+                            self.confirm_dialog = Some(ConfirmDialog::new(
+                                "Delete Archived Session",
+                                &message,
+                                "delete_archived_session",
+                            ));
+                        }
+                    }
+                    return None;
+                }
                 // Deletion only allowed in Agent View
                 if self.view_mode == ViewMode::Terminal {
                     self.info_dialog = Some(InfoDialog::new(
@@ -972,20 +1025,43 @@ impl HomeView {
                             has_sandbox: inst.sandbox_info.as_ref().is_some_and(|s| s.enabled),
                             project_path: Some(inst.project_path.clone()),
                         };
+                        let title = inst.title.clone();
 
-                        let profile = self.active_profile.as_deref().unwrap_or("default");
-                        self.unified_delete_dialog = Some(UnifiedDeleteDialog::new(
-                            inst.title.clone(),
-                            config,
-                            profile,
-                        ));
+                        let profile = if inst.source_profile.is_empty() {
+                            self.active_profile
+                                .as_deref()
+                                .unwrap_or("default")
+                                .to_string()
+                        } else {
+                            inst.source_profile.clone()
+                        };
+                        let archive_on_confirm = if allow_archive {
+                            self.archive_settings_for_instance(inst, true).0
+                        } else {
+                            false
+                        };
+                        self.delete_dialog_allow_archive = archive_on_confirm;
+                        self.unified_delete_dialog = Some(if archive_on_confirm {
+                            UnifiedDeleteDialog::new(title, config, &profile)
+                        } else {
+                            UnifiedDeleteDialog::new_permanent(title, config, &profile)
+                        });
                     } else {
                         let profile = self.active_profile.as_deref().unwrap_or("default");
-                        self.unified_delete_dialog = Some(UnifiedDeleteDialog::new(
-                            "Unknown Session".to_string(),
-                            DeleteDialogConfig::default(),
-                            profile,
-                        ));
+                        self.delete_dialog_allow_archive = allow_archive;
+                        self.unified_delete_dialog = Some(if allow_archive {
+                            UnifiedDeleteDialog::new(
+                                "Unknown Session".to_string(),
+                                DeleteDialogConfig::default(),
+                                profile,
+                            )
+                        } else {
+                            UnifiedDeleteDialog::new_permanent(
+                                "Unknown Session".to_string(),
+                                DeleteDialogConfig::default(),
+                                profile,
+                            )
+                        });
                     }
                 } else if let Some(group_path) = &self.selected_group {
                     if self.group_by == GroupByMode::Project {
@@ -1023,8 +1099,17 @@ impl HomeView {
                 }
             }
             KeyCode::Char('r') => {
+                if self.view_mode == ViewMode::Archive {
+                    if let Err(e) = self.restore_selected_archive() {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Restore Archived Session",
+                            &format!("Failed to restore archived session: {}", e),
+                        ));
+                    }
+                    return None;
+                }
                 if let Some(id) = &self.selected_session {
-                    if let Some(inst) = self.get_instance(id) {
+                    if let Some(inst) = self.get_display_instance(id) {
                         if matches!(inst.status, Status::Deleting | Status::Creating) {
                             return None;
                         }
@@ -1141,7 +1226,7 @@ impl HomeView {
             }
             KeyCode::Enter => {
                 if let Some(id) = &self.selected_session {
-                    if let Some(inst) = self.get_instance(id) {
+                    if let Some(inst) = self.get_display_instance(id) {
                         if matches!(inst.status, Status::Deleting | Status::Creating) {
                             return None;
                         }
@@ -1166,6 +1251,7 @@ impl HomeView {
                             };
                             Some(Action::AttachTerminal(id.clone(), terminal_mode))
                         }
+                        ViewMode::Archive => None,
                     };
                 } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
                     let path = path.clone();
@@ -1489,6 +1575,10 @@ impl HomeView {
             if self.selected_session != prev_session {
                 self.preview_scroll_offset = 0;
             }
+        } else {
+            self.selected_session = None;
+            self.selected_group = None;
+            self.selected_group_profile = None;
         }
     }
 
@@ -1542,13 +1632,20 @@ impl HomeView {
         // Route to the correct profile's GroupTree
         let profile = self.profile_for_cursor(self.cursor);
         if let Some(profile) = profile {
-            if let Some(tree) = self.group_trees.get_mut(&profile) {
+            let trees = if self.view_mode == ViewMode::Archive {
+                &mut self.archive_group_trees
+            } else {
+                &mut self.group_trees
+            };
+            if let Some(tree) = trees.get_mut(&profile) {
                 tree.toggle_collapsed(path);
             }
         }
         self.flat_items = self.build_flat_items();
-        if let Err(e) = self.save() {
-            tracing::error!("Failed to save group state: {}", e);
+        if self.view_mode != ViewMode::Archive {
+            if let Err(e) = self.save() {
+                tracing::error!("Failed to save group state: {}", e);
+            }
         }
     }
 
@@ -1585,6 +1682,7 @@ impl HomeView {
                     TerminalMode::Host => &self.terminal_preview_cache,
                 }
             }
+            ViewMode::Archive => return false,
         };
 
         let visible_height = active_cache.dimensions.1.saturating_sub(1) as usize;
@@ -1664,7 +1762,7 @@ impl HomeView {
         for (idx, item) in self.flat_items.iter().enumerate() {
             let haystack = match item {
                 Item::Session { id, .. } => {
-                    if let Some(inst) = self.get_instance(id) {
+                    if let Some(inst) = self.get_display_instance(id) {
                         format!("{} {}", inst.title, inst.project_path)
                     } else {
                         continue;
@@ -1825,6 +1923,11 @@ impl HomeView {
         }
 
         match key.code {
+            // Ctrl+Shift+D is the strict-mode hard-delete shortcut. Ctrl+D is
+            // reserved for diff view in strict mode.
+            KeyCode::Char('D') if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Some(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL))
+            }
             // Ctrl+letter relocations: map to the uppercase letter they replace
             // Ctrl+T -> T (attach terminal), Ctrl+D -> D (diff view),
             // Ctrl+R -> R (serve), Ctrl+P -> P (profiles), Ctrl+N -> N (new from selection)
@@ -1841,7 +1944,7 @@ impl HomeView {
             // Shifted action letters: map to lowercase equivalents
             // N->n (new), X->x (stop), S->s (settings), M->m (message),
             // T->t (toggle view), C->c (container toggle), Q->q (quit), O->o (sort)
-            KeyCode::Char(c @ ('N' | 'X' | 'S' | 'M' | 'T' | 'C' | 'Q' | 'O'))
+            KeyCode::Char(c @ ('N' | 'X' | 'S' | 'M' | 'T' | 'A' | 'C' | 'Q' | 'O'))
                 if bare || shift_only =>
             {
                 Some(KeyEvent::new(
@@ -1859,7 +1962,7 @@ impl HomeView {
             // `p` opens the Projects panel in non-strict mode; in strict mode reach it
             // via the command palette (Ctrl+K → "Manage projects").
             KeyCode::Char(
-                'q' | 'n' | 't' | 'c' | 's' | 'd' | 'x' | 'r' | 'm' | 'o' | 'g' | 'p',
+                'q' | 'n' | 't' | 'a' | 'c' | 's' | 'd' | 'x' | 'r' | 'm' | 'o' | 'g' | 'p',
             ) if bare => None,
             // Everything else passes through unchanged (navigation, ?, /, Enter, etc.)
             _ => Some(key),

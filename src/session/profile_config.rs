@@ -221,6 +221,12 @@ pub struct SessionConfigOverride {
     pub tool_session_tracking: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_on_delete: Option<bool>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_max_entries: Option<u64>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_agents: Option<HashMap<String, String>>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -431,6 +437,12 @@ pub fn apply_session_overrides(
     }
     if let Some(tool_session_tracking) = source.tool_session_tracking {
         target.tool_session_tracking = tool_session_tracking;
+    }
+    if let Some(archive_on_delete) = source.archive_on_delete {
+        target.archive_on_delete = archive_on_delete;
+    }
+    if let Some(archive_max_entries) = source.archive_max_entries {
+        target.archive_max_entries = archive_max_entries;
     }
     if let Some(ref custom_agents) = source.custom_agents {
         target.custom_agents = custom_agents.clone();

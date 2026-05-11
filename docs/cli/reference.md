@@ -9,6 +9,11 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe agents`↴](#aoe-agents)
 * [`aoe init`↴](#aoe-init)
 * [`aoe list`↴](#aoe-list)
+* [`aoe archive`↴](#aoe-archive)
+* [`aoe archive list`↴](#aoe-archive-list)
+* [`aoe archive show`↴](#aoe-archive-show)
+* [`aoe archive restore`↴](#aoe-archive-restore)
+* [`aoe archive delete`↴](#aoe-archive-delete)
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
@@ -75,6 +80,7 @@ Run without arguments to launch the TUI dashboard.
 * `agents` — List supported agents and their install status
 * `init` — Initialize .agent-of-empires/config.toml in a repository
 * `list` — List all sessions
+* `archive` — View, restore, or permanently delete archived sessions
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
@@ -169,6 +175,70 @@ List all sessions
 
 
 
+## `aoe archive`
+
+View, restore, or permanently delete archived sessions
+
+**Usage:** `aoe archive <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List archived sessions
+* `show` — Show archived session details
+* `restore` — Restore an archived session
+* `delete` — Permanently delete an archived session
+
+
+
+## `aoe archive list`
+
+List archived sessions
+
+**Usage:** `aoe archive list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output as JSON
+* `--all` — List archived sessions from all profiles
+
+
+
+## `aoe archive show`
+
+Show archived session details
+
+**Usage:** `aoe archive show <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Archived session ID, ID prefix, title, or path
+
+
+
+## `aoe archive restore`
+
+Restore an archived session
+
+**Usage:** `aoe archive restore <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Archived session ID, ID prefix, title, or path
+
+
+
+## `aoe archive delete`
+
+Permanently delete an archived session
+
+**Usage:** `aoe archive delete <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Archived session ID, ID prefix, title, or path
+
+
+
 ## `aoe remove`
 
 Remove a session
@@ -185,6 +255,7 @@ Remove a session
 * `--delete-branch` — Delete git branch after worktree removal (default: per config)
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
+* `--permanent` — Permanently delete instead of archiving
 
 
 

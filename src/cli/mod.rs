@@ -2,6 +2,7 @@
 
 pub mod add;
 pub mod agents;
+pub mod archive;
 #[cfg(feature = "serve")]
 pub mod cockpit;
 pub mod definition;

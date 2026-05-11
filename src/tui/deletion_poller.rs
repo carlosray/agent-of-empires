@@ -78,6 +78,8 @@ mod tests {
             delete_branch: false,
             delete_sandbox: false,
             force_delete: false,
+            archive_on_success: false,
+            archive_max_entries: 100,
         });
 
         let mut result = None;

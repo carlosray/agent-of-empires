@@ -1,6 +1,8 @@
 //! Integration tests for the core session lifecycle: create, persist, load, remove.
 
-use agent_of_empires::session::{GroupTree, Instance, Storage};
+use agent_of_empires::session::{
+    ArchiveCleanupOptions, GroupTree, Instance, SandboxInfo, Status, Storage, TerminalInfo,
+};
 use anyhow::Result;
 use serial_test::serial;
 use std::fs;
@@ -186,6 +188,101 @@ fn test_storage_defaults_to_default_profile() -> Result<()> {
     storage.save(&instances)?;
     let loaded = storage.load()?;
     assert_eq!(loaded.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_archive_session_roundtrip() -> Result<()> {
+    let _temp = setup_temp_home();
+
+    let storage = Storage::new("default")?;
+    let mut instance = Instance::new("Archived", "/tmp/archived");
+    instance.status = Status::Running;
+
+    storage.archive_instance(&instance, ArchiveCleanupOptions::default(), 100, None)?;
+
+    let archived = storage.load_archive()?;
+    assert_eq!(archived.len(), 1);
+    assert_eq!(archived[0].id, instance.id);
+    assert_eq!(archived[0].instance.title, "Archived");
+    assert_eq!(archived[0].source_profile, "default");
+    assert_eq!(archived[0].last_status, Status::Running);
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_archive_prunes_to_max_entries() -> Result<()> {
+    let _temp = setup_temp_home();
+
+    let storage = Storage::new("default")?;
+    let first = Instance::new("First", "/tmp/first");
+    let second = Instance::new("Second", "/tmp/second");
+    let third = Instance::new("Third", "/tmp/third");
+
+    storage.archive_instance(&first, ArchiveCleanupOptions::default(), 2, None)?;
+    storage.archive_instance(&second, ArchiveCleanupOptions::default(), 2, None)?;
+    storage.archive_instance(&third, ArchiveCleanupOptions::default(), 2, None)?;
+
+    let archived = storage.load_archive()?;
+    assert_eq!(archived.len(), 2);
+    assert!(archived.iter().any(|entry| entry.id == second.id));
+    assert!(archived.iter().any(|entry| entry.id == third.id));
+    assert!(!archived.iter().any(|entry| entry.id == first.id));
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_archived_restore_instance_is_safe_partial_restore() -> Result<()> {
+    let temp = setup_temp_home();
+    let project_path = temp.path().join("project");
+    fs::create_dir_all(&project_path)?;
+
+    let storage = Storage::new("default")?;
+    let mut instance = Instance::new("Restore", project_path.to_string_lossy().as_ref());
+    instance.status = Status::Running;
+    instance.last_error = Some("old failure".to_string());
+    instance.terminal_info = Some(TerminalInfo { created: true });
+    instance.sandbox_info = Some(SandboxInfo {
+        enabled: true,
+        container_id: Some("stale-container".to_string()),
+        image: "ubuntu:latest".to_string(),
+        container_name: "aoe-test".to_string(),
+        extra_env: None,
+        custom_instruction: None,
+    });
+
+    storage.archive_instance(&instance, ArchiveCleanupOptions::default(), 100, None)?;
+    let archived = storage.load_archive()?;
+    let restored = archived[0].restore_instance()?;
+
+    assert_eq!(restored.id, instance.id);
+    assert_eq!(restored.status, Status::Stopped);
+    assert!(restored.terminal_info.is_none());
+    assert!(restored.last_error.is_none());
+    let sandbox = restored.sandbox_info.as_ref().unwrap();
+    assert!(sandbox.container_id.is_none());
+
+    Ok(())
+}
+
+#[test]
+#[serial]
+fn test_archived_restore_fails_when_project_path_is_missing() -> Result<()> {
+    let _temp = setup_temp_home();
+
+    let storage = Storage::new("default")?;
+    let instance = Instance::new("Missing", "/tmp/aoe-missing-restore-path");
+    storage.archive_instance(&instance, ArchiveCleanupOptions::default(), 100, None)?;
+
+    let archived = storage.load_archive()?;
+    let err = archived[0].restore_instance().unwrap_err();
+    assert!(err.to_string().contains("project path does not exist"));
 
     Ok(())
 }

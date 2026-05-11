@@ -6,7 +6,7 @@ use clap::Args;
 use crate::containers;
 use crate::git::cleanup::remove_managed_worktree;
 use crate::git::GitWorktree;
-use crate::session::{GroupTree, Instance, Storage};
+use crate::session::{ArchiveCleanupOptions, GroupTree, Instance, Storage};
 use std::path::PathBuf;
 
 #[derive(Args)]
@@ -29,6 +29,10 @@ pub struct RemoveArgs {
     /// Keep container instead of deleting it (default: delete per config)
     #[arg(long = "keep-container")]
     keep_container: bool,
+
+    /// Permanently delete instead of archiving
+    #[arg(long = "permanent")]
+    permanent: bool,
 }
 
 fn needs_worktree_cleanup(inst: &Instance, args: &RemoveArgs) -> bool {
@@ -42,6 +46,7 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let (instances, groups) = storage.load_with_groups()?;
 
     let mut found = false;
+    let mut archived_any = false;
     let mut removed_title = String::new();
     let mut new_instances = Vec::with_capacity(instances.len());
 
@@ -224,6 +229,24 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     println!("Container preserved: {}", sandbox.container_name);
                 }
             }
+
+            let should_archive = config.session.archive_on_delete && !args.permanent;
+            if should_archive {
+                storage.archive_instance(
+                    &inst,
+                    ArchiveCleanupOptions {
+                        delete_worktree: will_cleanup_worktree,
+                        delete_branch: will_delete_branch,
+                        delete_sandbox: inst.sandbox_info.as_ref().is_some_and(|sandbox| {
+                            sandbox.enabled && !args.keep_container && config.sandbox.auto_cleanup
+                        }),
+                        force_delete: args.force,
+                    },
+                    config.session.archive_max_entries,
+                    None,
+                )?;
+                archived_any = true;
+            }
         } else {
             new_instances.push(inst);
         }
@@ -241,8 +264,14 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let group_tree = GroupTree::new_with_groups(&new_instances, &groups);
     storage.save_with_groups(&new_instances, &group_tree)?;
 
+    let action = if archived_any {
+        "Archived session"
+    } else {
+        "Removed session permanently"
+    };
     println!(
-        "  Removed session: {} (from profile '{}')",
+        "  {}: {} (from profile '{}')",
+        action,
         removed_title,
         storage.profile()
     );

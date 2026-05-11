@@ -47,6 +47,7 @@ Running one AI agent is easy. Running five of them across different branches, ke
 - **Git worktrees**: run parallel agents on different branches of the same repo
 - **Docker sandboxing**: isolate agents in containers with shared auth volumes
 - **Diff view**: review git changes and edit files without leaving the TUI
+- **Session archive**: deleted sessions are archived by default and can be viewed or safely restored later
 - **Profiles**: separate workspaces for different projects or clients
 
 ## Web Dashboard (Beta, stabilization in progress)

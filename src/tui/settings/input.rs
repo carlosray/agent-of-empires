@@ -666,6 +666,16 @@ impl SettingsView {
                     s.strict_hotkeys = None;
                 }
             }
+            FieldKey::ArchiveOnDelete => {
+                if let Some(ref mut s) = config.session {
+                    s.archive_on_delete = None;
+                }
+            }
+            FieldKey::ArchiveMaxEntries => {
+                if let Some(ref mut s) = config.session {
+                    s.archive_max_entries = None;
+                }
+            }
             FieldKey::AgentExtraArgs => {
                 if let Some(ref mut s) = config.session {
                     s.agent_extra_args = None;

@@ -1,7 +1,7 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
-use crate::session::{list_profiles, GroupTree, Status, Storage};
+use crate::session::{list_profiles, resolve_config, GroupTree, Instance, Status, Storage};
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, NewSessionData};
 
@@ -73,22 +73,42 @@ impl HomeView {
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
+        self.delete_selected_with_archive(options, true)
+    }
+
+    pub(super) fn delete_selected_permanently(
+        &mut self,
+        options: &DeleteOptions,
+    ) -> anyhow::Result<()> {
+        self.delete_selected_with_archive(options, false)
+    }
+
+    fn delete_selected_with_archive(
+        &mut self,
+        options: &DeleteOptions,
+        allow_archive: bool,
+    ) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
+            let Some(inst) = self.get_instance(&id).cloned() else {
+                return Ok(());
+            };
+            let (archive_on_success, archive_max_entries) =
+                self.archive_settings_for_instance(&inst, allow_archive);
 
             self.set_instance_status(&id, Status::Deleting);
 
-            if let Some(inst) = self.get_instance(&id) {
-                let request = DeletionRequest {
-                    session_id: id.clone(),
-                    instance: inst.clone(),
-                    delete_worktree: options.delete_worktree,
-                    delete_branch: options.delete_branch,
-                    delete_sandbox: options.delete_sandbox,
-                    force_delete: options.force_delete,
-                };
-                self.deletion_poller.request_deletion(request);
-            }
+            let request = DeletionRequest {
+                session_id: id.clone(),
+                instance: inst,
+                delete_worktree: options.delete_worktree,
+                delete_branch: options.delete_branch,
+                delete_sandbox: options.delete_sandbox,
+                force_delete: options.force_delete,
+                archive_on_success,
+                archive_max_entries,
+            };
+            self.deletion_poller.request_deletion(request);
         }
         Ok(())
     }
@@ -151,42 +171,48 @@ impl HomeView {
                 .collect();
 
             for session_id in sessions_to_delete {
+                let Some(inst) = self.get_instance(&session_id).cloned() else {
+                    continue;
+                };
+                let delete_worktree = options.delete_worktrees
+                    && (inst
+                        .worktree_info
+                        .as_ref()
+                        .is_some_and(|wt| wt.managed_by_aoe)
+                        || inst
+                            .workspace_info
+                            .as_ref()
+                            .is_some_and(|ws| ws.cleanup_on_delete));
+                let delete_branch = options.delete_branches
+                    && (inst
+                        .worktree_info
+                        .as_ref()
+                        .is_some_and(|wt| wt.managed_by_aoe)
+                        || inst
+                            .workspace_info
+                            .as_ref()
+                            .is_some_and(|ws| ws.cleanup_on_delete));
+                let delete_sandbox = options.delete_containers
+                    && inst.sandbox_info.as_ref().is_some_and(|s| s.enabled);
+                let (archive_on_success, archive_max_entries) =
+                    self.archive_settings_for_instance(&inst, true);
+
                 self.mutate_instance(&session_id, |inst| {
                     inst.status = Status::Deleting;
                     inst.group_path = String::new();
                 });
 
-                if let Some(inst) = self.get_instance(&session_id) {
-                    let delete_worktree = options.delete_worktrees
-                        && (inst
-                            .worktree_info
-                            .as_ref()
-                            .is_some_and(|wt| wt.managed_by_aoe)
-                            || inst
-                                .workspace_info
-                                .as_ref()
-                                .is_some_and(|ws| ws.cleanup_on_delete));
-                    let delete_branch = options.delete_branches
-                        && (inst
-                            .worktree_info
-                            .as_ref()
-                            .is_some_and(|wt| wt.managed_by_aoe)
-                            || inst
-                                .workspace_info
-                                .as_ref()
-                                .is_some_and(|ws| ws.cleanup_on_delete));
-                    let delete_sandbox = options.delete_containers
-                        && inst.sandbox_info.as_ref().is_some_and(|s| s.enabled);
-                    let request = DeletionRequest {
-                        session_id: session_id.clone(),
-                        instance: inst.clone(),
-                        delete_worktree,
-                        delete_branch,
-                        delete_sandbox,
-                        force_delete: options.force_delete_worktrees,
-                    };
-                    self.deletion_poller.request_deletion(request);
-                }
+                let request = DeletionRequest {
+                    session_id: session_id.clone(),
+                    instance: inst,
+                    delete_worktree,
+                    delete_branch,
+                    delete_sandbox,
+                    force_delete: options.force_delete_worktrees,
+                    archive_on_success,
+                    archive_max_entries,
+                };
+                self.deletion_poller.request_deletion(request);
             }
 
             if let Some(profile) = &owning_profile {
@@ -204,6 +230,34 @@ impl HomeView {
         Ok(())
     }
 
+    pub(super) fn archive_settings_for_instance(
+        &self,
+        inst: &Instance,
+        allow_archive: bool,
+    ) -> (bool, u64) {
+        if !allow_archive {
+            return (false, 1);
+        }
+
+        let profile = if inst.source_profile.is_empty() {
+            self.active_profile.as_deref().unwrap_or("default")
+        } else {
+            &inst.source_profile
+        };
+
+        let config = crate::session::repo_config::resolve_config_with_repo(
+            profile,
+            std::path::Path::new(&inst.project_path),
+        )
+        .or_else(|_| resolve_config(profile))
+        .unwrap_or_default();
+
+        (
+            config.session.archive_on_delete,
+            config.session.archive_max_entries,
+        )
+    }
+
     /// Force-remove a session from storage without any cleanup.
     /// Used for sessions stuck in the Deleting state where the background
     /// deletion thread never returned a result.
@@ -211,6 +265,52 @@ impl HomeView {
         self.remove_instance(session_id);
         self.rebuild_group_trees();
         self.save()?;
+        self.reload()?;
+        Ok(())
+    }
+
+    pub(super) fn restore_selected_archive(&mut self) -> anyhow::Result<()> {
+        let Some(session_id) = self.selected_session.clone() else {
+            return Ok(());
+        };
+        let Some(entry) = self.get_archived_session(&session_id).cloned() else {
+            return Ok(());
+        };
+        let profile = entry.source_profile.clone();
+        let active_instances: Vec<_> = self
+            .instances()
+            .iter()
+            .filter(|instance| instance.source_profile == profile)
+            .cloned()
+            .collect();
+
+        entry.validate_restore(&active_instances)?;
+        let restored = entry.restore_instance()?;
+
+        self.add_instance(restored);
+        self.rebuild_group_trees();
+        self.save()?;
+
+        let storage = self
+            .storages
+            .get(&profile)
+            .ok_or_else(|| anyhow::anyhow!("Storage not found for profile '{}'", profile))?;
+        storage.delete_archived_session(&session_id)?;
+
+        self.view_mode = super::ViewMode::Agent;
+        self.reload()?;
+        self.select_session_by_id(&session_id);
+        Ok(())
+    }
+
+    pub(super) fn delete_archived_session(&mut self, session_id: &str) -> anyhow::Result<()> {
+        let Some(entry) = self.get_archived_session(session_id).cloned() else {
+            return Ok(());
+        };
+        let storage = self.storages.get(&entry.source_profile).ok_or_else(|| {
+            anyhow::anyhow!("Storage not found for profile '{}'", entry.source_profile)
+        })?;
+        storage.delete_archived_session(session_id)?;
         self.reload()?;
         Ok(())
     }

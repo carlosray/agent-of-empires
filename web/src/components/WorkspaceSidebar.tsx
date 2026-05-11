@@ -41,6 +41,8 @@ interface Props {
   onSettings: () => void;
   onProjects: () => void;
   onDeleteSession?: (workspaceId: string) => void;
+  onArchiveSession?: (workspaceId: string) => void;
+  onPermanentDeleteSession?: (workspaceId: string) => void;
   readOnly?: boolean;
 }
 
@@ -119,6 +121,8 @@ const SessionRow = memo(function SessionRow({
   isActive,
   onClick,
   onDelete,
+  onArchive,
+  onPermanentDelete,
   readOnly,
   indented,
 }: {
@@ -126,6 +130,8 @@ const SessionRow = memo(function SessionRow({
   isActive: boolean;
   onClick: () => void;
   onDelete?: (workspaceId: string) => void;
+  onArchive?: (workspaceId: string) => void;
+  onPermanentDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   indented?: boolean;
 }) {
@@ -264,6 +270,16 @@ const SessionRow = memo(function SessionRow({
     setRenaming(true);
   };
 
+  const archiveSession = () => {
+    setContextMenu(null);
+    (onArchive ?? onDelete)?.(workspace.id);
+  };
+
+  const deleteSessionPermanently = () => {
+    setContextMenu(null);
+    onPermanentDelete?.(workspace.id);
+  };
+
   const commitRename = async () => {
     setRenaming(false);
     const trimmed = renameValue.trim();
@@ -272,11 +288,6 @@ const SessionRow = memo(function SessionRow({
     // the prefilled value should still set the title.
     if (!trimmed || trimmed === sessionTitle || !sessionId) return;
     await renameSession(sessionId, trimmed);
-  };
-
-  const handleDelete = () => {
-    setContextMenu(null);
-    onDelete?.(workspace.id);
   };
 
   if (renaming) {
@@ -375,6 +386,24 @@ const SessionRow = memo(function SessionRow({
             Rename
           </button>
           <div className="border-t border-surface-700/20 my-1" />
+          {!readOnly && (
+            <>
+              <div className="border-t border-surface-700/20 my-1" />
+              <button
+                onClick={archiveSession}
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+              >
+                Archive
+              </button>
+              <button
+                onClick={deleteSessionPermanently}
+                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
+              >
+                Delete permanently
+              </button>
+            </>
+          )}
+          <div className="border-t border-surface-700/20 my-1" />
           <div className="px-3 py-1 text-[11px] font-mono uppercase tracking-widest text-text-muted">
             Notifications
           </div>
@@ -401,17 +430,6 @@ const SessionRow = memo(function SessionRow({
               </button>
             );
           })}
-          {!readOnly && (
-            <>
-              <div className="border-t border-surface-700/20 my-1" />
-              <button
-                onClick={handleDelete}
-                className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
-              >
-                Delete
-              </button>
-            </>
-          )}
         </div>,
         document.body,
       )}
@@ -512,6 +530,8 @@ export function WorkspaceSidebar({
   onSettings,
   onProjects,
   onDeleteSession,
+  onArchiveSession,
+  onPermanentDeleteSession,
   readOnly,
 }: Props) {
   const [width, setWidth] = useState(loadSavedWidth);
@@ -694,6 +714,8 @@ export function WorkspaceSidebar({
                       isActive={ws.id === activeId}
                       onClick={() => onSelect(ws.id)}
                       onDelete={onDeleteSession}
+                      onArchive={onArchiveSession}
+                      onPermanentDelete={onPermanentDeleteSession}
                       readOnly={readOnly}
                       indented
                     />

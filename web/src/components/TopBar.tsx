@@ -10,6 +10,8 @@ interface Props {
   onOpenPalette: () => void;
   onToggleDiff: () => void;
   diffCollapsed: boolean;
+  onOpenSettings: () => void;
+  onOpenArchive: () => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onLogout: () => void;
@@ -25,6 +27,8 @@ export function TopBar({
   onOpenPalette,
   onToggleDiff,
   diffCollapsed,
+  onOpenSettings,
+  onOpenArchive,
   onOpenHelp,
   onOpenAbout,
   onLogout,
@@ -37,12 +41,14 @@ export function TopBar({
 
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
+      { label: "Settings", onClick: onOpenSettings },
+      { label: "Archive", onClick: onOpenArchive },
       { label: "Help", onClick: onOpenHelp },
       { label: "About", onClick: onOpenAbout },
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenHelp, onOpenAbout, onLogout, loginRequired]);
+  }, [onOpenSettings, onOpenArchive, onOpenHelp, onOpenAbout, onLogout, loginRequired]);
 
   return (
     <header className="h-12 bg-surface-800 border-b border-surface-700/20 flex items-center px-3 shrink-0 gap-2">
