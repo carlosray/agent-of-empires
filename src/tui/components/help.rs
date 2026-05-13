@@ -13,7 +13,7 @@ const BORDER_HEIGHT: u16 = 2;
 #[cfg(test)]
 const BORDER_WIDTH: u16 = 2;
 #[cfg(test)]
-const KEY_COLUMN_WIDTH: usize = 12; // 2 spaces indent + 10 chars for key
+const KEY_COLUMN_WIDTH: usize = 13; // 2 spaces indent + 11 chars for key
 
 fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str)>)> {
     if strict {
@@ -25,8 +25,8 @@ fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str
                     ("k/↑", "Move up"),
                     ("h/←", "Collapse group"),
                     ("l/→", "Expand group"),
-                    ("Home/End", "Go to top / bottom"),
-                    ("PgUp/Dn", "Move 10 items up / down"),
+                    ("Home/End/G", "Go to top / bottom"),
+                    ("PgUp/Dn", "Move 10 (also Shift+↑/↓, { })"),
                     ("w", "Next waiting/idle session"),
                 ],
             ),
@@ -81,8 +81,8 @@ fn shortcuts(strict: bool) -> Vec<(&'static str, Vec<(&'static str, &'static str
                     ("k/↑", "Move up"),
                     ("h/←", "Collapse group"),
                     ("l/→", "Expand group"),
-                    ("Home/End", "Go to top / bottom"),
-                    ("PgUp/Dn", "Move 10 items up / down"),
+                    ("Home/End/G", "Go to top / bottom"),
+                    ("PgUp/Dn", "Move 10 (also Shift+↑/↓, { })"),
                     ("w", "Next waiting/idle session"),
                 ],
             ),
@@ -202,7 +202,7 @@ impl HelpOverlay {
             )));
             for (key, desc) in keys {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {:10}", key), Style::default().fg(theme.waiting)),
+                    Span::styled(format!("  {:11}", key), Style::default().fg(theme.waiting)),
                     Span::styled(*desc, Style::default().fg(theme.text)),
                 ]));
             }
@@ -210,7 +210,7 @@ impl HelpOverlay {
             // Add sort label after "Views" section
             if *section == "Views" {
                 lines.push(Line::from(vec![
-                    Span::styled(format!("  {:10}", ""), Style::default().fg(theme.waiting)),
+                    Span::styled(format!("  {:11}", ""), Style::default().fg(theme.waiting)),
                     Span::styled(sort_label.as_str(), Style::default().fg(theme.text)),
                 ]));
             }
