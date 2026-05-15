@@ -1135,7 +1135,6 @@ mod tests {
             container_id: None,
             image: "test-image".to_string(),
             container_name: "sandbox".to_string(),
-            created_at: None,
             extra_env: None,
             custom_instruction: None,
         });

@@ -490,7 +490,17 @@ mod tests {
 
         terminal
             .draw(|frame| {
-                Preview::render_with_cache(frame, frame.area(), instance, "", &theme, false);
+                Preview::render_with_cache(
+                    frame,
+                    frame.area(),
+                    instance,
+                    "",
+                    0,
+                    &theme,
+                    Duration::from_secs(300),
+                    false,
+                    false,
+                );
             })
             .unwrap();
 

@@ -11,6 +11,7 @@ Treat it as the fork changelog for product behavior:
 ## Current Fork-Only Changes
 
 - [Git branch labels for all git sessions](git-branch-display.md)
+- [Codex status detection fix](codex-status-detection-fix.md)
 - [Session archive](session-archive.md)
 - [Tool session tracking and restore](tool-session-tracking.md)
 - [Terminal tab titles on attach](terminal-tab-title.md)

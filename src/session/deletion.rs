@@ -604,6 +604,8 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: true,
                 force_delete: false,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
 
             let stages = run_with_capture(|| {
@@ -710,6 +712,8 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: false,
                 force_delete: false,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
 
             let result = perform_deletion(&request);
@@ -803,6 +807,8 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
             let result = perform_deletion(&req_no_force);
             assert!(
@@ -822,6 +828,8 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: false,
                 force_delete: true,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
             let result = perform_deletion(&req_force);
             assert!(
@@ -918,6 +926,8 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: true,
                 force_delete: false,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
 
             // Stage assertions: preclean must not run when dirty.
@@ -985,6 +995,8 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: false,
                 force_delete: true,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
 
             let stages = run_with_capture(|| {
@@ -1021,6 +1033,8 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
+                archive_on_success: false,
+                archive_max_entries: 100,
             };
 
             let stages = run_with_capture(|| {

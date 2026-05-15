@@ -1068,7 +1068,7 @@ fn test_uppercase_b_on_non_git_session_shows_info_dialog() {
     let mut view = env.view;
 
     assert!(view.info_dialog.is_none());
-    view.handle_key(key(KeyCode::Char('B')));
+    view.handle_key(key(KeyCode::Char('B')), None);
     assert!(view.info_dialog.is_some());
     assert!(view.confirm_dialog.is_none());
 }
@@ -1098,7 +1098,7 @@ fn test_uppercase_b_on_changed_branch_opens_confirm_dialog() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    view.handle_key(key(KeyCode::Char('B')));
+    view.handle_key(key(KeyCode::Char('B')), None);
 
     let dialog = view
         .confirm_dialog
@@ -3235,6 +3235,7 @@ fn test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_
         id: inst_id.clone(),
         status: Status::Idle,
         last_error: None,
+        idle_entered_at: None,
         tool_session: None,
         tool_session_probe: Some(ToolSessionProbe {
             launch_started_at: Utc::now(),

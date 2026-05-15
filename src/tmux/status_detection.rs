@@ -362,17 +362,7 @@ pub fn detect_codex_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "continue?",
-            "proceed?",
-            "execute?",
-            "run command?",
-            "enter to select",
-            "esc to cancel",
-        ],
-    ) {
+    if contains_codex_approval_prompt(&last_lines_lower) {
         return Status::Waiting;
     }
 
@@ -392,7 +382,9 @@ pub fn detect_codex_status(raw_content: &str) -> Status {
         }
     }
 
-    if codex_has_input_prompt(&non_empty_lines) {
+    if codex_has_input_prompt(&non_empty_lines)
+        && !codex_has_completed_approval_log(&last_lines_lower)
+    {
         return Status::Waiting;
     }
 
@@ -508,6 +500,60 @@ fn codex_has_input_prompt(non_empty_lines: &[&str]) -> bool {
         let rest = rest.trim_start();
         !rest.starts_with("1.") && !rest.starts_with("2.") && !rest.starts_with("3.")
     })
+}
+
+fn codex_has_completed_approval_log(recent_lower: &str) -> bool {
+    recent_lower.contains("approval review approved")
+        || recent_lower.contains("request approved")
+        || recent_lower.contains("approved plan")
+}
+
+fn contains_codex_approval_prompt(recent_lower: &str) -> bool {
+    let direct_prompts = [
+        "(y/n)",
+        "[y/n]",
+        "continue?",
+        "proceed?",
+        "execute?",
+        "run command?",
+        "enter to select",
+        "esc to cancel",
+    ];
+    if direct_prompts
+        .iter()
+        .any(|prompt| recent_lower.contains(prompt))
+    {
+        return true;
+    }
+
+    let has_questioned_approval = recent_lower
+        .lines()
+        .any(|line| line.contains('?') && (line.contains("approve") || line.contains("allow")));
+    if has_questioned_approval {
+        return true;
+    }
+
+    let option_context = ["approve", "allow", "command", "execute", "run"]
+        .iter()
+        .any(|word| recent_lower.contains(word));
+    option_context && codex_approval_option_count(recent_lower) >= 2
+}
+
+fn codex_approval_option_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let mut chars = trimmed.chars();
+            let numbered = matches!(
+                (chars.next(), chars.next()),
+                (Some(first), Some('.')) if first.is_ascii_digit()
+            );
+            numbered
+                && ["yes", "no", "allow", "approve"]
+                    .iter()
+                    .any(|word| trimmed.contains(word))
+        })
+        .count()
 }
 
 /// Cursor agent status is detected via hooks (file-based), same as Claude Code.
@@ -1096,6 +1142,10 @@ mod tests {
             detect_codex_status("execute this action? [y/n]"),
             Status::Waiting
         );
+        assert_eq!(
+            detect_codex_status("Allow command?\n  1. Yes\n  2. No\nEnter to select"),
+            Status::Waiting
+        );
         assert_eq!(detect_codex_status("ready\ncodex>"), Status::Waiting);
         assert_eq!(detect_codex_status("done\n>"), Status::Waiting);
     }
@@ -1122,6 +1172,24 @@ mod tests {
         );
         assert_eq!(
             detect_codex_status("• Running command examples can be misleading"),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_codex_status(
+                "Automatic approval review approved (risk: low): allow decision\n\
+                 Request approved for apply_patch\n\
+                 Worked for 7m 38s\n\
+                 › Find and fix a bug in @filename"
+            ),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_codex_status(
+                "Approved plan\n\
+                 1. Run tests\n\
+                 2. Update docs\n\
+                 › Continue"
+            ),
             Status::Idle
         );
     }
