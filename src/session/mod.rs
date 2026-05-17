@@ -23,17 +23,15 @@ pub use archive::{ArchiveCleanupOptions, ArchivedSession};
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_update_settings, load_config, save_config, Config, ContainerRuntimeName,
-    DefaultTerminalMode, GroupByMode, SandboxConfig, SessionConfig,
-    ThemeConfig, TmuxClipboardMode, TmuxConfig, TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig,
-    WorktreeConfig,
+    DefaultTerminalMode, GroupByMode, SandboxConfig, SessionConfig, ThemeConfig, TmuxClipboardMode,
+    TmuxConfig, TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::validate_env_entry;
 pub use groups::{flatten_tree, flatten_tree_all_profiles, Group, GroupTree, Item};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, SandboxInfo, Status, TerminalInfo,
-    ToolSession, ToolSessionProbe, ToolSessionProbeState, WorkspaceInfo, WorkspaceRepo,
-    WorktreeInfo,
+    EnsureReadyError, EnsureReadyOutcome, Instance, SandboxInfo, Status, TerminalInfo, ToolSession,
+    ToolSessionProbe, ToolSessionProbeState, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,

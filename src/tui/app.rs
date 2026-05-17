@@ -2,8 +2,8 @@
 
 use anyhow::Result;
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::prelude::*;

@@ -936,7 +936,8 @@ fn build_worktree_fields(
         SettingField {
             key: FieldKey::ShowBranchInTui,
             label: "Show Branch in TUI",
-            description: "Display each session's persisted git branch in the session list and preview",
+            description:
+                "Display each session's persisted git branch in the session list and preview",
             value: FieldValue::Bool(show_branch_in_tui),
             category: SettingsCategory::Worktree,
             has_override: o4,
@@ -2009,9 +2010,7 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
             config.worktree.bare_repo_path_template = v.clone()
         }
         (FieldKey::WorktreeAutoCleanup, FieldValue::Bool(v)) => config.worktree.auto_cleanup = *v,
-        (FieldKey::ShowBranchInTui, FieldValue::Bool(v)) => {
-            config.worktree.show_branch_in_tui = *v
-        }
+        (FieldKey::ShowBranchInTui, FieldValue::Bool(v)) => config.worktree.show_branch_in_tui = *v,
         (FieldKey::BranchCommand, FieldValue::OptionalText(v)) => {
             config.worktree.branch_command = v.clone()
         }

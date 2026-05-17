@@ -634,16 +634,12 @@ impl HomeView {
                     } else {
                         format!("  [{} repos]", ws_info.repos.len())
                     };
-                    let suffix_color = if self.show_branch_in_tui && inst.display_branch.is_some()
-                    {
+                    let suffix_color = if self.show_branch_in_tui && inst.display_branch.is_some() {
                         theme.branch
                     } else {
                         theme.dimmed
                     };
-                    line_spans.push(Span::styled(
-                        suffix,
-                        Style::default().fg(suffix_color),
-                    ));
+                    line_spans.push(Span::styled(suffix, Style::default().fg(suffix_color)));
                 } else if self.show_branch_in_tui {
                     if let Some(branch) = &inst.display_branch {
                         line_spans.push(Span::styled(

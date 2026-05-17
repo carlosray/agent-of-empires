@@ -1223,7 +1223,10 @@ impl Instance {
         }
 
         if let Some(cmd) = self.build_tool_session_command(agent) {
-            return Some(wrap_command_ignore_suspend(&format!("{}{}", env_prefix, cmd)));
+            return Some(wrap_command_ignore_suspend(&format!(
+                "{}{}",
+                env_prefix, cmd
+            )));
         }
 
         if self.command.is_empty() {
