@@ -8,7 +8,7 @@ Codex can print approval review results into the terminal after a command or fil
 
 AoE status detection used to treat any recent `approve` or `allow` text as a live approval prompt. That made completed Codex sessions appear amber as `Waiting` even though the session was idle and ready for a new message.
 
-The fork now distinguishes live approval prompts from completed approval logs.
+The fork now distinguishes live approval prompts from completed approval logs. It also treats Codex's normal bottom `›` prompt after a completed turn as `Idle`, even if repeated warning lines push the earlier approval log out of the recent pane window.
 
 ## Waiting Still Works
 
@@ -18,6 +18,7 @@ Codex is still shown as `Waiting` for real input gates:
 - prompt text such as `continue?`, `proceed?`, `run command?`, `enter to select`, or `esc to cancel`
 - approval questions that include `approve?` or `allow?`
 - numbered approval menus with yes/no style options, even when Codex renders the options without a selector glyph
+- interrupted-turn prompts that ask the user to tell Codex what to do differently
 
 Completed output that merely mentions approved actions remains `Idle`.
 
@@ -39,4 +40,4 @@ For broader detector changes, run:
 cargo test status_detection
 ```
 
-The tests cover stale approval review output, ordinary numbered final-answer lists, explicit yes/no prompts, and numbered approval menus without a selector glyph.
+The tests cover stale approval review output, completed turns followed by ordinary `›` prompts, repeated warning tails, ordinary numbered final-answer lists, explicit yes/no prompts, interrupted-turn prompts, and numbered approval menus without a selector glyph.

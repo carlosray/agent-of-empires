@@ -330,7 +330,7 @@ pub fn detect_vibe_status(raw_content: &str) -> Status {
 ///      live status line carrying an `esc to interrupt` hint (anywhere in the
 ///      block), or a bare activity verb / spinner+verb in the last ~10 lines.
 ///   4. Waiting is detected from approval prompts, numbered `›`/`❯` choices,
-///      free-form `›`/`❯` prompts, and the `codex>` REPL prompt.
+///      interrupted-turn `›`/`❯` prompts, and the `codex>` REPL prompt.
 ///
 /// All comparisons are case-insensitive (content is lowercased on entry).
 pub fn detect_codex_status(raw_content: &str) -> Status {
@@ -382,8 +382,7 @@ pub fn detect_codex_status(raw_content: &str) -> Status {
         }
     }
 
-    if codex_has_input_prompt(&non_empty_lines)
-        && !codex_has_completed_approval_log(&last_lines_lower)
+    if codex_has_input_prompt(&non_empty_lines) && codex_has_interruption_prompt(&last_lines_lower)
     {
         return Status::Waiting;
     }
@@ -502,10 +501,9 @@ fn codex_has_input_prompt(non_empty_lines: &[&str]) -> bool {
     })
 }
 
-fn codex_has_completed_approval_log(recent_lower: &str) -> bool {
-    recent_lower.contains("approval review approved")
-        || recent_lower.contains("request approved")
-        || recent_lower.contains("approved plan")
+fn codex_has_interruption_prompt(recent_lower: &str) -> bool {
+    recent_lower.contains("conversation interrupted")
+        || recent_lower.contains("tell the model what to do differently")
 }
 
 fn contains_codex_approval_prompt(recent_lower: &str) -> bool {
@@ -1195,6 +1193,65 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_codex_status_idle_after_completed_turn_with_long_warning_tail() {
+        let pane = r#"
+⚠ Automatic approval review approved (risk: low, authorization: unknown): Auto-review returned
+  a low-risk allow decision.
+
+✔ Request approved for apply_patch
+
+• Done. I wrote the Confluence raw evidence pack here:
+
+  Verified the file exists and has the expected top-level sections.
+
+─ Worked for 7m 38s ───────────────────────────────────────────────────────────────────────────
+
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+⚠ Skipped loading 1 skill(s) due to invalid SKILL.md files.
+⚠ /Users/mikhailvasilenko/nebo2/skills/dwh/SKILL.md: invalid YAML: mapping values are not
+  allowed in this context at line 2 column 220
+
+› Find and fix a bug in @filename
+
+  gpt-5.5 xhigh fast · ~/nebo2
+"#;
+
+        assert_eq!(detect_codex_status(pane), Status::Idle);
+    }
+
+    #[test]
     fn test_detect_codex_status_waiting_after_interruption() {
         let pane = r#"
   If your API supports an array/operator filter like value_in, then this could be shorter,
@@ -1234,7 +1291,7 @@ mod tests {
   gpt-5.5 high · ~/appsSource/agent-of-empires
 "#;
 
-        assert_eq!(detect_codex_status(pane), Status::Waiting);
+        assert_eq!(detect_codex_status(pane), Status::Idle);
     }
 
     #[test]
@@ -1272,7 +1329,7 @@ mod tests {
   gpt-5.5 high · ~/appsSource/agent-of-empires
 "#;
 
-        assert_eq!(detect_codex_status(pane), Status::Waiting);
+        assert_eq!(detect_codex_status(pane), Status::Idle);
     }
 
     #[test]
