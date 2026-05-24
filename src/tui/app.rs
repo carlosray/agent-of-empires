@@ -18,6 +18,22 @@ use crate::session::{get_update_settings, save_config, Config};
 use crate::tmux::AvailableTools;
 use crate::update::{check_for_update, UpdateInfo};
 
+/// Minimum elapsed time between considering periodic update re-checks.
+/// The main loop runs at ~20Hz; gating on this gap keeps the per-iteration
+/// `get_update_settings()` config read off the hot path while still
+/// re-evaluating well under any realistic `check_interval_hours` setting.
+const UPDATE_CHECK_THROTTLE_GAP: Duration = Duration::from_secs(60);
+
+/// Floor for the periodic re-check interval. The settings TUI validator
+/// rejects `check_interval_hours = 0`, but a user could still land in that
+/// state by hand-editing the config file. Without a floor, the periodic
+/// re-check would fire once per `UPDATE_CHECK_THROTTLE_GAP` (60s) and the
+/// underlying `check_for_update` cache TTL would also be zero, defeating
+/// the cache and hitting GitHub on every tick. One hour is generous; users
+/// who genuinely want hourly checks set `check_interval_hours = 1` and get
+/// the same effect via the normal path.
+const MIN_PERIODIC_RECHECK_INTERVAL: Duration = Duration::from_secs(3600);
+
 /// Inter-key timeout for the paste-burst detector. After any printable Char
 /// or Enter, the event loop polls for the next event with this timeout; if
 /// another burst-candidate arrives before the deadline, it joins the burst.
@@ -92,6 +108,20 @@ pub struct App {
     /// the sync `execute_action` can't lend out).
     #[cfg(feature = "serve")]
     pending_cockpit_open: Option<String>,
+    /// Version of the install currently being attempted (auto or manual).
+    /// Set when the install task is spawned; transferred to
+    /// `last_installed_version_in_session` on confirmed success in
+    /// `poll_update_status`. Cleared on failure so the user can retry.
+    pending_install_version: Option<String>,
+    /// Version we successfully installed this session. The running binary's
+    /// compile-time `CARGO_PKG_VERSION` stays at the old value until
+    /// restart, so without this guard every periodic re-check (#1471) would
+    /// surface the same release again: as an auto-install loop in auto
+    /// mode, and as a re-appearing banner in notify mode. A genuinely newer
+    /// release clears the guard automatically because the version string
+    /// differs. Single-process scope; on restart the new binary's
+    /// `CARGO_PKG_VERSION` makes the underlying check return "no update".
+    last_installed_version_in_session: Option<String>,
 }
 
 /// Check if the app version changed and return the previous version if changelog should be shown.
@@ -208,6 +238,8 @@ impl App {
             mouse_captured: crate::tui::mouse_capture_requested(),
             #[cfg(feature = "serve")]
             pending_cockpit_open: None,
+            pending_install_version: None,
+            last_installed_version_in_session: None,
         })
     }
 
@@ -410,35 +442,19 @@ impl App {
         // Refresh tmux session cache
         crate::tmux::refresh_session_cache();
 
-        // Spawn async update check
+        // Spawn async update check at startup. The periodic re-check below
+        // covers long-running sessions (#1471). `last_update_check` stays
+        // `None` when the startup spawn does not fire (mode=off) so that
+        // toggling the mode on later triggers a check immediately, instead
+        // of waiting up to `check_interval_hours` from process launch.
         let settings = get_update_settings();
-        if settings.update_check_mode.is_enabled() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            self.update_rx = Some(rx);
-            tokio::spawn(async move {
-                let version = env!("CARGO_PKG_VERSION");
-                let mut result = check_for_update(version, false).await;
-                // For Homebrew installs, suppress the "update available"
-                // ribbon until the formula has caught up to the GitHub
-                // release. Otherwise users see the prompt, press 'u', and
-                // hit a no-op `brew upgrade` while the formula lags. The
-                // brew probes are sync; offload to keep the runtime free.
-                if let Ok(info) = &mut result {
-                    if info.available {
-                        let target = info.latest_version.clone();
-                        let actionable = tokio::task::spawn_blocking(move || {
-                            crate::update::install::install_method_supports_target(&target)
-                        })
-                        .await
-                        .unwrap_or(true);
-                        if !actionable {
-                            info.available = false;
-                        }
-                    }
-                }
-                let _ = tx.send(result);
-            });
-        }
+        let mut last_update_check: Option<std::time::Instant> =
+            if settings.update_check_mode.is_enabled() {
+                self.spawn_update_check();
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
         // SIGHUP/SIGTERM futures so we exit cleanly when the terminal
         // emulator is force-quit, preventing PTY slot leaks (#541).
@@ -464,6 +480,11 @@ impl App {
         let mut last_disk_refresh = std::time::Instant::now();
         let mut last_spinner_redraw = std::time::Instant::now();
         let mut last_heartbeat = std::time::Instant::now();
+        // Throttle for how often the periodic block re-reads settings;
+        // without this, the inner guards would re-fire on every loop
+        // iteration once any time has passed, hitting the config file at
+        // the 20Hz loop rate.
+        let mut last_update_eval = std::time::Instant::now();
         const STATUS_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
@@ -832,6 +853,25 @@ impl App {
                 last_heartbeat = std::time::Instant::now();
             }
 
+            // Periodic update re-check (#1471). The startup spawn only fires
+            // once per process; long-running TUI sessions would otherwise
+            // silently miss releases that ship after the user attached. The
+            // throttle gap keeps the per-iteration `get_update_settings()`
+            // config-file read off the 20Hz hot path.
+            if last_update_eval.elapsed() >= UPDATE_CHECK_THROTTLE_GAP {
+                last_update_eval = std::time::Instant::now();
+                let settings = get_update_settings();
+                if should_spawn_periodic_update_check(
+                    last_update_check.map(|t| t.elapsed()),
+                    periodic_recheck_interval(settings.check_interval_hours),
+                    self.update_rx.is_some(),
+                    settings.update_check_mode.is_enabled(),
+                ) {
+                    self.spawn_update_check();
+                    last_update_check = Some(std::time::Instant::now());
+                }
+            }
+
             // Animated spinners (rattles) need periodic redraws, but only at
             // the spinner frame rate to avoid unnecessary widget tree rebuilds
             if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
@@ -890,6 +930,39 @@ impl App {
         }
     }
 
+    /// Spawn an async update check, mirroring the brew-formula-lag
+    /// suppression done at startup. Stores the receiver on `self.update_rx`
+    /// so the main loop's `poll_update_check` picks up the result. Callers
+    /// are responsible for gating on `update_check_mode.is_enabled()` and
+    /// avoiding duplicate in-flight checks via `self.update_rx.is_none()`.
+    fn spawn_update_check(&mut self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.update_rx = Some(rx);
+        tokio::spawn(async move {
+            let version = env!("CARGO_PKG_VERSION");
+            let mut result = check_for_update(version, false).await;
+            // For Homebrew installs, suppress the "update available" banner
+            // until the formula has caught up to the GitHub release.
+            // Otherwise users see the prompt, press 'u', and hit a no-op
+            // `brew upgrade` while the formula lags. The brew probes are
+            // sync; offload to keep the runtime free.
+            if let Ok(info) = &mut result {
+                if info.available {
+                    let target = info.latest_version.clone();
+                    let actionable = tokio::task::spawn_blocking(move || {
+                        crate::update::install::install_method_supports_target(&target)
+                    })
+                    .await
+                    .unwrap_or(true);
+                    if !actionable {
+                        info.available = false;
+                    }
+                }
+            }
+            let _ = tx.send(result);
+        });
+    }
+
     /// Poll for update check result (non-blocking).
     /// Returns true if an update is available, was just received, and is
     /// not snoozed by a prior `dismissed_update_version`.
@@ -906,6 +979,21 @@ impl App {
         let Some(info) = self.update_info.as_ref() else {
             return false;
         };
+
+        // Already installed this version this session (auto or manual). The
+        // running binary's compile-time `CARGO_PKG_VERSION` is stale until
+        // the user restarts, so every periodic re-check (#1471) would
+        // otherwise rediscover the same release: auto mode would loop the
+        // installer, notify mode would re-show the banner. Skip both.
+        if self.last_installed_version_in_session.as_deref() == Some(info.latest_version.as_str()) {
+            tracing::info!(
+                target: "update.dedup",
+                version = %info.latest_version,
+                "skipping: already installed this version this session, restart aoe to use it"
+            );
+            self.update_info = None;
+            return false;
+        }
 
         // Auto mode: install in the background and suppress the banner.
         // The new binary is picked up on next launch; we do not restart
@@ -980,6 +1068,11 @@ impl App {
         self.update_status = Some(UpdateStatus::transient(format!(
             "auto-updating to v{version} in background…"
         )));
+        // Stash for `poll_update_status` to promote into
+        // `last_installed_version_in_session` on confirmed success. Tracking
+        // only on success preserves the user's ability to retry after a
+        // failed install (transient network issue, disk full, etc.).
+        self.pending_install_version = Some(version.clone());
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.update_status_rx = Some(rx);
         let handle = tokio::runtime::Handle::current();
@@ -997,12 +1090,17 @@ impl App {
         };
         match rx.try_recv() {
             Ok(Ok(())) => {
+                // Promote the pending version into the per-session record so
+                // the periodic re-check (#1471) stops surfacing this release.
+                self.last_installed_version_in_session = self.pending_install_version.take();
                 self.update_status = Some(UpdateStatus::persistent(
                     "update complete. Restart aoe to use the new version.".into(),
                 ));
                 true
             }
             Ok(Err(e)) => {
+                // Clear pending so a retry is allowed.
+                self.pending_install_version = None;
                 self.update_status = Some(UpdateStatus::transient(format!("update failed: {e}")));
                 true
             }
@@ -1011,6 +1109,7 @@ impl App {
                 false
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.pending_install_version = None;
                 self.update_status = Some(UpdateStatus::transient(
                     "update task ended unexpectedly".into(),
                 ));
@@ -1050,6 +1149,9 @@ impl App {
             })?;
             match result {
                 Ok(()) => {
+                    // Record the successful manual install so the periodic
+                    // re-check (#1471) stops re-surfacing this release.
+                    self.last_installed_version_in_session = Some(version.clone());
                     self.update_status = Some(UpdateStatus::persistent(
                         "update complete. Restart aoe to use the new version.".into(),
                     ));
@@ -1067,6 +1169,9 @@ impl App {
             // async I/O still use the existing tokio runtime while sidestepping the
             // Send constraint.
             self.update_status = Some(UpdateStatus::transient(format!("updating to v{version}…")));
+            // Stash for `poll_update_status` to promote on confirmed success
+            // (#1471). Mirrors the auto-install path.
+            self.pending_install_version = Some(version.clone());
             let (tx, rx) = tokio::sync::oneshot::channel();
             self.update_status_rx = Some(rx);
             let handle = tokio::runtime::Handle::current();
@@ -1093,6 +1198,36 @@ fn persist_dismissed_update_version(version: Option<String>) {
             error = %e,
             "failed to persist dismissed_update_version"
         );
+    }
+}
+
+/// Convert `check_interval_hours` to a `Duration` for the periodic re-check,
+/// clamped to a sane minimum. See `MIN_PERIODIC_RECHECK_INTERVAL`.
+fn periodic_recheck_interval(check_interval_hours: u64) -> Duration {
+    Duration::from_secs(check_interval_hours.saturating_mul(3600))
+        .max(MIN_PERIODIC_RECHECK_INTERVAL)
+}
+
+/// Decide whether the main loop should spawn a fresh periodic update check.
+/// Pulled out as a pure function so the throttle/in-flight/mode guards are
+/// testable without driving the tokio runtime, the config file, or the
+/// network. `elapsed = None` means no check has run yet this process, which
+/// makes the first tick after the user enables update_check_mode mid-session
+/// fire immediately rather than waiting up to `check_interval_hours` from
+/// process launch. `interval` is the value produced by
+/// `periodic_recheck_interval`.
+fn should_spawn_periodic_update_check(
+    elapsed: Option<Duration>,
+    interval: Duration,
+    rx_in_flight: bool,
+    mode_enabled: bool,
+) -> bool {
+    if rx_in_flight || !mode_enabled {
+        return false;
+    }
+    match elapsed {
+        None => true,
+        Some(e) => e >= interval,
     }
 }
 
@@ -1785,6 +1920,119 @@ mod tests {
         assert!(info.is_none());
         // Receiver should be put back for next poll
         assert!(rx_out.is_some());
+    }
+
+    #[test]
+    fn periodic_recheck_fires_after_interval_elapses() {
+        // The dominant bug (#1471): the original code spawned the update check
+        // only once at startup. After the configured interval has passed in a
+        // long-running TUI, the loop must spawn a fresh check.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(should_spawn_periodic_update_check(
+            Some(interval + Duration::from_secs(1)),
+            interval,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_holds_within_interval() {
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            Some(interval - Duration::from_secs(1)),
+            interval,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_skips_when_in_flight() {
+        // Don't queue a second check while one is already running; the existing
+        // one will deliver its result on the oneshot channel and the next tick
+        // after that can fire normally.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            Some(interval + Duration::from_secs(1)),
+            interval,
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_skips_when_mode_disabled() {
+        // update_check_mode = "off" should suppress both startup and periodic
+        // checks. Mirror the gate at startup.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            Some(interval + Duration::from_secs(1)),
+            interval,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_fires_immediately_when_never_checked_and_mode_enabled() {
+        // User started with mode=off, toggled to notify/auto mid-session. The
+        // first guard tick after toggle should fire without waiting another
+        // full `check_interval_hours` from process launch.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(should_spawn_periodic_update_check(
+            None, interval, false, true,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_skips_when_never_checked_but_mode_disabled() {
+        // Symmetric: a None elapsed does not override the mode gate. Mode=off
+        // still wins.
+        let interval = Duration::from_secs(24 * 3600);
+        assert!(!should_spawn_periodic_update_check(
+            None, interval, false, false,
+        ));
+    }
+
+    #[test]
+    fn periodic_recheck_interval_honors_user_setting() {
+        assert_eq!(
+            periodic_recheck_interval(24),
+            Duration::from_secs(24 * 3600)
+        );
+        assert_eq!(
+            periodic_recheck_interval(168),
+            Duration::from_secs(168 * 3600)
+        );
+    }
+
+    #[test]
+    fn periodic_recheck_interval_floors_zero_to_minimum() {
+        // The settings TUI rejects 0, but a hand-edited config could land
+        // here. Without the floor, a 0-hour interval combined with the 0-hour
+        // cache TTL would hit GitHub on every throttle-gap tick (~60s).
+        assert_eq!(periodic_recheck_interval(0), MIN_PERIODIC_RECHECK_INTERVAL);
+    }
+
+    #[test]
+    fn periodic_recheck_interval_does_not_overflow() {
+        // `saturating_mul` keeps `u64::MAX` hours from wrapping. The result
+        // is "effectively never re-check" rather than a panic.
+        let _ = periodic_recheck_interval(u64::MAX);
+    }
+
+    #[test]
+    fn periodic_recheck_fires_at_interval_boundary() {
+        // `>=`, not `>`. A user with `check_interval_hours = 1` should get the
+        // tick at the 1-hour mark, not 1h + epsilon.
+        let interval = Duration::from_secs(3600);
+        assert!(should_spawn_periodic_update_check(
+            Some(interval),
+            interval,
+            false,
+            true,
+        ));
     }
 
     #[test]
