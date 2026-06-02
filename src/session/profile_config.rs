@@ -53,6 +53,9 @@ pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cockpit: Option<CockpitConfigOverride>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<DiffConfigOverride>,
+
     /// Per-profile override for the host-side `environment` list. When
     /// `Some`, replaces the global list entirely (matching the existing
     /// `sandbox.environment` override semantics). `None` inherits the
@@ -285,6 +288,13 @@ pub struct SessionConfigOverride {
     pub click_action: Option<super::config::ClickAction>,
 }
 
+/// Per-profile override for diff view preferences.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DiffConfigOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub split_view: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HooksConfigOverride {
     #[serde(
@@ -357,6 +367,7 @@ pub fn profile_has_overrides(config: &ProfileConfig) -> bool {
         || config.sound.is_some()
         || config.status_hooks.is_some()
         || config.cockpit.is_some()
+        || config.diff.is_some()
         || config.environment.is_some()
 }
 
@@ -662,6 +673,12 @@ pub fn merge_configs(mut global: Config, profile: &ProfileConfig) -> Config {
         }
         if let Some(v) = cockpit_override.auto_stop_idle_secs {
             global.cockpit.auto_stop_idle_secs = v;
+        }
+    }
+
+    if let Some(ref diff_override) = profile.diff {
+        if let Some(split_view) = diff_override.split_view {
+            global.diff.split_view = split_view;
         }
     }
 
@@ -1196,5 +1213,19 @@ mod tests {
 
         let merged = merge_configs(global, &profile);
         assert_eq!(merged.environment, vec!["FROM_GLOBAL=1".to_string()]);
+    }
+
+    #[test]
+    fn profile_diff_split_view_override_applies() {
+        let mut global = Config::default();
+        global.diff.split_view = false;
+        let profile = ProfileConfig {
+            diff: Some(DiffConfigOverride {
+                split_view: Some(true),
+            }),
+            ..Default::default()
+        };
+        let merged = merge_configs(global, &profile);
+        assert!(merged.diff.split_view);
     }
 }

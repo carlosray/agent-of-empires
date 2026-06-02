@@ -28,6 +28,7 @@ pub enum SettingsCategory {
     Hooks,
     Web,
     Cockpit,
+    Diff,
     Logging,
 }
 
@@ -47,6 +48,7 @@ impl SettingsCategory {
             Self::Hooks => "Lifecycle Hooks",
             Self::Web => "Web",
             Self::Cockpit => "Cockpit",
+            Self::Diff => "Diff",
             Self::Logging => "Logging",
         }
     }
@@ -162,6 +164,8 @@ pub enum FieldKey {
     CockpitSilentOrphanGraceSecs,
     CockpitSilentOrphanFastGraceSecs,
     CockpitAutoStopIdleSecs,
+    // Diff
+    DiffSplitView,
     // Logging
     LoggingDefaultLevel,
     /// Per-target override; carries an index into `crate::logging::KNOWN_SUB_TARGETS`
@@ -383,6 +387,7 @@ pub fn build_fields_for_category(
         SettingsCategory::Hooks => build_hooks_fields(scope, global, profile),
         SettingsCategory::Web => build_web_fields(scope, global, profile),
         SettingsCategory::Cockpit => build_cockpit_fields(scope, global, profile),
+        SettingsCategory::Diff => build_diff_fields(scope, global, profile),
         SettingsCategory::Logging => build_logging_fields(global),
     }
 }
@@ -876,6 +881,30 @@ fn build_web_fields(
             inherited_display: None,
         },
     ]
+}
+
+fn build_diff_fields(
+    scope: SettingsScope,
+    global: &Config,
+    profile: &ProfileConfig,
+) -> Vec<SettingField> {
+    let diff = profile.diff.as_ref();
+
+    let (split_view, has_override) = resolve_value(
+        scope,
+        global.diff.split_view,
+        diff.and_then(|d| d.split_view),
+    );
+
+    vec![SettingField {
+        key: FieldKey::DiffSplitView,
+        label: "Side-by-side diff",
+        description: "Show diffs in a split (side-by-side) layout instead of unified",
+        value: FieldValue::Bool(split_view),
+        category: SettingsCategory::Diff,
+        has_override,
+        inherited_display: inherited_if(has_override, FieldValue::Bool(global.diff.split_view)),
+    }]
 }
 
 fn build_theme_fields(
@@ -2865,6 +2894,8 @@ fn apply_field_to_global(field: &SettingField, config: &mut Config) {
         (FieldKey::WebNotifyOnError, FieldValue::Bool(v)) => {
             config.web.notify_on_error = *v;
         }
+        // Diff
+        (FieldKey::DiffSplitView, FieldValue::Bool(v)) => config.diff.split_view = *v,
         // Cockpit
         (FieldKey::CockpitEnabled, FieldValue::Bool(v)) => config.cockpit.enabled = *v,
         (FieldKey::CockpitDefaultForClaude, FieldValue::Bool(v)) => {
@@ -3064,6 +3095,10 @@ fn apply_field_to_profile(field: &SettingField, _global: &Config, config: &mut P
         }
         (FieldKey::InitSubmodules, FieldValue::Bool(v)) => {
             set_profile_override(*v, &mut config.worktree, |s, val| s.init_submodules = val);
+        }
+        // Diff
+        (FieldKey::DiffSplitView, FieldValue::Bool(v)) => {
+            set_profile_override(*v, &mut config.diff, |d, val| d.split_view = val);
         }
         // Sandbox
         (FieldKey::SandboxEnabledByDefault, FieldValue::Bool(v)) => {
@@ -3779,6 +3814,25 @@ mod tests {
 
         assert!(field.has_override);
         assert!(matches!(field.value, FieldValue::Bool(true)));
+    }
+
+    #[test]
+    fn test_diff_split_view_applies_to_global() {
+        let mut global = Config::default();
+        assert!(!global.diff.split_view);
+
+        let field = SettingField {
+            key: FieldKey::DiffSplitView,
+            label: "Side-by-side diff",
+            description: "",
+            value: FieldValue::Bool(true),
+            category: SettingsCategory::Diff,
+            has_override: false,
+            inherited_display: None,
+        };
+        apply_field_to_global(&field, &mut global);
+
+        assert!(global.diff.split_view);
     }
 
     #[test]

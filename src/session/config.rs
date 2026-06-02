@@ -926,6 +926,10 @@ pub struct DiffConfig {
     /// Number of context lines to show around changes
     #[serde(default = "default_context_lines")]
     pub context_lines: usize,
+
+    /// Render diffs side-by-side (split) instead of unified.
+    #[serde(default)]
+    pub split_view: bool,
 }
 
 impl Default for DiffConfig {
@@ -933,6 +937,7 @@ impl Default for DiffConfig {
         Self {
             default_branch: None,
             context_lines: 3,
+            split_view: false,
         }
     }
 }
@@ -2160,6 +2165,16 @@ mod tests {
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.diff.default_branch, Some("main".to_string()));
         assert_eq!(config.diff.context_lines, 10);
+    }
+
+    #[test]
+    fn diff_config_split_view_roundtrips() {
+        let mut cfg = DiffConfig::default();
+        assert!(!cfg.split_view);
+        cfg.split_view = true;
+        let toml = toml::to_string(&cfg).unwrap();
+        let back: DiffConfig = toml::from_str(&toml).unwrap();
+        assert!(back.split_view);
     }
 
     #[test]

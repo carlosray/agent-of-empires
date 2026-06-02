@@ -710,6 +710,12 @@ impl SettingsView {
                     w.init_submodules = None;
                 }
             }
+            // Diff
+            FieldKey::DiffSplitView => {
+                if let Some(d) = config.diff.as_mut() {
+                    d.split_view = None;
+                }
+            }
             // Sandbox
             FieldKey::DefaultImage => {
                 if let Some(ref mut s) = config.sandbox {
