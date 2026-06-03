@@ -23,6 +23,9 @@ closed, versioned schema (see `src/telemetry/events.rs`):
   current install, never a stream of actions:
   - how many sessions exist and how many are running / idle / errored,
   - how many use a sandbox, the cockpit, or yolo mode,
+  - how many sessions are currently pinned, snoozed, or archived (a
+    point-in-time count of the session-organization states, not how often
+    those actions were taken),
   - a per-substrate census: each session is classified into exactly one of
     `local` / `worktree` / `workspace` / `sandbox` / `scratch` (a closed
     five-way vocabulary), so the counts partition the session total and answer

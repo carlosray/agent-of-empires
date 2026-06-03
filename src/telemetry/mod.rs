@@ -212,6 +212,133 @@ fn process_start_event(surface: Surface, install_id: String) -> ProcessStart {
     }
 }
 
+/// Pure per-session aggregation, split out of [`build_usage_snapshot`] so the
+/// counting logic is unit-testable without the opt-in / install-id / config
+/// global state the snapshot builder pulls in.
+struct InstanceMetrics {
+    total: u32,
+    running: u32,
+    idle: u32,
+    error: u32,
+    cockpit: u32,
+    sandboxed: u32,
+    yolo: u32,
+    pinned: u32,
+    snoozed: u32,
+    archived: u32,
+    by_agent: BTreeMap<String, u32>,
+    by_model_bucket: BTreeMap<String, u32>,
+    by_substrate: BTreeMap<String, u32>,
+}
+
+fn aggregate_instances(instances: &[Instance]) -> InstanceMetrics {
+    let mut by_agent: BTreeMap<String, u32> = BTreeMap::new();
+    let mut by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
+    // Pre-seed every substrate to 0 so the census is always complete: a
+    // dashboard never has to coalesce a missing key, and the values always
+    // sum to `session_total`.
+    let mut by_substrate: BTreeMap<String, u32> =
+        SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect();
+    let (mut running, mut idle, mut error, mut cockpit, mut sandboxed, mut yolo) =
+        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
+    let (mut pinned, mut snoozed, mut archived) = (0u32, 0u32, 0u32);
+
+    for inst in instances {
+        match inst.status {
+            crate::session::Status::Running => running += 1,
+            crate::session::Status::Idle => idle += 1,
+            crate::session::Status::Error => error += 1,
+            _ => {}
+        }
+        // Cockpit fields only exist in `serve` builds; treat them as absent
+        // otherwise so the aggregation stays surface-agnostic.
+        #[cfg(feature = "serve")]
+        let is_cockpit = inst.cockpit_mode;
+        #[cfg(not(feature = "serve"))]
+        let is_cockpit = false;
+        if is_cockpit {
+            cockpit += 1;
+        }
+        if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
+            sandboxed += 1;
+        }
+        if inst.yolo_mode {
+            yolo += 1;
+        }
+
+        // Mutually-exclusive primary substrate; orthogonal to the sandbox count
+        // above (a sandboxed worktree buckets as `worktree` here). The map is
+        // pre-seeded with the closed vocabulary, so increment the existing key
+        // rather than inserting: any drift in `substrate_bucket` then fails
+        // loudly instead of silently broadening the payload.
+        *by_substrate
+            .get_mut(substrate_bucket(inst))
+            .expect("SUBSTRATES must contain every substrate bucket") += 1;
+
+        // Point-in-time session-triage census. The three states are mutually
+        // exclusive per the triage invariant enforced in the session apply /
+        // merge path (see `Instance::archive`/`snooze`/`pin` and the merge
+        // reconciliation), so independent checks never double-count a
+        // well-formed session. The debug assert makes a future mutator or
+        // merge regression fail fast instead of silently skewing the census
+        // (sum of the three counts exceeding `session_total`).
+        let is_pinned = inst.is_pinned();
+        let is_snoozed = inst.is_snoozed();
+        let is_archived = inst.is_archived();
+        debug_assert!(
+            [is_pinned, is_snoozed, is_archived]
+                .into_iter()
+                .filter(|state| *state)
+                .count()
+                <= 1,
+            "session triage states must be mutually exclusive"
+        );
+        if is_pinned {
+            pinned += 1;
+        }
+        if is_snoozed {
+            snoozed += 1;
+        }
+        if is_archived {
+            archived += 1;
+        }
+
+        // Prefer the canonical detection name; fall back to the raw tool
+        // string. Either way it is coerced to an allowlisted bucket.
+        let agent_src = if inst.detect_as.trim().is_empty() {
+            inst.tool.as_str()
+        } else {
+            inst.detect_as.as_str()
+        };
+        *by_agent
+            .entry(sanitize::agent_bucket(agent_src))
+            .or_insert(0) += 1;
+
+        #[cfg(feature = "serve")]
+        let model = inst.cockpit_model.as_deref();
+        #[cfg(not(feature = "serve"))]
+        let model: Option<&str> = None;
+        let bucket = sanitize::model_bucket(model);
+        *by_model_bucket.entry(bucket.to_string()).or_insert(0) += 1;
+    }
+
+    InstanceMetrics {
+        total: instances.len() as u32,
+        running,
+        idle,
+        error,
+        cockpit,
+        sandboxed,
+        yolo,
+        pinned,
+        snoozed,
+        archived,
+        by_agent,
+        by_model_bucket,
+        by_substrate,
+    }
+}
+
 /// Build a `usage_snapshot` from the current sessions, or `None` when not
 /// opted in. All agent/model strings pass through [`sanitize`]; raw values
 /// never reach the payload.
@@ -277,68 +404,7 @@ fn assemble_usage_snapshot(
 ) -> UsageSnapshot {
     let features = features::active_features(config);
 
-    let mut sessions_by_agent: BTreeMap<String, u32> = BTreeMap::new();
-    let mut sessions_by_model_bucket: BTreeMap<String, u32> = BTreeMap::new();
-    // Pre-seed every substrate to 0 so the census is always complete: a
-    // dashboard never has to coalesce a missing key, and the values always
-    // sum to `session_total`.
-    let mut sessions_by_substrate: BTreeMap<String, u32> =
-        SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect();
-    let (mut running, mut idle, mut error, mut cockpit, mut sandboxed, mut yolo) =
-        (0u32, 0u32, 0u32, 0u32, 0u32, 0u32);
-
-    for inst in instances {
-        match inst.status {
-            crate::session::Status::Running => running += 1,
-            crate::session::Status::Idle => idle += 1,
-            crate::session::Status::Error => error += 1,
-            _ => {}
-        }
-        // Cockpit fields only exist in `serve` builds; treat them as absent
-        // otherwise so the snapshot logic stays surface-agnostic.
-        #[cfg(feature = "serve")]
-        let is_cockpit = inst.cockpit_mode;
-        #[cfg(not(feature = "serve"))]
-        let is_cockpit = false;
-        if is_cockpit {
-            cockpit += 1;
-        }
-        if inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) {
-            sandboxed += 1;
-        }
-        if inst.yolo_mode {
-            yolo += 1;
-        }
-
-        // Mutually-exclusive primary substrate; orthogonal to the sandbox count
-        // above (a sandboxed worktree buckets as `worktree` here). The map is
-        // pre-seeded with the closed vocabulary, so increment the existing key
-        // rather than inserting: any drift in `substrate_bucket` then fails
-        // loudly instead of silently broadening the payload.
-        *sessions_by_substrate
-            .get_mut(substrate_bucket(inst))
-            .expect("SUBSTRATES must contain every substrate bucket") += 1;
-
-        // Prefer the canonical detection name; fall back to the raw tool
-        // string. Either way it is coerced to an allowlisted bucket.
-        let agent_src = if inst.detect_as.trim().is_empty() {
-            inst.tool.as_str()
-        } else {
-            inst.detect_as.as_str()
-        };
-        *sessions_by_agent
-            .entry(sanitize::agent_bucket(agent_src))
-            .or_insert(0) += 1;
-
-        #[cfg(feature = "serve")]
-        let model = inst.cockpit_model.as_deref();
-        #[cfg(not(feature = "serve"))]
-        let model: Option<&str> = None;
-        let bucket = sanitize::model_bucket(model);
-        *sessions_by_model_bucket
-            .entry(bucket.to_string())
-            .or_insert(0) += 1;
-    }
+    let metrics = aggregate_instances(instances);
 
     UsageSnapshot {
         schema: SCHEMA_VERSION,
@@ -349,16 +415,19 @@ fn assemble_usage_snapshot(
         aoe_version: env!("CARGO_PKG_VERSION").to_string(),
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
-        session_total: instances.len() as u32,
-        session_running: running,
-        session_idle: idle,
-        session_error: error,
-        session_cockpit: cockpit,
-        session_sandboxed: sandboxed,
-        session_yolo: yolo,
-        sessions_by_agent,
-        sessions_by_model_bucket,
-        sessions_by_substrate,
+        session_total: metrics.total,
+        session_running: metrics.running,
+        session_idle: metrics.idle,
+        session_error: metrics.error,
+        session_cockpit: metrics.cockpit,
+        session_sandboxed: metrics.sandboxed,
+        session_yolo: metrics.yolo,
+        session_pinned: metrics.pinned,
+        session_snoozed: metrics.snoozed,
+        session_archived: metrics.archived,
+        sessions_by_agent: metrics.by_agent,
+        sessions_by_model_bucket: metrics.by_model_bucket,
+        sessions_by_substrate: metrics.by_substrate,
         features,
         web_seen,
         cockpit_seen,
@@ -628,6 +697,9 @@ mod tests {
             session_cockpit: 0,
             session_sandboxed: 2,
             session_yolo: 0,
+            session_pinned: 0,
+            session_snoozed: 0,
+            session_archived: 0,
             sessions_by_agent: BTreeMap::new(),
             sessions_by_model_bucket: BTreeMap::new(),
             sessions_by_substrate: SUBSTRATES.iter().map(|s| (s.to_string(), 0)).collect(),
@@ -638,6 +710,78 @@ mod tests {
             auth_mode: None,
             serve_mode: None,
         }
+    }
+
+    use crate::session::Instance;
+
+    // A maintainer with two pinned sessions and one snoozed session must see
+    // `session_pinned = 2` and `session_snoozed = 1` (issue #1892, story 1).
+    #[test]
+    fn aggregate_counts_each_triage_state() {
+        let mut pinned_a = Instance::new("pin-a", "/tmp/a");
+        pinned_a.pin();
+        let mut pinned_b = Instance::new("pin-b", "/tmp/b");
+        pinned_b.pin();
+        let mut snoozed = Instance::new("snooze", "/tmp/c");
+        snoozed.snooze(60);
+        let mut archived = Instance::new("arch", "/tmp/d");
+        archived.archive();
+        let untouched = Instance::new("plain", "/tmp/e");
+
+        let m = aggregate_instances(&[pinned_a, pinned_b, snoozed, archived, untouched]);
+
+        assert_eq!(m.pinned, 2, "two pinned sessions");
+        assert_eq!(m.snoozed, 1, "one currently snoozed session");
+        assert_eq!(m.archived, 1, "one archived session");
+        assert_eq!(m.total, 5);
+    }
+
+    // A snooze whose window has elapsed must not be counted, matching
+    // `Instance::is_snoozed()` semantics (issue #1892, story 2).
+    #[test]
+    fn expired_snooze_is_not_counted() {
+        let mut expired = Instance::new("expired", "/tmp/x");
+        // A snooze that ended an hour ago: `snoozed_until` is set but in the past.
+        expired.snoozed_until = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        assert!(
+            !expired.is_snoozed(),
+            "precondition: expired snooze reads false"
+        );
+
+        let m = aggregate_instances(&[expired]);
+        assert_eq!(
+            m.snoozed, 0,
+            "an elapsed snooze must not increment session_snoozed"
+        );
+    }
+
+    // The triage census emits only integer counts; the fields are plain `u32`
+    // and carry no session id, name, path, or timestamp (issue #1892, story 3).
+    #[test]
+    fn triage_counts_are_plain_integers() {
+        // Assert the wire format, not just the Rust type: a future serde
+        // attribute or wrapper that serialized these as strings or null would
+        // regress the telemetry contract while a `u32`-only check still passed.
+        let json = serde_json::to_value(sample_snapshot()).unwrap();
+        assert!(json["session_pinned"].is_u64());
+        assert!(json["session_snoozed"].is_u64());
+        assert!(json["session_archived"].is_u64());
+    }
+
+    // An opted-out install records nothing: `build_usage_snapshot` returns
+    // `None` regardless of session state (issue #1892, story 4). `DO_NOT_TRACK`
+    // is the absolute, config-independent suppressor.
+    #[test]
+    #[serial]
+    fn opted_out_build_returns_none() {
+        unsafe { std::env::set_var("DO_NOT_TRACK", "1") };
+        let mut pinned = Instance::new("pin", "/tmp/p");
+        pinned.pin();
+        assert!(
+            build_usage_snapshot(Surface::Tui, &[pinned], false, false, 0, None, None).is_none(),
+            "opted-out install must not build a snapshot"
+        );
+        unsafe { std::env::remove_var("DO_NOT_TRACK") };
     }
 
     // The serve deployment-mode fields are part of the content fingerprint, so a

@@ -15,7 +15,8 @@ use serde::Serialize;
 /// v2 (#1941): added serve-only `auth_mode` / `serve_mode`.
 /// v3 (#1886): added `sessions_by_substrate`, a mutually-exclusive
 /// per-substrate census of live sessions.
-pub const SCHEMA_VERSION: u32 = 3;
+/// v4 (#1931): added `session_pinned` / `session_snoozed` / `session_archived`.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +79,16 @@ pub struct UsageSnapshot {
     pub session_cockpit: u32,
     pub session_sandboxed: u32,
     pub session_yolo: u32,
+
+    /// Sessions currently pinned, snoozed (future `snoozed_until`), or
+    /// archived at snapshot time. Point-in-time state prevalence, not action
+    /// counts; the three are mutually exclusive per the session triage
+    /// invariant, so they sum to at most `session_total`. Set through a shared
+    /// mutator layer, so this census covers both the web and TUI surfaces with
+    /// no per-surface wiring.
+    pub session_pinned: u32,
+    pub session_snoozed: u32,
+    pub session_archived: u32,
 
     /// Allowlisted agent bucket -> session count.
     pub sessions_by_agent: BTreeMap<String, u32>,
