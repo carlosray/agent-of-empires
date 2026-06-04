@@ -91,6 +91,23 @@ agent command becomes `custom`, an unrecognized model becomes `other`. **Raw
 commands, file paths, titles, branch names, group paths, and prompts are never
 sent.**
 
+### Model families and the `other` bucket
+
+`model_bucket` maps a model string to a small, closed vocabulary of family
+names (`claude`, `openai`, `gemini`, ...); anything it does not recognize
+becomes `other`, and an absent model becomes `unset`. The raw model string
+never leaves the sanitizer, so an internal or private model name can only ever
+be counted as `other`, never revealed.
+
+The family list is maintained by hand. Unlike the agent allowlist, which is
+derived from the built-in agent registry, there is no in-repo source of model
+names to generate it from, so adding a newly common public family is a
+deliberate edit in `sanitize.rs`. The signal that the list has drifted is the
+`other` rate in the `sessions_by_model_bucket` aggregate: when `other` climbs,
+a popular family is missing and should be added. By design that is the only
+discriminator for unknowns; no hashed or partial form of an unknown model name
+is emitted, since model names are low-entropy and a hash would be reversible.
+
 ### Feature flags
 
 The snapshot includes a small `features` map (allowlisted feature name ->
@@ -203,3 +220,12 @@ booleans, or short identifier-like strings (and the allowlisted bucket maps:
 per-agent, per-model-family, and per-substrate); the gateway drops free text,
 paths, branch-name-like strings, and any nested object, so anything richer than
 a count or flag will not survive ingest.
+
+**Idempotency key.** The `process_start` and `usage_snapshot` events carry a
+per-event `uuid`, a random v4 UUID minted once when the event is built. It is
+distinct from the install id (stable per install) and `sent_at` (a per-emit
+timestamp), and is stable across any redelivery of the same logical event. The
+gateway forwards it as the PostHog event `uuid`, so a retried or redelivered
+POST is recognized as the same event and deduped downstream rather than
+double-counted. It is excluded from the in-process snapshot dedup fingerprint,
+so two snapshots with identical content still compare equal.

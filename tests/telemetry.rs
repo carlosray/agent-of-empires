@@ -361,6 +361,66 @@ fn snapshot_carries_session_create_count() {
     assert_eq!(some.session_creates_since_last_snapshot, 7);
 }
 
+/// User stories (#1873): every built event carries a non-empty per-event
+/// `uuid`, distinct from `install_id` and `sent_at`, and two events built in the
+/// same process get different uuids. This is the idempotency key the gateway
+/// forwards as the PostHog event `uuid` for native redelivery dedup.
+#[test]
+#[serial]
+fn events_carry_distinct_idempotency_uuid() {
+    let _tmp = isolate();
+    set_enabled(true);
+    telemetry::apply_opt_in_change(true);
+
+    let snap =
+        telemetry::build_usage_snapshot(Surface::Tui, &[], usage_signals::zeroed(), 0, None, None)
+            .expect("snapshot built when opted in");
+    assert!(!snap.uuid.is_empty(), "snapshot uuid must be non-empty");
+    assert_ne!(
+        snap.uuid, snap.install_id,
+        "uuid must differ from install_id"
+    );
+    assert_ne!(snap.uuid, snap.sent_at, "uuid must differ from sent_at");
+    // It must serialize onto the wire so the gateway can read it.
+    let serialized = serde_json::to_string(&snap).expect("serialize");
+    assert!(
+        serialized.contains(&format!("\"uuid\":\"{}\"", snap.uuid)),
+        "uuid must be present in the serialized payload"
+    );
+
+    // Two events built in the same process must not collide.
+    let proc = telemetry::build_process_start(Surface::Tui).expect("process_start built");
+    let snap2 =
+        telemetry::build_usage_snapshot(Surface::Tui, &[], usage_signals::zeroed(), 0, None, None)
+            .expect("second snapshot built");
+    assert_ne!(
+        snap.uuid, snap2.uuid,
+        "two snapshots must get distinct uuids"
+    );
+    assert_ne!(
+        proc.uuid, snap.uuid,
+        "process_start and snapshot must get distinct uuids"
+    );
+}
+
+/// Opted out (the default): no event, and therefore no `uuid`, is ever built.
+#[test]
+#[serial]
+fn opted_out_builds_no_uuid() {
+    let _tmp = isolate();
+    assert!(!telemetry::is_opted_in());
+    assert!(telemetry::build_process_start(Surface::Tui).is_none());
+    assert!(telemetry::build_usage_snapshot(
+        Surface::Tui,
+        &[],
+        usage_signals::zeroed(),
+        0,
+        None,
+        None
+    )
+    .is_none());
+}
+
 /// User story (#1880): a usage signal registered in the allowlist flows through
 /// the daemon aggregate (`UsageSeenCounters`) into the snapshot's `usage_seen`
 /// map with no other code changes. The map carries the recorded counts verbatim.

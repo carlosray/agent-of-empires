@@ -22,7 +22,9 @@ use serde::Serialize;
 /// [`ProcessStart`] in favor of it.
 /// v7 (#1887): added version-health fields (`data_schema_version`,
 /// `update_status`, `update_releases_behind`) to every event.
-pub const SCHEMA_VERSION: u32 = 7;
+/// v8 (#1873): added a per-event `uuid` idempotency key to `process_start`
+/// and `usage_snapshot`.
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -56,6 +58,11 @@ pub struct ProcessStart {
     pub schema: u32,
     /// Always `"process_start"`.
     pub event: &'static str,
+    /// Random v4 UUID minted once when the event is built. Stable across any
+    /// redelivery of the same logical event, so the gateway can forward it as
+    /// the PostHog event `uuid` and let PostHog dedup retried POSTs. Distinct
+    /// from `install_id` (stable per install) and `sent_at` (per-emit stamp).
+    pub uuid: String,
     pub install_id: String,
     /// RFC 3339 UTC timestamp.
     pub sent_at: String,
@@ -115,6 +122,11 @@ pub struct UsageSnapshot {
     pub schema: u32,
     /// Always `"usage_snapshot"`.
     pub event: &'static str,
+    /// Random v4 UUID minted once when the event is built; see
+    /// [`ProcessStart::uuid`]. Excluded from the in-process dedup fingerprint
+    /// (`super::snapshot_fingerprint`) so two snapshots with identical content
+    /// still compare equal.
+    pub uuid: String,
     pub install_id: String,
     pub sent_at: String,
     pub surface: Surface,
