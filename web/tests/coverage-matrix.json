@@ -2144,6 +2144,17 @@
       ]
     },
     {
+      "id": "story.projects-edit",
+      "kind": "live-playwright",
+      "risk": "medium",
+      "specs": [
+        "tests/live/acp-stories/projects-edit.spec.ts"
+      ],
+      "components": [
+        "web/src/components/ProjectsView.tsx"
+      ]
+    },
+    {
       "id": "story.projects-remove",
       "kind": "live-playwright",
       "risk": "medium",

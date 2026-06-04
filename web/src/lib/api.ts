@@ -697,6 +697,37 @@ export async function deleteProject(
   }
 }
 
+/** Update a project's default base branch. Pass `null` to clear it. */
+export async function updateProject(
+  name: string,
+  scope: "global" | "profile",
+  defaultBaseBranch: string | null,
+): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
+  try {
+    const res = await fetch(
+      `/api/projects/${encodeURIComponent(name)}?scope=${scope}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
+      },
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return { ok: false, error: data.message || `Server error (${res.status})` };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    const project = (await res.json()) as ProjectInfo;
+    return { ok: true, project };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
 export async function fetchDockerStatus(): Promise<DockerStatusResponse> {
   return (
     (await fetchJson<DockerStatusResponse>("/api/docker/status")) ?? {

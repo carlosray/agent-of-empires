@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ProjectInfo } from "../lib/types";
-import { fetchProjects, createProject, deleteProject } from "../lib/api";
+import { fetchProjects, createProject, deleteProject, updateProject } from "../lib/api";
 import { DirectoryBrowser } from "./DirectoryBrowser";
 
 interface Props {
@@ -22,6 +22,13 @@ export function ProjectsView({ onClose, readOnly }: Props) {
   const [allowOverride, setAllowOverride] = useState(false);
   const [showBrowser, setShowBrowser] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+
+  // Inline per-row base-branch edit state, keyed by `${scope}:${path}`.
+  const [editingKey, setEditingKey] = useState<string | null>(null);
+  const [editBranch, setEditBranch] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  const projectKey = (p: ProjectInfo) => `${p.scope}:${p.path}`;
 
   const reload = async () => {
     setLoading(true);
@@ -69,6 +76,31 @@ export function ProjectsView({ onClose, readOnly }: Props) {
       setError(result.error || "Remove failed");
       return;
     }
+    await reload();
+  };
+
+  const startEdit = (p: ProjectInfo) => {
+    setError(null);
+    setEditingKey(projectKey(p));
+    setEditBranch(p.default_base_branch ?? "");
+  };
+
+  const cancelEdit = () => {
+    setEditingKey(null);
+    setEditBranch("");
+  };
+
+  const handleSaveEdit = async (p: ProjectInfo) => {
+    setSavingEdit(true);
+    setError(null);
+    const trimmed = editBranch.trim();
+    const result = await updateProject(p.name, p.scope, trimmed || null);
+    setSavingEdit(false);
+    if (!result.ok) {
+      setError(result.error || "Update failed");
+      return;
+    }
+    cancelEdit();
     await reload();
   };
 
@@ -149,7 +181,7 @@ export function ProjectsView({ onClose, readOnly }: Props) {
               className="w-full px-3 py-2 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 mb-3"
             />
 
-            <label className="block text-[12px] text-text-dim mb-1">Default base branch for extra repos (optional)</label>
+            <label className="block text-[12px] text-text-dim mb-1">Default base branch (optional)</label>
             <input
               type="text"
               value={baseBranch}
@@ -269,21 +301,62 @@ export function ProjectsView({ onClose, readOnly }: Props) {
                   <p className="text-[11px] font-mono text-text-dim truncate mt-0.5" title={p.path}>
                     {p.path}
                   </p>
-                  {p.default_base_branch && (
-                    <p className="text-[11px] text-text-dim mt-0.5">
-                      base branch:{" "}
-                      <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
-                    </p>
+                  {editingKey === projectKey(p) ? (
+                    <div className="mt-1.5 flex items-center gap-2">
+                      <input
+                        type="text"
+                        autoFocus
+                        value={editBranch}
+                        onChange={(e) => setEditBranch(e.target.value)}
+                        placeholder="blank = inherit global default, then auto-detect"
+                        className="flex-1 px-2 py-1 text-[12px] bg-surface-900 border border-surface-700/40 rounded text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600 font-mono"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleSaveEdit(p)}
+                        disabled={savingEdit}
+                        className={`px-2 py-1 text-xs rounded-md font-medium ${
+                          savingEdit
+                            ? "bg-brand-600/40 text-surface-900/60 cursor-not-allowed"
+                            : "bg-brand-600 hover:bg-brand-700 text-surface-900 cursor-pointer"
+                        }`}
+                      >
+                        {savingEdit ? "Saving…" : "Save"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={cancelEdit}
+                        className="px-2 py-1 text-xs border border-surface-700 text-text-secondary hover:bg-surface-800 rounded-md cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    p.default_base_branch && (
+                      <p className="text-[11px] text-text-dim mt-0.5">
+                        base branch:{" "}
+                        <span className="font-mono text-text-secondary">{p.default_base_branch}</span>
+                      </p>
+                    )
                   )}
                 </div>
-                {!readOnly && (
-                  <button
-                    type="button"
-                    onClick={() => handleRemove(p)}
-                    className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-status-error hover:border-status-error/40 rounded-md cursor-pointer"
-                  >
-                    Remove
-                  </button>
+                {!readOnly && editingKey !== projectKey(p) && (
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => startEdit(p)}
+                      className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-text-primary hover:border-surface-700 rounded-md cursor-pointer"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleRemove(p)}
+                      className="px-2 py-1 text-xs border border-surface-700 text-text-dim hover:text-status-error hover:border-status-error/40 rounded-md cursor-pointer"
+                    >
+                      Remove
+                    </button>
+                  </div>
                 )}
               </li>
             ))}
