@@ -1,10 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-  classifyMcp,
-  humanizeServer,
-  humanizeVerb,
-} from "./mcpClassify";
-import type { ToolCall } from "./cockpitTypes";
+import { classifyMcp, humanizeServer, humanizeVerb } from "./mcpClassify";
+import type { ToolCall } from "./acpTypes";
 
 function tool(name: string, args: Record<string, unknown> = {}): ToolCall {
   return {

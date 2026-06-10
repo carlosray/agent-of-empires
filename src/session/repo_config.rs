@@ -21,34 +21,48 @@ pub enum HookProgress {
 }
 
 use super::config::Config;
-use super::profile_config::{
-    HooksConfigOverride, ProfileConfig, SandboxConfigOverride, SessionConfigOverride,
-    TmuxConfigOverride, UpdatesConfigOverride, WorktreeConfigOverride,
-};
+use super::profile_config::ProfileConfig;
+use super::project_mcp::ProjectMcpServer;
+
+/// Config sections a repo `.agent-of-empires/config.toml` may override.
+/// Personal/global sections (theme, status_hooks, acp, web, logging, host
+/// environment) are intentionally excluded, matching the historical typed
+/// `RepoConfig` that simply had no field for them.
+const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
+    "hooks", "session", "sandbox", "worktree", "updates", "tmux", "sound",
+];
 
 /// Repository-level configuration loaded from `.agent-of-empires/config.toml`.
+///
+/// Stored as a sparse override tree like [`ProfileConfig`] (#1692): section
+/// tables keyed by config-section name. Only [`REPO_OVERRIDABLE_SECTIONS`] are
+/// honored; any other section is dropped on merge and on save, so a repo can
+/// never override personal/global settings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RepoConfig {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hooks: Option<HooksConfig>,
+    #[serde(flatten)]
+    pub overrides: serde_json::Map<String, serde_json::Value>,
+}
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session: Option<SessionConfigOverride>,
+impl RepoConfig {
+    /// The lifecycle hooks section parsed into a [`HooksConfig`], if present.
+    /// Used by the trust system to hash and display the repo's hook commands.
+    pub fn hooks(&self) -> Option<HooksConfig> {
+        self.overrides
+            .get("hooks")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+    }
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sandbox: Option<SandboxConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<WorktreeConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub updates: Option<UpdatesConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tmux: Option<TmuxConfigOverride>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sound: Option<crate::sound::SoundConfigOverride>,
+    /// The overrides restricted to repo-allowed sections, as a JSON object.
+    fn allowed_overrides(&self) -> serde_json::Value {
+        serde_json::Value::Object(
+            self.overrides
+                .iter()
+                .filter(|(k, _)| REPO_OVERRIDABLE_SECTIONS.contains(&k.as_str()))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
 }
 
 /// Hook commands to run at various lifecycle points.
@@ -121,7 +135,7 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
     };
 
     if is_legacy {
-        tracing::warn!(
+        tracing::warn!(target: "session.store",
             "Found repo config at legacy path .aoe/config.toml -- please rename to .agent-of-empires/config.toml"
         );
     }
@@ -135,6 +149,12 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
 
     let config: RepoConfig = toml::from_str(&content)
         .with_context(|| format!("Failed to parse {}", config_path.display()))?;
+
+    // Type-check the repo overrides by merging onto a default Config (the sparse
+    // map accepts any JSON). A wrong-typed value surfaces as a load error here
+    // rather than a merge-time panic; the caller degrades to profile config.
+    super::profile_config::validate_overrides_typecheck(&config.allowed_overrides())
+        .with_context(|| format!("Invalid override in {}", config_path.display()))?;
 
     Ok(Some(config))
 }
@@ -152,16 +172,16 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
     let content = toml::to_string_pretty(config)
         .with_context(|| "Failed to serialize repo config".to_string())?;
 
-    fs::write(&config_path, content)
+    super::atomic_write(&config_path, content.as_bytes())
         .with_context(|| format!("Failed to write {}", config_path.display()))?;
 
     // Clean up legacy .aoe/config.toml to prevent stale config from reactivating
     let legacy_config = project_path.join(LEGACY_REPO_CONFIG_PATH);
     if legacy_config.exists() {
         if let Err(e) = fs::remove_file(&legacy_config) {
-            tracing::warn!("Failed to remove legacy {}: {}", legacy_config.display(), e);
+            tracing::warn!(target: "session.store", "Failed to remove legacy {}: {}", legacy_config.display(), e);
         } else {
-            tracing::info!("Removed legacy .aoe/config.toml after migrating to .agent-of-empires/");
+            tracing::info!(target: "session.store", "Removed legacy .aoe/config.toml after migrating to .agent-of-empires/");
         }
         // Also remove the .aoe/ directory if it's now empty
         let legacy_dir = project_path.join(".aoe");
@@ -174,113 +194,68 @@ pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> 
 }
 
 /// Merge repo config overrides into an already-resolved config (global + profile).
-pub fn merge_repo_config(mut config: Config, repo: &RepoConfig) -> Config {
-    use super::profile_config::{
-        apply_sandbox_overrides, apply_session_overrides, apply_tmux_overrides,
-        apply_worktree_overrides,
-    };
+///
+/// Routes through the generic sparse-JSON merge (#1692): the repo's
+/// allowed-section overrides are applied onto the serialized config. Object
+/// keys recurse and scalars/arrays replace, matching the legacy per-field merge
+/// (empty hook lists never serialize, so they inherit rather than wipe).
+pub fn merge_repo_config(config: Config, repo: &RepoConfig) -> Config {
+    super::profile_config::merge_configs_generic(&config, &repo.allowed_overrides())
+}
 
-    if let Some(ref session_override) = repo.session {
-        apply_session_overrides(&mut config.session, session_override);
-    }
-
-    if let Some(ref sandbox_override) = repo.sandbox {
-        apply_sandbox_overrides(&mut config.sandbox, sandbox_override);
-    }
-
-    if let Some(ref worktree_override) = repo.worktree {
-        apply_worktree_overrides(&mut config.worktree, worktree_override);
-    }
-
-    if let Some(ref hooks) = repo.hooks {
-        if !hooks.on_create.is_empty() {
-            config.hooks.on_create = hooks.on_create.clone();
-        }
-        if !hooks.on_launch.is_empty() {
-            config.hooks.on_launch = hooks.on_launch.clone();
-        }
-        if !hooks.on_destroy.is_empty() {
-            config.hooks.on_destroy = hooks.on_destroy.clone();
-        }
-    }
-
-    if let Some(ref updates_override) = repo.updates {
-        if let Some(check_enabled) = updates_override.check_enabled {
-            config.updates.check_enabled = check_enabled;
-        }
-        if let Some(check_interval_hours) = updates_override.check_interval_hours {
-            config.updates.check_interval_hours = check_interval_hours;
-        }
-        if let Some(notify_in_cli) = updates_override.notify_in_cli {
-            config.updates.notify_in_cli = notify_in_cli;
-        }
-    }
-
-    if let Some(ref tmux_override) = repo.tmux {
-        apply_tmux_overrides(&mut config.tmux, tmux_override);
-    }
-
-    if let Some(ref sound_override) = repo.sound {
-        crate::sound::apply_sound_overrides(&mut config.sound, sound_override);
-    }
-
-    config
+/// Filter a sparse override map to the repo-allowed sections.
+fn repo_overridable_overrides(
+    overrides: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    overrides
+        .iter()
+        .filter(|(k, _)| REPO_OVERRIDABLE_SECTIONS.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Convert a RepoConfig into a ProfileConfig for TUI editing.
 /// This allows the settings TUI to reuse the same field infrastructure
-/// for all three scopes (Global, Profile, Repo).
+/// for all three scopes (Global, Profile, Repo). Only repo-allowed sections
+/// carry over so the TUI never shows a personal/global field as repo-overridden.
 pub fn repo_config_to_profile(repo: &RepoConfig) -> ProfileConfig {
     ProfileConfig {
-        updates: repo.updates.clone(),
-        worktree: repo.worktree.clone(),
-        sandbox: repo.sandbox.clone(),
-        tmux: repo.tmux.clone(),
-        session: repo.session.clone(),
-        sound: repo.sound.clone(),
-        hooks: repo.hooks.as_ref().map(|h| HooksConfigOverride {
-            on_create: if h.on_create.is_empty() {
-                None
-            } else {
-                Some(h.on_create.clone())
-            },
-            on_launch: if h.on_launch.is_empty() {
-                None
-            } else {
-                Some(h.on_launch.clone())
-            },
-            on_destroy: if h.on_destroy.is_empty() {
-                None
-            } else {
-                Some(h.on_destroy.clone())
-            },
-        }),
-        ..Default::default()
+        description: None,
+        overrides: repo_overridable_overrides(&repo.overrides),
     }
 }
 
-/// Convert a ProfileConfig back into a RepoConfig after TUI editing.
+/// Convert a ProfileConfig back into a RepoConfig after TUI editing. Sections
+/// the repo may not override (theme, acp, ...) are dropped here, matching
+/// the historical behavior where editing them in Repo scope was discarded.
 pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
     RepoConfig {
-        hooks: profile.hooks.as_ref().map(|h| HooksConfig {
-            on_create: h.on_create.clone().unwrap_or_default(),
-            on_launch: h.on_launch.clone().unwrap_or_default(),
-            on_destroy: h.on_destroy.clone().unwrap_or_default(),
-        }),
-        session: profile.session.clone(),
-        sandbox: profile.sandbox.clone(),
-        worktree: profile.worktree.clone(),
-        updates: profile.updates.clone(),
-        tmux: profile.tmux.clone(),
-        sound: profile.sound.clone(),
+        overrides: repo_overridable_overrides(&profile.overrides),
     }
+}
+
+/// For worktrees, `.agent-of-empires/config.toml` lives in the main repo, not
+/// the worktree dir. Resolve the main repo path so repo config follows the
+/// session regardless of which checkout it was created from.
+///
+/// Only attempts the lookup when `project_path` itself has a `.git` entry,
+/// matching the guard in `compute_volume_paths` (avoids `Repository::discover`
+/// walking up to an unrelated ancestor repo, e.g. a dotfile-managed `$HOME`).
+pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
+    if project_path.join(".git").exists() {
+        if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
+            return main_repo;
+        }
+    }
+    project_path.to_path_buf()
 }
 
 /// Resolve config with repo overrides: global -> profile -> repo.
 pub fn resolve_config_with_repo(profile: &str, project_path: &Path) -> Result<Config> {
     let config = super::profile_config::resolve_config(profile)?;
+    let config_path = repo_config_source_path(project_path);
 
-    match load_repo_config(project_path)? {
+    match load_repo_config(&config_path)? {
         Some(repo_config) => Ok(merge_repo_config(config, &repo_config)),
         None => Ok(config),
     }
@@ -292,13 +267,14 @@ pub fn resolve_config_with_repo(profile: &str, project_path: &Path) -> Result<Co
 /// and a malformed profile config degrades to defaults.
 pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> Config {
     let base = super::profile_config::resolve_config_or_warn(profile);
-    match load_repo_config(project_path) {
+    let config_path = repo_config_source_path(project_path);
+    match load_repo_config(&config_path) {
         Ok(Some(repo_config)) => merge_repo_config(base, &repo_config),
         Ok(None) => base,
         Err(e) => {
-            tracing::warn!(
+            tracing::warn!(target: "session.store",
                 "Failed to load repo config at '{}', falling back to profile config: {e}",
-                project_path.display()
+                config_path.display()
             );
             base
         }
@@ -309,11 +285,19 @@ pub fn resolve_config_with_repo_or_warn(profile: &str, project_path: &Path) -> C
 // Hook trust system
 // ---------------------------------------------------------------------------
 
-/// A single trusted repo entry.
+/// A single trusted repo entry. A row may carry hook trust, project-MCP trust,
+/// or both, recorded independently so trusting one surface never silently
+/// re-authorizes a stale version of the other (#1985). `hooks_hash` was a bare
+/// `String` before MCP trust existed; it is now `Option<String>` so a repo
+/// trusted only for its `.mcp.json` (no hooks) is representable. Existing
+/// on-disk rows with a string `hooks_hash` deserialize as `Some`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrustedRepo {
     path: String,
-    hooks_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hooks_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mcp_hash: Option<String>,
     trusted_at: String,
 }
 
@@ -375,28 +359,58 @@ fn normalize_path(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_string_lossy().to_string())
 }
 
-/// Check if a repo's hooks are trusted (hash matches stored trust entry).
-/// Normalizes `project_path` before lookup.
-pub fn is_repo_trusted(project_path: &Path, hooks_hash: &str) -> Result<bool> {
+/// Check whether a repo is trusted for the given surface fingerprints. Each
+/// argument is per-surface: `Some(hash)` requires the stored entry to match that
+/// hash for that surface; `None` means "do not care about this surface". A repo
+/// with no stored row is never trusted. So the supervisor's MCP gate calls
+/// `is_repo_trusted(path, None, Some(&mcp_hash))`, while the hook lifecycle
+/// calls `is_repo_trusted(path, Some(&hooks_hash), None)`. Normalizes
+/// `project_path` before lookup.
+pub fn is_repo_trusted(
+    project_path: &Path,
+    hooks_hash: Option<&str>,
+    mcp_hash: Option<&str>,
+) -> Result<bool> {
     let normalized = normalize_path(project_path);
-    is_repo_trusted_normalized(&normalized, hooks_hash)
+    is_repo_trusted_normalized(&normalized, hooks_hash, mcp_hash)
+}
+
+/// Does the stored surface hash satisfy the requested one? `None` requested
+/// means the surface is not being checked; `Some` requires an exact match.
+fn surface_matches(stored: Option<&str>, want: Option<&str>) -> bool {
+    match want {
+        None => true,
+        Some(w) => stored == Some(w),
+    }
 }
 
 /// Like `is_repo_trusted` but expects an already-normalized path.
-fn is_repo_trusted_normalized(normalized_path: &str, hooks_hash: &str) -> Result<bool> {
+fn is_repo_trusted_normalized(
+    normalized_path: &str,
+    hooks_hash: Option<&str>,
+    mcp_hash: Option<&str>,
+) -> Result<bool> {
     let trusted = load_trusted_repos()?;
-    Ok(trusted
-        .repos
-        .iter()
-        .any(|r| r.path == normalized_path && r.hooks_hash == hooks_hash))
+    Ok(trusted.repos.iter().any(|r| {
+        r.path == normalized_path
+            && surface_matches(r.hooks_hash.as_deref(), hooks_hash)
+            && surface_matches(r.mcp_hash.as_deref(), mcp_hash)
+    }))
 }
 
-/// Mark a repo's hooks as trusted.
+/// Record trust for a repo, per surface. `Some(hash)` writes (or updates) that
+/// surface's trust; `None` preserves whatever was already stored for it, so
+/// approving project MCP never wipes an existing hook-trust record and vice
+/// versa. A single approval dialog passes `Some` for every surface it showed.
 ///
 /// Uses file locking to prevent concurrent writes from clobbering each other
 /// (e.g. multiple sessions being created simultaneously). Writes through the
 /// locked file handle to ensure the lock is effective.
-pub fn trust_repo(project_path: &Path, hooks_hash: &str) -> Result<()> {
+pub fn trust_repo(
+    project_path: &Path,
+    hooks_hash: Option<&str>,
+    mcp_hash: Option<&str>,
+) -> Result<()> {
     use fs2::FileExt;
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -423,11 +437,21 @@ pub fn trust_repo(project_path: &Path, hooks_hash: &str) -> Result<()> {
         toml::from_str(&content).context("Failed to parse trusted_repos.toml")?
     };
 
+    // Preserve the surface not being updated by carrying its existing hash.
+    let existing = trusted.repos.iter().find(|r| r.path == normalized);
+    let hooks_final = hooks_hash
+        .map(str::to_string)
+        .or_else(|| existing.and_then(|e| e.hooks_hash.clone()));
+    let mcp_final = mcp_hash
+        .map(str::to_string)
+        .or_else(|| existing.and_then(|e| e.mcp_hash.clone()));
+
     trusted.repos.retain(|r| r.path != normalized);
 
     trusted.repos.push(TrustedRepo {
         path: normalized,
-        hooks_hash: hooks_hash.to_string(),
+        hooks_hash: hooks_final,
+        mcp_hash: mcp_final,
         trusted_at: chrono::Utc::now().to_rfc3339(),
     });
 
@@ -439,41 +463,106 @@ pub fn trust_repo(project_path: &Path, hooks_hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// Result of checking hook trust for a project.
-pub enum HookTrustStatus {
-    /// No hooks defined, nothing to trust.
-    NoHooks,
-    /// Hooks are trusted (hash matches).
-    Trusted(HooksConfig),
-    /// Hooks need user approval before execution.
-    NeedsTrust {
-        hooks: HooksConfig,
-        hooks_hash: String,
-    },
+/// Trust state of one reviewable surface (lifecycle hooks or project MCP). Each
+/// surface is resolved independently so an untrusted project-MCP file never
+/// suppresses already-trusted hooks, and vice versa (#1985).
+pub enum TrustSurface<T> {
+    /// Surface absent on disk; nothing to trust.
+    Absent,
+    /// On-disk surface matches the stored trust hash.
+    Trusted(T),
+    /// Present but unapproved at its current fingerprint.
+    NeedsTrust { config: T, hash: String },
 }
 
-/// Check hook trust status for a project path.
-/// Loads the repo config, checks for hooks, and validates trust.
-pub fn check_hook_trust(project_path: &Path) -> Result<HookTrustStatus> {
-    let normalized = normalize_path(project_path);
-    let repo_config = match load_repo_config(Path::new(&normalized))? {
-        Some(rc) => rc,
-        None => return Ok(HookTrustStatus::NoHooks),
-    };
-
-    let hooks = match repo_config.hooks {
-        Some(h) if !h.is_empty() => h,
-        _ => return Ok(HookTrustStatus::NoHooks),
-    };
-
-    let hooks_hash = compute_hooks_hash(&hooks);
-
-    // Pass already-normalized path to avoid double canonicalization
-    if is_repo_trusted_normalized(&normalized, &hooks_hash)? {
-        Ok(HookTrustStatus::Trusted(hooks))
-    } else {
-        Ok(HookTrustStatus::NeedsTrust { hooks, hooks_hash })
+impl<T> TrustSurface<T> {
+    pub fn needs_trust(&self) -> bool {
+        matches!(self, TrustSurface::NeedsTrust { .. })
     }
+
+    /// The config when the surface is trusted, else `None`. Used by the hook
+    /// lifecycle callers that only run already-trusted hooks.
+    pub fn trusted(self) -> Option<T> {
+        match self {
+            TrustSurface::Trusted(config) => Some(config),
+            _ => None,
+        }
+    }
+}
+
+/// Combined trust state for a repo: hooks plus project MCP, both keyed on the
+/// same normalized main-repo `project_path`. `.mcp.json` is read from the main
+/// repo (the same source as hooks), so the file reviewed in the trust dialog is
+/// exactly the file the supervisor later forwards; per-worktree `.mcp.json`
+/// divergence is intentionally not supported (use the per-profile layer).
+pub struct RepoTrust {
+    pub project_path: String,
+    pub hooks: TrustSurface<HooksConfig>,
+    pub mcp: TrustSurface<Vec<ProjectMcpServer>>,
+}
+
+impl RepoTrust {
+    /// True when any surface needs interactive approval.
+    pub fn needs_prompt(&self) -> bool {
+        self.hooks.needs_trust() || self.mcp.needs_trust()
+    }
+}
+
+/// Check combined repo trust for a project path: hook commands from
+/// `.agent-of-empires/config.toml` and MCP servers from `.mcp.json`, both read
+/// from the main repo (resolved from a worktree path) and checked against the
+/// stored per-surface hashes.
+pub fn check_repo_trust(project_path: &Path) -> Result<RepoTrust> {
+    let source = repo_config_source_path(project_path);
+    let normalized = normalize_path(&source);
+    let trusted = load_trusted_repos()?;
+    let row = trusted.repos.iter().find(|r| r.path == normalized);
+
+    let hooks = match load_repo_config(Path::new(&normalized))?.and_then(|rc| rc.hooks()) {
+        Some(h) if !h.is_empty() => {
+            let hash = compute_hooks_hash(&h);
+            if row.and_then(|r| r.hooks_hash.as_deref()) == Some(hash.as_str()) {
+                TrustSurface::Trusted(h)
+            } else {
+                TrustSurface::NeedsTrust { config: h, hash }
+            }
+        }
+        _ => TrustSurface::Absent,
+    };
+
+    // MCP load errors must not suppress hook trust: a malformed `.mcp.json`
+    // here would otherwise make the whole call fail and silently drop
+    // already-trusted hooks. Treat a load error as "no project MCP" (the
+    // supervisor is the real MCP gate and logs/skips a broken file at spawn).
+    let servers = super::project_mcp::load_project_mcp_servers(Path::new(&normalized))
+        .unwrap_or_else(|e| {
+            tracing::warn!(
+                target: "session.store",
+                path = %normalized,
+                error = %e,
+                "failed to load project .mcp.json for trust; treating as absent"
+            );
+            Vec::new()
+        });
+    let mcp = if servers.is_empty() {
+        TrustSurface::Absent
+    } else {
+        let hash = super::project_mcp::fingerprint(&servers);
+        if row.and_then(|r| r.mcp_hash.as_deref()) == Some(hash.as_str()) {
+            TrustSurface::Trusted(servers)
+        } else {
+            TrustSurface::NeedsTrust {
+                config: servers,
+                hash,
+            }
+        }
+    };
+
+    Ok(RepoTrust {
+        project_path: normalized,
+        hooks,
+        mcp,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -509,6 +598,80 @@ pub fn merge_hooks_with_config(profile: &str, repo_hooks: HooksConfig) -> Option
     } else {
         Some(base)
     }
+}
+
+/// Apply repo hooks onto a base (global/profile) hooks config, mirroring how hooks
+/// actually resolve: repo overrides global per type. Unlike `merge_hooks_with_config`
+/// this keeps `on_destroy` and never collapses to `None`, since it feeds the trust
+/// dialog rather than execution gating.
+fn apply_repo_hook_overrides(mut base: HooksConfig, repo_hooks: &HooksConfig) -> HooksConfig {
+    if !repo_hooks.on_create.is_empty() {
+        base.on_create = repo_hooks.on_create.clone();
+    }
+    if !repo_hooks.on_launch.is_empty() {
+        base.on_launch = repo_hooks.on_launch.clone();
+    }
+    if !repo_hooks.on_destroy.is_empty() {
+        base.on_destroy = repo_hooks.on_destroy.clone();
+    }
+    base
+}
+
+/// Resolve the full merged hook set for display in the trust dialog: global/profile
+/// hooks overlaid by the repo's per-type overrides. Lets the user see every command
+/// that will actually run, not just the repo-defined ones (#596).
+pub fn merge_hooks_for_display(profile: &str, repo_hooks: &HooksConfig) -> HooksConfig {
+    let base = super::profile_config::resolve_config_or_warn(profile).hooks;
+    apply_repo_hook_overrides(base, repo_hooks)
+}
+
+/// One hook type's resolved commands plus where they came from, for display in the
+/// CLI trust prompt and the TUI trust dialog. `from_repo` is true when the repo
+/// defined this type (and thus overrode global); false means the commands fell
+/// through to global/profile config.
+pub struct HookDisplayGroup {
+    pub name: &'static str,
+    pub from_repo: bool,
+    pub commands: Vec<String>,
+}
+
+impl HookDisplayGroup {
+    /// Human-readable source suffix, e.g. ` (from repo)`. Shared so the CLI and TUI
+    /// render the exact same wording.
+    pub fn source_label(&self) -> &'static str {
+        if self.from_repo {
+            " (from repo)"
+        } else {
+            " (from global config)"
+        }
+    }
+}
+
+/// Build the per-type display groups for a merged hook set, labeling each type by
+/// source and dropping types with no commands. `include_destroy` controls whether
+/// `on_destroy` is listed: callers that only run the create lifecycle can omit it,
+/// while the trust surfaces show every type the user is trusting.
+pub fn hook_display_groups(
+    merged: &HooksConfig,
+    repo: &HooksConfig,
+    include_destroy: bool,
+) -> Vec<HookDisplayGroup> {
+    let mut types: Vec<(&'static str, &[String], &[String])> = vec![
+        ("on_create", &merged.on_create, &repo.on_create),
+        ("on_launch", &merged.on_launch, &repo.on_launch),
+    ];
+    if include_destroy {
+        types.push(("on_destroy", &merged.on_destroy, &repo.on_destroy));
+    }
+    types
+        .into_iter()
+        .filter(|(_, merged_cmds, _)| !merged_cmds.is_empty())
+        .map(|(name, merged_cmds, repo_cmds)| HookDisplayGroup {
+            name,
+            from_repo: !repo_cmds.is_empty(),
+            commands: merged_cmds.to_vec(),
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -554,10 +717,16 @@ const PROMPT_SUPPRESS_ENV: &[(&str, &str)] = &[
 
 /// Build a `Command` for running a hook. Local hooks use the user's `$SHELL`;
 /// container hooks use `bash` since the user shell may not be installed.
+///
+/// `extra_env` carries session metadata (see [`lifecycle_env_vars`]) that
+/// scripts can read via `$AOE_SESSION_ID`, `$AOE_PROJECT_PATH`, etc. For
+/// container hooks these are re-emitted as `docker exec -e KEY=VALUE` since
+/// host env vars don't propagate into `docker exec` by default.
 fn build_hook_command(
     cmd: &str,
     target: &HookTarget,
     opts: HookSpawnOpts,
+    extra_env: &[(&'static str, String)],
 ) -> std::process::Command {
     let shell_cmd = if opts.merge_stderr {
         format!("{} 2>&1", cmd)
@@ -570,6 +739,9 @@ fn build_hook_command(
             let shell = super::environment::user_shell();
             let mut command = std::process::Command::new(shell);
             command.arg("-c").arg(shell_cmd).current_dir(project_path);
+            for (k, v) in extra_env {
+                command.env(k, v);
+            }
             command
         }
         HookTarget::Container {
@@ -581,6 +753,9 @@ fn build_hook_command(
             command.arg("exec").arg("--workdir").arg(workdir);
             // For container hooks, env vars on the `docker exec` parent do not
             // propagate inside the container; inject them via `-e` instead.
+            for (k, v) in extra_env {
+                command.arg("-e").arg(format!("{}={}", k, v));
+            }
             if opts.detach_tty {
                 for (k, v) in PROMPT_SUPPRESS_ENV {
                     command.arg("-e").arg(format!("{}={}", k, v));
@@ -627,6 +802,27 @@ fn build_hook_command(
     command
 }
 
+/// Env vars exposed to lifecycle hooks (`on_create`, `on_launch`, `on_destroy`).
+///
+/// Mirrors the naming in [`crate::status_hooks::StatusHookContext::env_vars`]
+/// so a single vocabulary covers both hook surfaces. `AOE_SESSION_BRANCH` is
+/// only present when the session has a worktree; other fields may be empty
+/// strings (e.g., `AOE_GROUP_PATH` for ungrouped sessions).
+pub(crate) fn lifecycle_env_vars(instance: &super::Instance) -> Vec<(&'static str, String)> {
+    let mut env = vec![
+        ("AOE_SESSION_ID", instance.id.clone()),
+        ("AOE_SESSION_TITLE", instance.title.clone()),
+        ("AOE_PROJECT_PATH", instance.project_path.clone()),
+        ("AOE_PROFILE", instance.effective_profile()),
+        ("AOE_TOOL", instance.tool.clone()),
+        ("AOE_GROUP_PATH", instance.group_path.clone()),
+    ];
+    if let Some(wt) = instance.worktree_info.as_ref() {
+        env.push(("AOE_SESSION_BRANCH", wt.branch.clone()));
+    }
+    env
+}
+
 /// Format a hook failure error message from captured output.
 fn format_hook_error(
     cmd: &str,
@@ -656,17 +852,27 @@ fn format_hook_error(
 }
 
 /// Run hook commands with captured output (non-streamed).
-fn run_hooks_captured(commands: &[String], target: &HookTarget) -> Result<()> {
+fn run_hooks_captured(
+    commands: &[String],
+    target: &HookTarget,
+    extra_env: &[(&'static str, String)],
+) -> Result<()> {
     let in_container = matches!(target, HookTarget::Container { .. });
+    let timeout = crate::session::recovery::current_hook_timeout();
 
     for cmd in commands {
-        tracing::info!("Running hook: {}", cmd);
-        let mut command = build_hook_command(cmd, target, HookSpawnOpts::default());
-        let output = command
+        tracing::info!(target: "session.store", "Running hook: {}", cmd);
+        let mut command = build_hook_command(cmd, target, HookSpawnOpts::default(), extra_env);
+        command
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .output()
-            .with_context(|| format!("Failed to execute hook: {}", cmd))?;
+            .stderr(std::process::Stdio::piped());
+
+        let output = match timeout {
+            None => command
+                .output()
+                .with_context(|| format!("Failed to execute hook: {}", cmd))?,
+            Some(deadline) => run_hook_with_timeout(&mut command, deadline, cmd)?,
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -680,7 +886,7 @@ fn run_hooks_captured(commands: &[String], target: &HookTarget) -> Result<()> {
             ));
         }
 
-        tracing::debug!(
+        tracing::debug!(target: "session.store",
             "Hook completed: {} (stdout: {} bytes, stderr: {} bytes)",
             cmd,
             output.stdout.len(),
@@ -690,18 +896,78 @@ fn run_hooks_captured(commands: &[String], target: &HookTarget) -> Result<()> {
     Ok(())
 }
 
+/// Spawn a hook child, drain its pipes concurrently, and enforce a per-call
+/// wall-clock deadline. On timeout, [`crate::process::kill_process_tree`]
+/// reaps the descendant tree (SIGTERM, 100 ms grace, then SIGKILL) so the
+/// recovery cascade can release its cross-process lock (#1265).
+fn run_hook_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+    cmd_label: &str,
+) -> Result<std::process::Output> {
+    // Match Command::output's stdin so hooks reading stdin see EOF.
+    command.stdin(std::process::Stdio::null());
+    let child = command
+        .spawn()
+        .with_context(|| format!("Failed to spawn hook: {}", cmd_label))?;
+    let pid = child.id();
+
+    let (tx, rx) = mpsc::channel::<std::io::Result<std::process::Output>>();
+    std::thread::Builder::new()
+        .name(format!("aoe-hook-drain-{}", pid))
+        .spawn(move || {
+            let _ = tx.send(child.wait_with_output());
+        })
+        .expect("hook drain thread spawn");
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(output)) => Ok(output),
+        Ok(Err(io_err)) => {
+            // Reap defensively: wait_with_output can Err while the child is
+            // still live, which would re-pin the recovery lock.
+            crate::process::kill_process_tree(pid);
+            Err(anyhow::Error::from(io_err)
+                .context(format!("Failed to wait on hook: {}", cmd_label)))
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                target: "session.startup_recovery",
+                cmd = %cmd_label,
+                timeout_secs = timeout.as_secs(),
+                "on_launch hook timed out; killing process tree to release recovery lock"
+            );
+            crate::process::kill_process_tree(pid);
+            anyhow::bail!(
+                "on_launch hook timed out after {}s: {}",
+                timeout.as_secs(),
+                cmd_label
+            )
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!(
+            "hook drain thread disconnected before reporting result: {}",
+            cmd_label
+        ),
+    }
+}
+
 /// Run hook commands with streamed output sent through a progress channel.
 fn run_hooks_streamed(
     commands: &[String],
     target: &HookTarget,
     progress_tx: &mpsc::Sender<HookProgress>,
+    extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     use std::io::BufRead;
 
     let in_container = matches!(target, HookTarget::Container { .. });
 
-    for cmd in commands {
-        tracing::info!("Running hook (streamed): {}", cmd);
+    // Streamed lines are consumed live by the progress channel and gone by
+    // the time a failure dialog renders, so keep a bounded tail to attach to
+    // the error; it's the only context that survives to the user.
+    const ERROR_TAIL_LINES: usize = 20;
+
+    for (idx, cmd) in commands.iter().enumerate() {
+        tracing::info!(target: "session.store", "Running hook (streamed): {}", cmd);
         let _ = progress_tx.send(HookProgress::Started(cmd.clone()));
 
         let mut command = build_hook_command(
@@ -711,6 +977,7 @@ fn run_hooks_streamed(
                 merge_stderr: true,
                 detach_tty: true,
             },
+            extra_env,
         );
         let mut child = command
             .stdout(std::process::Stdio::piped())
@@ -718,28 +985,63 @@ fn run_hooks_streamed(
             .spawn()
             .with_context(|| format!("Failed to execute hook: {}", cmd))?;
 
+        let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        let mut total_lines = 0usize;
         if let Some(stdout) = child.stdout.take() {
             let reader = std::io::BufReader::new(stdout);
             for line in reader.lines().map_while(Result::ok) {
+                total_lines += 1;
+                if tail.len() == ERROR_TAIL_LINES {
+                    tail.pop_front();
+                }
+                tail.push_back(line.clone());
                 let _ = progress_tx.send(HookProgress::Output(line));
             }
         }
 
         let status = child.wait()?;
         if !status.success() {
-            let detail = format_hook_error(cmd, status.code(), "", "", in_container);
+            let mut detail = format_hook_error(cmd, status.code(), "", "", in_container);
+            if !tail.is_empty() {
+                let label = if total_lines > tail.len() {
+                    format!("output (last {} of {} lines)", tail.len(), total_lines)
+                } else {
+                    "output".to_string()
+                };
+                let lines: Vec<String> = tail.into();
+                detail.push_str(&format!("\n{}:\n{}", label, lines.join("\n")));
+            }
+            if commands.len() > 1 {
+                if idx + 1 < commands.len() {
+                    detail.push_str(&format!(
+                        "\n(hook {} of {}; remaining hooks skipped)",
+                        idx + 1,
+                        commands.len()
+                    ));
+                } else {
+                    detail.push_str(&format!("\n(hook {} of {})", idx + 1, commands.len()));
+                }
+            }
             let _ = progress_tx.send(HookProgress::Output(detail.clone()));
             anyhow::bail!(detail);
         }
 
-        tracing::debug!("Hook completed (streamed): {}", cmd);
+        tracing::debug!(target: "session.store", "Hook completed (streamed): {}", cmd);
     }
     Ok(())
 }
 
 /// Execute a list of hook commands in the given directory.
-pub fn execute_hooks(commands: &[String], project_path: &Path) -> Result<()> {
-    run_hooks_captured(commands, &HookTarget::Local { project_path })
+///
+/// `extra_env` is exported to each hook process; see [`lifecycle_env_vars`]
+/// for the canonical set of session env vars. Pass `&[]` if no session context
+/// is available.
+pub fn execute_hooks(
+    commands: &[String],
+    project_path: &Path,
+    extra_env: &[(&'static str, String)],
+) -> Result<()> {
+    run_hooks_captured(commands, &HookTarget::Local { project_path }, extra_env)
 }
 
 /// Execute hooks inside a Docker container.
@@ -747,6 +1049,7 @@ pub fn execute_hooks_in_container(
     commands: &[String],
     container_name: &str,
     workdir: &str,
+    extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     run_hooks_captured(
         commands,
@@ -754,6 +1057,7 @@ pub fn execute_hooks_in_container(
             container_name,
             workdir,
         },
+        extra_env,
     )
 }
 
@@ -768,12 +1072,13 @@ fn run_hooks_best_effort(
     commands: &[String],
     target: &HookTarget,
     detach_tty: bool,
+    extra_env: &[(&'static str, String)],
 ) -> Vec<String> {
     let in_container = matches!(target, HookTarget::Container { .. });
     let mut errors = Vec::new();
 
     for cmd in commands {
-        tracing::info!("Running hook (best-effort): {}", cmd);
+        tracing::info!(target: "session.store", "Running hook (best-effort): {}", cmd);
         let mut command = build_hook_command(
             cmd,
             target,
@@ -781,6 +1086,7 @@ fn run_hooks_best_effort(
                 merge_stderr: false,
                 detach_tty,
             },
+            extra_env,
         );
         match command
             .stdout(std::process::Stdio::piped())
@@ -798,10 +1104,10 @@ fn run_hooks_best_effort(
                         &stdout,
                         in_container,
                     );
-                    tracing::warn!("{}", err);
+                    tracing::warn!(target: "session.store", "{}", err);
                     errors.push(err);
                 } else {
-                    tracing::debug!(
+                    tracing::debug!(target: "session.store",
                         "Hook completed: {} (stdout: {} bytes, stderr: {} bytes)",
                         cmd,
                         output.stdout.len(),
@@ -811,7 +1117,7 @@ fn run_hooks_best_effort(
             }
             Err(e) => {
                 let err = format!("Failed to execute hook: {}: {}", cmd, e);
-                tracing::warn!("{}", err);
+                tracing::warn!(target: "session.store", "{}", err);
                 errors.push(err);
             }
         }
@@ -828,8 +1134,14 @@ pub fn execute_hooks_best_effort(
     commands: &[String],
     project_path: &Path,
     detach_tty: bool,
+    extra_env: &[(&'static str, String)],
 ) -> Vec<String> {
-    run_hooks_best_effort(commands, &HookTarget::Local { project_path }, detach_tty)
+    run_hooks_best_effort(
+        commands,
+        &HookTarget::Local { project_path },
+        detach_tty,
+        extra_env,
+    )
 }
 
 /// Execute hooks in a container with best-effort semantics (all commands attempted).
@@ -842,6 +1154,7 @@ pub fn execute_hooks_in_container_best_effort(
     container_name: &str,
     workdir: &str,
     detach_tty: bool,
+    extra_env: &[(&'static str, String)],
 ) -> Vec<String> {
     run_hooks_best_effort(
         commands,
@@ -850,6 +1163,7 @@ pub fn execute_hooks_in_container_best_effort(
             workdir,
         },
         detach_tty,
+        extra_env,
     )
 }
 
@@ -858,8 +1172,14 @@ pub fn execute_hooks_streamed(
     commands: &[String],
     project_path: &Path,
     progress_tx: &mpsc::Sender<HookProgress>,
+    extra_env: &[(&'static str, String)],
 ) -> Result<()> {
-    run_hooks_streamed(commands, &HookTarget::Local { project_path }, progress_tx)
+    run_hooks_streamed(
+        commands,
+        &HookTarget::Local { project_path },
+        progress_tx,
+        extra_env,
+    )
 }
 
 /// Execute hooks inside a Docker container with streamed output.
@@ -868,6 +1188,7 @@ pub fn execute_hooks_in_container_streamed(
     container_name: &str,
     workdir: &str,
     progress_tx: &mpsc::Sender<HookProgress>,
+    extra_env: &[(&'static str, String)],
 ) -> Result<()> {
     run_hooks_streamed(
         commands,
@@ -876,13 +1197,14 @@ pub fn execute_hooks_in_container_streamed(
             workdir,
         },
         progress_tx,
+        extra_env,
     )
 }
 
 /// Template content for `aoe init`.
 pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 # This file configures aoe behavior for this repository.
-# See: https://github.com/njbrake/agent-of-empires
+# See: https://github.com/agent-of-empires/agent-of-empires
 
 # [hooks]
 # Commands run once when a session is first created
@@ -897,7 +1219,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 
 # [sandbox]
 # enabled_by_default = true
-# default_image = "ghcr.io/njbrake/aoe-dev-sandbox:0.10"
+# default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:0.10"
 # List fields below replace (not append to) global settings when set:
 # environment = ["NODE_ENV", "DATABASE_URL"]
 # volume_ignores = ["node_modules", ".next"]
@@ -906,7 +1228,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 # enabled = true
 
 # [updates]
-# check_enabled = false
+# update_check_mode = "off"
 
 # [tmux]
 # status_bar = "auto"
@@ -1011,15 +1333,13 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_create, vec!["npm install"]);
         assert_eq!(hooks.on_launch, vec!["echo start"]);
-        assert_eq!(
-            config.session.unwrap().default_tool,
-            Some("opencode".to_string())
-        );
-        assert_eq!(config.sandbox.unwrap().enabled_by_default, Some(true));
-        assert_eq!(config.worktree.unwrap().enabled, Some(true));
+        let ov = serde_json::to_value(&config).unwrap();
+        assert_eq!(ov["session"]["default_tool"], serde_json::json!("opencode"));
+        assert_eq!(ov["sandbox"]["enabled_by_default"], serde_json::json!(true));
+        assert_eq!(ov["worktree"]["enabled"], serde_json::json!(true));
     }
 
     #[test]
@@ -1037,7 +1357,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(
             hooks.on_launch,
             vec!["uv python install 3.11 && uv venv /opt/venv --python 3.11"]
@@ -1045,14 +1365,10 @@ mod tests {
         assert!(hooks.on_create.is_empty());
 
         // Verify the sandbox config is also preserved
-        let sandbox = config.sandbox.unwrap();
+        let ov = serde_json::to_value(&config).unwrap();
         assert_eq!(
-            sandbox.environment,
-            Some(vec![
-                "ANTHROPIC_API_KEY".to_string(),
-                "UV_LINK_MODE=copy".to_string(),
-                "CI=true".to_string(),
-            ])
+            ov["sandbox"]["environment"],
+            serde_json::json!(["ANTHROPIC_API_KEY", "UV_LINK_MODE=copy", "CI=true"])
         );
     }
 
@@ -1064,7 +1380,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_create, vec!["npm install"]);
         assert!(hooks.on_launch.is_empty());
     }
@@ -1077,7 +1393,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_destroy, vec!["docker-compose down"]);
         assert!(hooks.on_create.is_empty());
         assert!(hooks.on_launch.is_empty());
@@ -1091,7 +1407,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(
             hooks.on_destroy,
             vec!["docker-compose down", "rm -rf /tmp/cache"]
@@ -1107,7 +1423,7 @@ mod tests {
         "#;
 
         let config: RepoConfig = toml::from_str(toml).unwrap();
-        let hooks = config.hooks.unwrap();
+        let hooks = config.hooks().unwrap();
         assert_eq!(hooks.on_create, vec!["npm install", "cp .env.example .env"]);
         assert_eq!(hooks.on_launch, vec!["npm start"]);
     }
@@ -1115,23 +1431,16 @@ mod tests {
     #[test]
     fn test_repo_config_empty_deserialization() {
         let config: RepoConfig = toml::from_str("").unwrap();
-        assert!(config.hooks.is_none());
-        assert!(config.session.is_none());
-        assert!(config.sandbox.is_none());
-        assert!(config.worktree.is_none());
+        assert!(config.hooks().is_none());
+        assert!(config.overrides.is_empty());
     }
 
     #[test]
     fn test_merge_repo_config_session() {
         let config = Config::default();
-        let repo = RepoConfig {
-            session: Some(SessionConfigOverride {
-                default_tool: Some("opencode".to_string()),
-                yolo_mode_default: None,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig =
+            serde_json::from_value(serde_json::json!({"session": {"default_tool": "opencode"}}))
+                .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert_eq!(merged.session.default_tool, Some("opencode".to_string()));
     }
@@ -1154,30 +1463,30 @@ mod tests {
     #[test]
     fn test_merge_repo_config_sandbox() {
         let config = Config::default();
-        let repo = RepoConfig {
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(true),
-                volume_ignores: Some(vec!["node_modules".to_string()]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig = serde_json::from_value(serde_json::json!({"sandbox": {
+            "enabled_by_default": true,
+            "default_image": "ghcr.io/example/custom:latest",
+            "volume_ignores": ["node_modules"]
+        }}))
+        .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert!(merged.sandbox.enabled_by_default);
+        // `aoe add --sandbox` reads `config.sandbox.default_image` as its
+        // fallback image, so the repo override must land here (see #1651).
+        assert_eq!(
+            merged.sandbox.default_image,
+            "ghcr.io/example/custom:latest"
+        );
         assert_eq!(merged.sandbox.volume_ignores, vec!["node_modules"]);
     }
 
     #[test]
     fn test_merge_repo_config_worktree() {
         let config = Config::default();
-        let repo = RepoConfig {
-            worktree: Some(WorktreeConfigOverride {
-                enabled: Some(true),
-                path_template: Some("../wt/{branch}".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig = serde_json::from_value(
+            serde_json::json!({"worktree": {"enabled": true, "path_template": "../wt/{branch}"}}),
+        )
+        .unwrap();
         let merged = merge_repo_config(config, &repo);
         assert!(merged.worktree.enabled);
         assert_eq!(merged.worktree.path_template, "../wt/{branch}");
@@ -1199,6 +1508,111 @@ mod tests {
     fn test_load_repo_config_nonexistent() {
         let result = load_repo_config(Path::new("/nonexistent/path")).unwrap();
         assert!(result.is_none());
+    }
+
+    fn global_hooks_fixture() -> HooksConfig {
+        HooksConfig {
+            on_create: vec!["global-create".to_string()],
+            on_launch: vec!["global-launch".to_string()],
+            on_destroy: vec!["global-destroy".to_string()],
+        }
+    }
+
+    #[test]
+    fn test_apply_repo_hook_overrides_replaces_not_appends() {
+        // A repo-defined type fully replaces the global list (per-field override,
+        // never append): the global command must NOT survive in the merged list.
+        let repo = HooksConfig {
+            on_create: vec!["repo-create-a".to_string(), "repo-create-b".to_string()],
+            on_launch: vec!["repo-launch".to_string()],
+            on_destroy: vec!["repo-destroy".to_string()],
+        };
+        let merged = apply_repo_hook_overrides(global_hooks_fixture(), &repo);
+        assert_eq!(
+            merged.on_create,
+            vec!["repo-create-a".to_string(), "repo-create-b".to_string()]
+        );
+        assert_eq!(merged.on_launch, vec!["repo-launch".to_string()]);
+        assert_eq!(merged.on_destroy, vec!["repo-destroy".to_string()]);
+        assert!(
+            !merged.on_create.iter().any(|c| c.starts_with("global")),
+            "global on_create should be replaced, not appended"
+        );
+    }
+
+    #[test]
+    fn test_apply_repo_hook_overrides_falls_through_to_global() {
+        // Types the repo leaves empty fall through to the global/profile values.
+        let repo = HooksConfig::default();
+        let merged = apply_repo_hook_overrides(global_hooks_fixture(), &repo);
+        assert_eq!(merged.on_create, vec!["global-create".to_string()]);
+        assert_eq!(merged.on_launch, vec!["global-launch".to_string()]);
+        assert_eq!(merged.on_destroy, vec!["global-destroy".to_string()]);
+    }
+
+    #[test]
+    fn test_apply_repo_hook_overrides_mixed_per_type() {
+        // Override and fall-through coexist: repo defines only on_create, so
+        // on_launch/on_destroy keep the global values.
+        let repo = HooksConfig {
+            on_create: vec!["repo-create".to_string()],
+            ..Default::default()
+        };
+        let merged = apply_repo_hook_overrides(global_hooks_fixture(), &repo);
+        assert_eq!(merged.on_create, vec!["repo-create".to_string()]);
+        assert_eq!(merged.on_launch, vec!["global-launch".to_string()]);
+        assert_eq!(merged.on_destroy, vec!["global-destroy".to_string()]);
+    }
+
+    #[test]
+    fn test_hook_display_groups_labels_source_and_filters_empty() {
+        // Repo overrides on_create; on_launch falls through to global; on_destroy
+        // has no commands and must be dropped from the display groups.
+        let repo = HooksConfig {
+            on_create: vec!["repo-create".to_string()],
+            ..Default::default()
+        };
+        let merged = HooksConfig {
+            on_create: vec!["repo-create".to_string()],
+            on_launch: vec!["global-launch".to_string()],
+            on_destroy: vec![],
+        };
+        let groups = hook_display_groups(&merged, &repo, true);
+        assert_eq!(groups.len(), 2, "empty on_destroy should be filtered out");
+
+        assert_eq!(groups[0].name, "on_create");
+        assert!(groups[0].from_repo);
+        assert_eq!(groups[0].source_label(), " (from repo)");
+        assert_eq!(groups[0].commands, vec!["repo-create".to_string()]);
+
+        assert_eq!(groups[1].name, "on_launch");
+        assert!(!groups[1].from_repo);
+        assert_eq!(groups[1].source_label(), " (from global config)");
+        assert_eq!(groups[1].commands, vec!["global-launch".to_string()]);
+    }
+
+    #[test]
+    fn test_hook_display_groups_include_destroy_toggle() {
+        // on_destroy only appears when the caller opts in (e.g. the trust surfaces),
+        // not for create-lifecycle callers.
+        let repo = HooksConfig {
+            on_destroy: vec!["repo-destroy".to_string()],
+            ..Default::default()
+        };
+        let merged = HooksConfig {
+            on_destroy: vec!["repo-destroy".to_string()],
+            ..Default::default()
+        };
+        assert!(
+            hook_display_groups(&merged, &repo, false).is_empty(),
+            "on_destroy should be hidden when include_destroy is false"
+        );
+
+        let groups = hook_display_groups(&merged, &repo, true);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].name, "on_destroy");
+        assert!(groups[0].from_repo);
+        assert_eq!(groups[0].commands, vec!["repo-destroy".to_string()]);
     }
 
     #[test]
@@ -1231,17 +1645,36 @@ mod tests {
         let trusted = TrustedRepos {
             repos: vec![TrustedRepo {
                 path: "/home/user/project".to_string(),
-                hooks_hash: "abc123".to_string(),
+                hooks_hash: Some("abc123".to_string()),
+                mcp_hash: Some("def456".to_string()),
                 trusted_at: "2026-01-31T00:00:00Z".to_string(),
             }],
         };
         let serialized = toml::to_string_pretty(&trusted).unwrap();
         assert!(serialized.contains("path = \"/home/user/project\""));
         assert!(serialized.contains("hooks_hash = \"abc123\""));
+        assert!(serialized.contains("mcp_hash = \"def456\""));
 
         let deserialized: TrustedRepos = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.repos.len(), 1);
         assert_eq!(deserialized.repos[0].path, "/home/user/project");
+    }
+
+    /// Back-compat: an existing pre-#1985 `trusted_repos.toml` row has only a
+    /// string `hooks_hash` and no `mcp_hash`; it must still deserialize, with
+    /// `mcp_hash` defaulting to `None` (project MCP never reviewed).
+    #[test]
+    fn test_trusted_repos_legacy_row_deserializes() {
+        let legacy = r#"
+[[repos]]
+path = "/home/user/project"
+hooks_hash = "abc123"
+trusted_at = "2026-01-31T00:00:00Z"
+"#;
+        let parsed: TrustedRepos = toml::from_str(legacy).unwrap();
+        assert_eq!(parsed.repos.len(), 1);
+        assert_eq!(parsed.repos[0].hooks_hash.as_deref(), Some("abc123"));
+        assert_eq!(parsed.repos[0].mcp_hash, None);
     }
 
     #[test]
@@ -1279,6 +1712,7 @@ mod tests {
             &["echo test".to_string()],
             "nonexistent_container",
             "/workspace/myproject",
+            &[],
         );
         // Should fail because docker/container doesn't exist, but should not panic
         assert!(result.is_err());
@@ -1293,17 +1727,11 @@ mod tests {
         config.worktree.auto_cleanup = true;
 
         // Only override one field per section
-        let repo = RepoConfig {
-            sandbox: Some(SandboxConfigOverride {
-                enabled_by_default: Some(false),
-                ..Default::default()
-            }),
-            worktree: Some(WorktreeConfigOverride {
-                enabled: Some(false),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig = serde_json::from_value(serde_json::json!({
+            "sandbox": {"enabled_by_default": false},
+            "worktree": {"enabled": false}
+        }))
+        .unwrap();
 
         let merged = merge_repo_config(config, &repo);
         // Overridden fields should change
@@ -1332,7 +1760,7 @@ mod tests {
             echo "SSH_ASKPASS=${SSH_ASKPASS:-unset}"
         "#;
         let (tx, rx) = mpsc::channel();
-        execute_hooks_streamed(&[probe.to_string()], tmp.path(), &tx).unwrap();
+        execute_hooks_streamed(&[probe.to_string()], tmp.path(), &tx, &[]).unwrap();
         drop(tx);
 
         let lines: Vec<String> = rx
@@ -1366,6 +1794,85 @@ mod tests {
         );
     }
 
+    /// A failing streamed hook's error must carry the hook's output, not just
+    /// the exit code. Streamed hooks merge stderr into stdout and send it down
+    /// the progress channel, which the TUI discards once creation fails; the
+    /// returned error is the only context that reaches the "Creation Failed"
+    /// dialog (via `CreationResult::Error`), so it has to include the output
+    /// that explains why the hook failed.
+    #[test]
+    fn streamed_hook_failure_error_includes_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The failure detail lives in a script file, not the hook command
+        // line, mirroring real hooks (`npm install`, `./setup.sh`) whose
+        // command text says nothing about why they failed.
+        let script = tmp.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'fatal: dependency xyz not found' >&2\nexit 3\n",
+        )
+        .unwrap();
+        let probe = "sh hook.sh".to_string();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&[probe], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("exit code 3"), "got: {}", msg);
+        assert!(
+            msg.contains("fatal: dependency xyz not found"),
+            "error must include the hook's output so the TUI dialog shows the \
+             actual failure, not just the exit code; got:\n{}",
+            msg
+        );
+    }
+
+    /// With multiple on_create hooks the failure detail says which hook
+    /// failed and that the rest were skipped, so the user doesn't assume
+    /// later hooks ran.
+    #[test]
+    fn streamed_hook_failure_names_position_when_multiple() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec![
+            "true".to_string(),
+            "sh -c 'exit 7'".to_string(),
+            "true".to_string(),
+        ];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("second hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(
+            msg.contains("(hook 2 of 3; remaining hooks skipped)"),
+            "got: {}",
+            msg
+        );
+    }
+
+    /// When the last hook fails there is nothing left to skip, so the position
+    /// text omits the "remaining hooks skipped" suffix.
+    #[test]
+    fn streamed_hook_failure_omits_skip_note_for_last_hook() {
+        let tmp = tempfile::tempdir().unwrap();
+        let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&hooks, tmp.path(), &tx, &[])
+            .expect_err("last hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("(hook 2 of 2)"), "got: {}", msg);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
+    }
+
+    /// A single hook keeps the error free of position noise.
+    #[test]
+    fn streamed_hook_failure_omits_position_when_single() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
+            .expect_err("hook exits non-zero");
+        let msg = format!("{:#}", err);
+        assert!(!msg.contains("remaining hooks skipped"), "got: {}", msg);
+    }
+
     /// The CLI/captured path leaves the terminal attached so users running
     /// `aoe add` from a real shell can still answer interactive prompts. We
     /// only verify the env vars are NOT forced here (stdin may or may not be
@@ -1374,7 +1881,7 @@ mod tests {
     fn captured_hook_does_not_force_git_env() {
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
-        execute_hooks(&[probe.to_string()], tmp.path()).unwrap();
+        execute_hooks(&[probe.to_string()], tmp.path(), &[]).unwrap();
         let out = std::fs::read_to_string(tmp.path().join("out.txt")).unwrap();
         assert!(
             !out.contains("GIT_TERMINAL_PROMPT=0"),
@@ -1400,6 +1907,7 @@ mod tests {
                 merge_stderr: true,
                 detach_tty: true,
             },
+            &[],
         );
         let args: Vec<String> = detached
             .get_args()
@@ -1422,7 +1930,8 @@ mod tests {
             args
         );
 
-        let attached = build_hook_command("rm -rf /work/build", &target, HookSpawnOpts::default());
+        let attached =
+            build_hook_command("rm -rf /work/build", &target, HookSpawnOpts::default(), &[]);
         let attached_args: Vec<String> = attached
             .get_args()
             .map(|a| a.to_string_lossy().into_owned())
@@ -1441,7 +1950,7 @@ mod tests {
     fn best_effort_hook_detaches_when_requested() {
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
-        let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), true);
+        let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), true, &[]);
         assert!(
             errors.is_empty(),
             "hook should succeed, errors: {:?}",
@@ -1459,7 +1968,7 @@ mod tests {
     fn best_effort_hook_attached_for_cli() {
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
-        let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), false);
+        let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), false, &[]);
         assert!(
             errors.is_empty(),
             "hook should succeed, errors: {:?}",
@@ -1470,6 +1979,154 @@ mod tests {
             !out.contains("GIT_TERMINAL_PROMPT=0"),
             "CLI best-effort path must not force GIT_TERMINAL_PROMPT, got: {}",
             out
+        );
+    }
+
+    /// `lifecycle_env_vars` is the contract advertised to hook authors in
+    /// docs/guides/repo-config.md. Keys (and conditional inclusion of
+    /// `AOE_SESSION_BRANCH`) must stay stable; pin the shape here so changes
+    /// have to update both the helper and the docs in lockstep.
+    #[test]
+    fn lifecycle_env_vars_shape() {
+        use super::super::instance::WorktreeInfo;
+        use crate::session::Instance;
+
+        let mut instance = Instance::new("My Session", "/tmp/proj");
+        instance.tool = "claude".to_string();
+        instance.group_path = "backend/api".to_string();
+        instance.source_profile = "work".to_string();
+
+        let env: std::collections::HashMap<_, _> =
+            lifecycle_env_vars(&instance).into_iter().collect();
+
+        assert_eq!(
+            env.get("AOE_SESSION_ID").map(String::as_str),
+            Some(instance.id.as_str())
+        );
+        assert_eq!(
+            env.get("AOE_SESSION_TITLE").map(String::as_str),
+            Some("My Session")
+        );
+        assert_eq!(
+            env.get("AOE_PROJECT_PATH").map(String::as_str),
+            Some("/tmp/proj")
+        );
+        assert_eq!(env.get("AOE_TOOL").map(String::as_str), Some("claude"));
+        assert_eq!(
+            env.get("AOE_GROUP_PATH").map(String::as_str),
+            Some("backend/api")
+        );
+        assert!(env.contains_key("AOE_PROFILE"));
+        assert!(
+            !env.contains_key("AOE_SESSION_BRANCH"),
+            "branch should be omitted when no worktree is attached"
+        );
+
+        instance.worktree_info = Some(WorktreeInfo {
+            branch: "feature/auth".to_string(),
+            main_repo_path: "/tmp/proj".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let env_with_branch: std::collections::HashMap<_, _> =
+            lifecycle_env_vars(&instance).into_iter().collect();
+        assert_eq!(
+            env_with_branch
+                .get("AOE_SESSION_BRANCH")
+                .map(String::as_str),
+            Some("feature/auth")
+        );
+    }
+
+    /// End-to-end check that session env vars actually reach the hook process:
+    /// run a real local hook that echoes its env into a file, then read it
+    /// back. Covers the captured (`execute_hooks`), streamed
+    /// (`execute_hooks_streamed`), and best-effort (`execute_hooks_best_effort`)
+    /// paths so a regression in any one of them fails this test.
+    #[test]
+    fn local_hooks_see_session_env_vars() {
+        use crate::session::Instance;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mut instance = Instance::new("My Title", tmp.path().to_str().unwrap());
+        instance.tool = "codex".to_string();
+        instance.source_profile = "work".to_string();
+        let env = lifecycle_env_vars(&instance);
+
+        let probe = r#"
+            echo "ID=${AOE_SESSION_ID}" > env.txt
+            echo "TITLE=${AOE_SESSION_TITLE}" >> env.txt
+            echo "PATH=${AOE_PROJECT_PATH}" >> env.txt
+            echo "TOOL=${AOE_TOOL}" >> env.txt
+        "#;
+
+        execute_hooks(&[probe.to_string()], tmp.path(), &env).unwrap();
+        let out = std::fs::read_to_string(tmp.path().join("env.txt")).unwrap();
+        assert!(
+            out.contains(&format!("ID={}", instance.id)),
+            "captured: {}",
+            out
+        );
+        assert!(out.contains("TITLE=My Title"), "captured: {}", out);
+        assert!(out.contains("TOOL=codex"), "captured: {}", out);
+
+        std::fs::remove_file(tmp.path().join("env.txt")).unwrap();
+        let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), false, &env);
+        assert!(errors.is_empty(), "best-effort errors: {:?}", errors);
+        let out = std::fs::read_to_string(tmp.path().join("env.txt")).unwrap();
+        assert!(
+            out.contains(&format!("ID={}", instance.id)),
+            "best-effort: {}",
+            out
+        );
+
+        std::fs::remove_file(tmp.path().join("env.txt")).unwrap();
+        let (tx, _rx) = mpsc::channel();
+        execute_hooks_streamed(&[probe.to_string()], tmp.path(), &tx, &env).unwrap();
+        drop(tx);
+        let out = std::fs::read_to_string(tmp.path().join("env.txt")).unwrap();
+        assert!(
+            out.contains(&format!("ID={}", instance.id)),
+            "streamed: {}",
+            out
+        );
+    }
+
+    /// Container hooks must forward session env via `docker exec -e KEY=VALUE`
+    /// since host env doesn't propagate into `docker exec`. Structural check
+    /// against the constructed argv (CI has no docker daemon).
+    #[test]
+    fn container_hook_forwards_session_env_via_dash_e() {
+        let target = HookTarget::Container {
+            container_name: "test_container",
+            workdir: "/work",
+        };
+        let env = vec![
+            ("AOE_SESSION_ID", "s_abc".to_string()),
+            ("AOE_SESSION_TITLE", "My Title".to_string()),
+        ];
+        let cmd = build_hook_command("true", &target, HookSpawnOpts::default(), &env);
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Assert directly against the argv vector so a value with spaces ("My
+        // Title") must be a single argument; a substring match on the joined
+        // string would pass even if the value were split across two args.
+        let has_pair = |k: &str, v: &str| -> bool {
+            args.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == format!("{}={}", k, v))
+        };
+        assert!(
+            has_pair("AOE_SESSION_ID", "s_abc"),
+            "expected (-e, AOE_SESSION_ID=s_abc) pair in argv, got: {:?}",
+            args
+        );
+        assert!(
+            has_pair("AOE_SESSION_TITLE", "My Title"),
+            "expected (-e, AOE_SESSION_TITLE=My Title) pair as single argv element, got: {:?}",
+            args
         );
     }
 }

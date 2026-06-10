@@ -61,6 +61,21 @@ pub(crate) fn resolve_client_ip(
     socket_ip
 }
 
+/// Whether `client_ip` should be treated as a same-host caller that
+/// already passes the filesystem-permission trust boundary. The local
+/// TUI reads its bearer token from `~/.agent-of-empires/serve.url`
+/// (file mode 0600), so a loopback request that carries a valid token
+/// has, by construction, the same fs-level access as the daemon owner.
+/// Layering a passphrase factor on top adds friction without
+/// strengthening the trust boundary. Used by the post-token decision
+/// (see [`post_token_auth_action`]) to bypass the passphrase wall for
+/// the local-TUI-to-local-daemon flow; remote callers proxied via a
+/// tunnel are unaffected because [`resolve_client_ip`] resolves them
+/// to the real remote IP, not loopback. See #1168.
+fn is_local_trusted(client_ip: IpAddr) -> bool {
+    client_ip.is_loopback()
+}
+
 /// Build a Set-Cookie header value with optional Secure flag for HTTPS tunnels.
 fn build_cookie(token: &str, secure: bool, max_age_secs: u64) -> String {
     let mut cookie = format!(
@@ -116,40 +131,6 @@ async fn attach_token_headers(response: &mut Response, state: &AppState) {
         state.behind_tunnel,
         max_age,
     );
-}
-
-const MAX_DEVICES: usize = 100;
-
-/// Record a successful device connection for tracking.
-async fn record_device(state: &AppState, ip: IpAddr, user_agent: &str) {
-    let ip_str = ip.to_string();
-    let ua = user_agent.to_string();
-    let mut devices = state.devices.write().await;
-    if let Some(device) = devices
-        .iter_mut()
-        .find(|d| d.ip == ip_str && d.user_agent == ua)
-    {
-        device.last_seen = chrono::Utc::now();
-        device.request_count += 1;
-    } else {
-        if devices.len() >= MAX_DEVICES {
-            if let Some(oldest_idx) = devices
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, d)| d.last_seen)
-                .map(|(i, _)| i)
-            {
-                devices.remove(oldest_idx);
-            }
-        }
-        devices.push(super::DeviceInfo {
-            ip: ip_str,
-            user_agent: ua,
-            first_seen: chrono::Utc::now(),
-            last_seen: chrono::Utc::now(),
-            request_count: 1,
-        });
-    }
 }
 
 /// Extract all token candidates from the request (cookie, query parameter, and
@@ -211,7 +192,7 @@ fn extract_ws_protocols(request: &Request) -> Vec<String> {
 }
 
 /// Strip a possible trailing slash from a path so suffix matches are
-/// not bypassed by `/api/sessions/123/cockpit/prompt/` (axum routes
+/// not bypassed by `/api/sessions/123/acp/prompt/` (axum routes
 /// both forms to the same handler). Cheap and explicit.
 fn normalize_path(path: &str) -> &str {
     path.strip_suffix('/').unwrap_or(path)
@@ -219,15 +200,22 @@ fn normalize_path(path: &str) -> &str {
 
 /// Whether a request path is exempt from the passphrase session +
 /// device-binding check. These are the login bootstrap surfaces and
-/// static assets that pre-load the SPA shell. Shared by the
+/// static assets that pre-load the SPA shell. Browser document
+/// navigations to the SPA (for example `/session/<id>`) cannot attach
+/// the device-binding header; the API and websocket routes stay
+/// non-exempt so the device-bound session still protects data and
+/// terminal attachment. Shared by the
 /// token-with-passphrase branch of `auth_middleware` and by
 /// `run_passphrase_wall` so a new bootstrap path only needs to be
 /// added once.
 fn is_login_session_exempt(path: &str) -> bool {
-    path == "/login"
+    path == "/"
+        || path == "/login"
+        || path.starts_with("/session/")
         || path == "/api/login"
         || path == "/api/login/status"
         || path == "/api/logout"
+        || path == "/theme-bootstrap.js"
         || path.starts_with("/assets/")
         || path == "/manifest.json"
         || path == "/sw.js"
@@ -251,12 +239,115 @@ fn should_refresh_session_cookie(path: &str) -> bool {
     !is_login_session_exempt(path)
 }
 
+/// Decision for the post-token branch of `auth_middleware`: a request
+/// validated its bearer token but did not present an `aoe_session`
+/// cookie + device binding. When passphrase login is on, that would
+/// normally redirect/401 with `login_required` so the SPA can pop the
+/// passphrase prompt. The bypass case lets the request through to the
+/// handler, used both for bootstrap paths (login itself, static
+/// assets) and for loopback callers per the #1168 fix.
+#[derive(Debug, PartialEq, Eq)]
+enum PostTokenAuthAction {
+    /// Pass the request through to the next layer. Either passphrase
+    /// login is disabled, the path is a login-bootstrap surface, or
+    /// the caller is on loopback and is fs-trusted.
+    Bypass,
+    /// Return a `login_required` response so the SPA pops the
+    /// passphrase prompt (or redirects to `/login` for HTML).
+    RequireLogin,
+}
+
+/// Resolve the post-token branch decision. Extracted from
+/// `auth_middleware` so the loopback-bypass policy is auditable and
+/// can be exercised by table tests without the full middleware
+/// state machine. See #1168.
+fn post_token_auth_action(
+    login_enabled: bool,
+    login_exempt: bool,
+    client_ip: IpAddr,
+) -> PostTokenAuthAction {
+    if !login_enabled || login_exempt {
+        return PostTokenAuthAction::Bypass;
+    }
+    if is_local_trusted(client_ip) {
+        PostTokenAuthAction::Bypass
+    } else {
+        PostTokenAuthAction::RequireLogin
+    }
+}
+
+/// Decision for the entry of `run_passphrase_wall`: a request landed on
+/// the wall because the daemon is running in `--auth=passphrase` mode
+/// (token gate disabled, passphrase login active). The wall normally
+/// requires a session cookie + device binding for `/api/*` and `/ws`,
+/// redirects to `/login` otherwise, and step-up-elevates writes to
+/// persistent-config surfaces. Two conditions bypass that entire
+/// gauntlet: a login-bootstrap path (so the SPA can load assets and
+/// post to `/api/login`) and a loopback caller (so the local TUI can
+/// attach without a passphrase exchange).
+#[derive(Debug, PartialEq, Eq)]
+enum PassphraseWallEntryAction {
+    /// Path is in the login-bootstrap allow-list. Skip the wall so
+    /// `/login`, `/api/login`, static assets, etc. stay reachable
+    /// even without a session.
+    BypassExempt,
+    /// Caller is on loopback. fs-perm boundary on
+    /// `~/.agent-of-empires/serve.*` already protects same-host
+    /// access, so layering the passphrase factor on top adds friction
+    /// without strengthening the trust boundary. Mirrors the token-
+    /// auth path's `is_local_trusted` carve-out from #1168 so the
+    /// local TUI works against an `--auth=passphrase` daemon. See
+    /// #1525.
+    BypassLoopback,
+    /// Run the full session + device-binding + elevation flow.
+    Continue,
+}
+
+/// Resolve the entry decision for `run_passphrase_wall`. Extracted so
+/// the bypass policy is table-testable without standing up the full
+/// axum middleware. See #1525.
+fn passphrase_wall_entry_action(path: &str, client_ip: IpAddr) -> PassphraseWallEntryAction {
+    if is_login_session_exempt(path) {
+        return PassphraseWallEntryAction::BypassExempt;
+    }
+    if is_local_trusted(client_ip) {
+        return PassphraseWallEntryAction::BypassLoopback;
+    }
+    PassphraseWallEntryAction::Continue
+}
+
+/// Emit the passphrase-only loopback-bypass event. This fires on every
+/// request a local caller makes (the TUI / dashboard poll `/api/*`
+/// continuously), so it is a frequent, expected control-flow event and
+/// belongs at `debug`, not `info`. See #1647. Extracted so the level is
+/// assertable with a tracing capture layer without standing up the full
+/// middleware.
+fn log_loopback_bypass_passphrase(client_ip: IpAddr, path: &str) {
+    tracing::debug!(
+        target: "auth.passphrase",
+        ip = %client_ip,
+        path = %path,
+        "loopback bypass: skipping passphrase factor in passphrase-only mode"
+    );
+}
+
+/// Emit the token-mode loopback-bypass event. Same per-request frequency
+/// and rationale as [`log_loopback_bypass_passphrase`]; see #1647.
+fn log_loopback_bypass_token(client_ip: IpAddr, path: &str) {
+    tracing::debug!(
+        target: "auth",
+        ip = %client_ip,
+        path = %path,
+        "loopback bypass: valid token + loopback peer; skipping passphrase factor"
+    );
+}
+
 /// Whether a request path + method needs an elevated login session
 /// (step-up auth, 15-minute passphrase confirmation window).
 ///
 /// Scope is intentionally narrow: only persistent-config writes that
 /// can plant code for the owner's next session spawn. Daily-use
-/// surfaces (cockpit prompt, terminal attach, session lifecycle,
+/// surfaces (structured view prompt, terminal attach, session lifecycle,
 /// approval resolution) rely on the session cookie + device binding
 /// alone, matching the SSH model the user wanted. See discussion on
 /// #1137. The protected attack class is the persisted-tamper pattern:
@@ -265,6 +356,19 @@ fn should_refresh_session_cookie(path: &str) -> bool {
 /// owner to spawn a session that runs it. The writes must be gated
 /// even though the spawn itself is not, because the spawn runs with
 /// the legitimate owner's elevation, not the attacker's.
+///
+/// `PATCH /api/profiles/{name}/settings` is intentionally exempt at
+/// this layer: the same endpoint accepts both tamper-surface keys
+/// (sandbox, worktree, dangerous session fields) and benign user-
+/// preference keys (theme, sound, updates, web notifications,
+/// logging, description, safe session fields). The handler validates
+/// each patch leaf against the settings schema
+/// (`settings_schema::validate_patch`) and returns the same `403
+/// elevation_required` payload when a `requires_elevation` field is
+/// present without elevation (#1692). Elevating the whole
+/// endpoint here trained every preference save to re-prompt for the
+/// passphrase, which both broke the theme picker UX and conditioned
+/// users to dismiss the real prompts. See #1510.
 ///
 /// Read-only `GET`/`HEAD` on these resources stay open; this is an
 /// allow-list, not a default-deny, so adding a benign read endpoint
@@ -292,11 +396,32 @@ fn requires_elevation(method: &axum::http::Method, path: &str) -> bool {
     if path == "/api/profiles" && method == Method::POST {
         return true;
     }
-    if path.starts_with("/api/profiles/") {
-        // Per-profile writes: PATCH /api/profiles/{name}/settings,
-        // PATCH .../rename, DELETE /api/profiles/{name}. Read GETs
-        // were filtered out by the GET/HEAD bypass above.
+    if let Some(rest) = path.strip_prefix("/api/profiles/") {
+        // Per-profile writes. `PATCH /api/profiles/{name}/settings`
+        // is body-gated inside the handler so safe preference fields
+        // (theme, sound, etc.) do not pay a passphrase prompt; the
+        // tamper-surface fields still 403 with elevation_required.
+        // Rename + delete stay path-gated. Read GETs were filtered
+        // out by the GET/HEAD bypass above.
+        if method == Method::PATCH && (rest.ends_with("/settings") || rest.ends_with("/settings/"))
+        {
+            return false;
+        }
         return true;
+    }
+
+    // Device / login-session management. Revoking another device's
+    // session or signing every device out is a credential-management
+    // action; gate it behind step-up so a stolen session+binding cannot
+    // lock the legitimate owner out without re-proving the passphrase.
+    // See #1235.
+    if path == "/api/login/logout-all" && method == Method::POST {
+        return true;
+    }
+    if let Some(rest) = path.strip_prefix("/api/login/sessions/") {
+        if method == Method::DELETE && !rest.is_empty() {
+            return true;
+        }
     }
 
     false
@@ -351,10 +476,33 @@ enum TokenSource {
 #[derive(Clone, Copy, Debug)]
 pub struct AuthenticatedTokenHash(pub [u8; 32]);
 
+/// Request extension carrying the login session id used to authenticate
+/// the current request. Inserted by `auth_middleware` whenever a valid
+/// `aoe_session` cookie + device binding pair landed (both the
+/// session+binding steady-state path and the `--auth=passphrase` wall).
+/// Absent under `--auth=none` and on bootstrap token-only paths where
+/// no session cookie exists yet. Handlers that need a body-shape
+/// elevation check (e.g. `update_profile_settings`) read this extension
+/// to call `state.login_manager.is_elevated(...)` from inside the
+/// handler instead of relying on the path-shape gate in
+/// `requires_elevation`. See #1510.
+#[derive(Clone, Debug)]
+pub struct AuthenticatedSession(pub String);
+
 /// Passphrase login wall used when the token gate is disabled
 /// (`--auth=passphrase`). Mirrors the session + device-binding check
 /// inside the token-auth path, but skips every token-cookie
 /// operation since there is no token to refresh.
+///
+/// Loopback callers bypass the wall entirely (see
+/// [`passphrase_wall_entry_action`] / [`is_local_trusted`]). This
+/// mirrors the token-auth path's #1168 carve-out so the local TUI can
+/// attach to a same-host `--auth=passphrase` daemon without going
+/// through a passphrase exchange. The fs-perm boundary on
+/// `~/.agent-of-empires/serve.*` already protects same-host access,
+/// and remote callers proxied through a tunnel come in with the real
+/// remote IP via `resolve_client_ip`, so they still hit the wall as
+/// expected. See #1525.
 ///
 /// Rate-limit lockout is intentionally not consulted here: the only
 /// authentication attempt that can fail in this path is the passphrase
@@ -372,8 +520,13 @@ async fn run_passphrase_wall(
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
-    if is_login_session_exempt(&path) {
-        return next.run(request).await;
+    match passphrase_wall_entry_action(&path, client_ip) {
+        PassphraseWallEntryAction::BypassExempt => return next.run(request).await,
+        PassphraseWallEntryAction::BypassLoopback => {
+            log_loopback_bypass_passphrase(client_ip, &path);
+            return next.run(request).await;
+        }
+        PassphraseWallEntryAction::Continue => {}
     }
 
     let session_id = super::login::extract_login_session(&request);
@@ -425,6 +578,11 @@ async fn run_passphrase_wall(
             .into_response();
     }
 
+    let mut request = request;
+    request
+        .extensions_mut()
+        .insert(AuthenticatedSession(session_id.clone()));
+
     let mut response = next.run(request).await;
 
     // Refresh login session cookie (sliding window). No token cookie
@@ -446,11 +604,11 @@ pub async fn auth_middleware(
 ) -> Response {
     let client_ip = resolve_client_ip(addr, request.headers());
 
-    // Trace cockpit ws specifically so we can see whether the
-    // browser ever reached the server when the cockpit live updates
+    // Trace structured view ws specifically so we can see whether the
+    // browser ever reached the server when the structured view live updates
     // get stuck. Other ws paths (terminal) are not as load-bearing
     // for diagnostics today.
-    if request.uri().path().contains("/cockpit/ws") {
+    if request.uri().path().contains("/acp/ws") {
         let token_sources: Vec<&'static str> = extract_tokens(&request)
             .iter()
             .map(|(_, src)| match src {
@@ -466,7 +624,7 @@ pub async fn auth_middleware(
             ip = %client_ip,
             token_sources = ?token_sources,
             ws_protocol_count = ws_protocols.len(),
-            "auth_middleware entered for cockpit ws"
+            "auth_middleware entered for structured view ws"
         );
     }
 
@@ -642,14 +800,6 @@ pub async fn auth_middleware(
             .extensions_mut()
             .insert(AuthenticatedTokenHash(hash));
     }
-    let user_agent = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown")
-        .to_string();
-    record_device(&state, client_ip, user_agent.as_str()).await;
-
     let path = request.uri().path().to_string();
     let should_attach_token =
         matches!(source, TokenSource::QueryParam | TokenSource::Bearer) || needs_upgrade;
@@ -658,38 +808,50 @@ pub async fn auth_middleware(
     // non-bootstrap paths: the user still needs to complete the
     // passphrase flow to mint a session. Return login_required
     // (or redirect to /login for HTML) so the SPA pops the
-    // passphrase prompt.
-    if login_enabled && !is_login_session_exempt(&path) {
-        tracing::warn!(
-            target: "auth",
-            ip = %client_ip,
-            path = %path,
-            had_session_cookie = presented_session_id.is_some(),
-            had_device_binding = presented_binding.is_some(),
-            "valid token but no session on non-login-exempt path; returning login_required"
-        );
-        if path.starts_with("/api/") || path.contains("/ws") {
-            return (
-                StatusCode::UNAUTHORIZED,
-                axum::Json(serde_json::json!({
-                    "error": "login_required",
-                    "message": "Passphrase login required"
-                })),
-            )
-                .into_response();
-        } else {
-            let mut response = axum::response::Redirect::temporary("/login").into_response();
-            if should_attach_token {
-                attach_token_headers(&mut response, &state).await;
+    // passphrase prompt. The one carve-out is loopback callers
+    // (#1168): the local TUI reads its token from `serve.url` (0600),
+    // so fs perms already gate same-host access; layering a
+    // passphrase on top adds friction without strengthening the
+    // boundary.
+    let login_exempt = is_login_session_exempt(&path);
+    match post_token_auth_action(login_enabled, login_exempt, client_ip) {
+        PostTokenAuthAction::Bypass => {
+            if login_enabled && !login_exempt && is_local_trusted(client_ip) {
+                log_loopback_bypass_token(client_ip, &path);
             }
-            return response;
+        }
+        PostTokenAuthAction::RequireLogin => {
+            tracing::warn!(
+                target: "auth",
+                ip = %client_ip,
+                path = %path,
+                had_session_cookie = presented_session_id.is_some(),
+                had_device_binding = presented_binding.is_some(),
+                "valid token but no session on non-login-exempt path; returning login_required"
+            );
+            if path.starts_with("/api/") || path.contains("/ws") {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    axum::Json(serde_json::json!({
+                        "error": "login_required",
+                        "message": "Passphrase login required"
+                    })),
+                )
+                    .into_response();
+            } else {
+                let mut response = axum::response::Redirect::temporary("/login").into_response();
+                if should_attach_token {
+                    attach_token_headers(&mut response, &state).await;
+                }
+                return response;
+            }
         }
     }
 
-    // Bootstrap path (login enabled + /login, /api/login, etc.) or
-    // token-only mode. Pass through; attach token cookie for the
-    // upcoming login POST when the token came via QueryParam /
-    // Bearer / grace upgrade.
+    // Bootstrap path (login enabled + /login, /api/login, etc.),
+    // token-only mode, or loopback bypass per the match above. Pass
+    // through; attach token cookie for the upcoming login POST when
+    // the token came via QueryParam / Bearer / grace upgrade.
     let mut response = next.run(request).await;
     if should_attach_token {
         attach_token_headers(&mut response, &state).await;
@@ -728,13 +890,6 @@ async fn handle_session_authenticated(
         .extensions_mut()
         .insert(AuthenticatedTokenHash(owner_hash));
 
-    let user_agent = request
-        .headers()
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("unknown");
-    record_device(state, client_ip, user_agent).await;
-
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
@@ -755,6 +910,10 @@ async fn handle_session_authenticated(
             .into_response();
     }
 
+    request
+        .extensions_mut()
+        .insert(AuthenticatedSession(session_id.clone()));
+
     let mut response = next.run(request).await;
 
     if should_refresh_session_cookie(&path) {
@@ -771,6 +930,57 @@ async fn handle_session_authenticated(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Records (level, target) for every event so the loopback-bypass
+    // helpers' log level is assertable without standing up the full
+    // axum middleware (AppState is too heavy to build in a unit test).
+    #[derive(Clone, Default)]
+    struct LevelCapture(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for LevelCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            self.0
+                .lock()
+                .unwrap()
+                .push((*meta.level(), meta.target().to_string()));
+        }
+    }
+
+    fn capture_events(f: impl FnOnce()) -> Vec<(tracing::Level, String)> {
+        use tracing_subscriber::layer::SubscriberExt;
+        let capture = LevelCapture::default();
+        let events = capture.0.clone();
+        let subscriber = tracing_subscriber::registry::Registry::default().with(capture);
+        tracing::subscriber::with_default(subscriber, f);
+        let recorded = events.lock().unwrap();
+        recorded.clone()
+    }
+
+    // #1647: the loopback bypass fires on essentially every local
+    // request, so it must log at debug, not info, to keep the
+    // default-level log readable.
+    #[test]
+    fn loopback_bypass_passphrase_logs_at_debug() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let events = capture_events(|| log_loopback_bypass_passphrase(loopback, "/api/sessions"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::DEBUG);
+        assert_eq!(events[0].1, "auth.passphrase");
+    }
+
+    #[test]
+    fn loopback_bypass_token_logs_at_debug() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let events = capture_events(|| log_loopback_bypass_token(loopback, "/api/sessions"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, tracing::Level::DEBUG);
+        assert_eq!(events[0].1, "auth");
+    }
 
     #[test]
     fn constant_time_eq_matching() {
@@ -842,6 +1052,129 @@ mod tests {
         headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
         let ip = resolve_client_ip(socket, &headers);
         assert!(ip.is_loopback());
+    }
+
+    #[test]
+    fn is_local_trusted_recognizes_loopback() {
+        assert!(is_local_trusted("127.0.0.1".parse().unwrap()));
+        assert!(is_local_trusted("::1".parse().unwrap()));
+        assert!(!is_local_trusted("192.168.1.50".parse().unwrap()));
+        assert!(!is_local_trusted("100.64.0.5".parse().unwrap()));
+        assert!(!is_local_trusted("203.0.113.10".parse().unwrap()));
+    }
+
+    // Per-row coverage of the post-token branch policy from #1168:
+    // a loopback caller with a valid token should be allowed past the
+    // passphrase wall, every other combination should still 401 or
+    // pass through exactly as before.
+    #[test]
+    fn post_token_auth_action_matrix() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback_v6: IpAddr = "::1".parse().unwrap();
+        let remote: IpAddr = "100.64.0.5".parse().unwrap();
+
+        // login disabled: bypass regardless of path or IP (token gate
+        // was the sole factor; we are now past it).
+        assert_eq!(
+            post_token_auth_action(false, false, loopback),
+            PostTokenAuthAction::Bypass
+        );
+        assert_eq!(
+            post_token_auth_action(false, false, remote),
+            PostTokenAuthAction::Bypass
+        );
+
+        // login enabled + login-bootstrap path: bypass so the SPA can
+        // load assets and post to /api/login itself.
+        assert_eq!(
+            post_token_auth_action(true, true, loopback),
+            PostTokenAuthAction::Bypass
+        );
+        assert_eq!(
+            post_token_auth_action(true, true, remote),
+            PostTokenAuthAction::Bypass
+        );
+
+        // login enabled + non-bootstrap path + loopback: the #1168
+        // carve-out. Local TUI authenticated by token from
+        // ~/.agent-of-empires/serve.url skips the passphrase factor.
+        assert_eq!(
+            post_token_auth_action(true, false, loopback),
+            PostTokenAuthAction::Bypass
+        );
+        assert_eq!(
+            post_token_auth_action(true, false, loopback_v6),
+            PostTokenAuthAction::Bypass
+        );
+
+        // login enabled + non-bootstrap path + remote: still requires
+        // the passphrase. This is the threat passphrase auth was
+        // built to mitigate (leaked token from a remote attacker).
+        // Note: when a real reverse proxy forwards a remote request
+        // to a loopback socket, `resolve_client_ip` already returns
+        // the proxy-supplied remote IP, so the input here would be
+        // non-loopback and we land on RequireLogin correctly.
+        assert_eq!(
+            post_token_auth_action(true, false, remote),
+            PostTokenAuthAction::RequireLogin
+        );
+    }
+
+    // Per-row coverage of the passphrase-wall entry policy added in
+    // #1525: a loopback caller should bypass the wall outright so the
+    // local TUI can attach to an `--auth=passphrase` daemon without a
+    // session, while remote callers continue to fall through to the
+    // session check. The login-bootstrap allow-list still wins over
+    // both regardless of IP so the SPA can fetch assets and POST to
+    // `/api/login` even when the network would otherwise be remote.
+    #[test]
+    fn passphrase_wall_entry_action_matrix() {
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let loopback_v6: IpAddr = "::1".parse().unwrap();
+        let remote: IpAddr = "100.64.0.5".parse().unwrap();
+
+        // Non-exempt path + loopback (IPv4 and IPv6): bypass the
+        // wall entirely. This is the #1525 fix: same-host TUI attach
+        // must not require a passphrase exchange.
+        assert_eq!(
+            passphrase_wall_entry_action("/api/sessions", loopback),
+            PassphraseWallEntryAction::BypassLoopback
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", loopback),
+            PassphraseWallEntryAction::BypassLoopback
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/api/settings", loopback_v6),
+            PassphraseWallEntryAction::BypassLoopback
+        );
+
+        // Non-exempt path + remote: run the full session check. This
+        // is the case the passphrase wall was built for; the bypass
+        // must not leak through here.
+        assert_eq!(
+            passphrase_wall_entry_action("/api/sessions", remote),
+            PassphraseWallEntryAction::Continue
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/sessions/abc/acp/ws", remote),
+            PassphraseWallEntryAction::Continue
+        );
+
+        // Login-bootstrap allow-list wins regardless of IP, so the
+        // SPA can pull assets and POST to `/api/login` from any peer.
+        assert_eq!(
+            passphrase_wall_entry_action("/login", remote),
+            PassphraseWallEntryAction::BypassExempt
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/api/login", remote),
+            PassphraseWallEntryAction::BypassExempt
+        );
+        assert_eq!(
+            passphrase_wall_entry_action("/assets/index.css", loopback),
+            PassphraseWallEntryAction::BypassExempt
+        );
     }
 
     #[test]
@@ -1032,18 +1365,18 @@ mod tests {
         // Login-exempt: must not refresh.
         assert!(!should_refresh_session_cookie("/api/logout"));
         assert!(!should_refresh_session_cookie("/api/login"));
+        assert!(!should_refresh_session_cookie("/"));
         assert!(!should_refresh_session_cookie("/login"));
+        assert!(!should_refresh_session_cookie("/session/abc"));
         assert!(!should_refresh_session_cookie("/api/login/status"));
+        assert!(!should_refresh_session_cookie("/theme-bootstrap.js"));
         assert!(!should_refresh_session_cookie("/assets/index.js"));
         assert!(!should_refresh_session_cookie("/manifest.json"));
         assert!(!should_refresh_session_cookie("/sw.js"));
 
         // Non-exempt: must refresh (sliding window).
-        assert!(should_refresh_session_cookie("/"));
         assert!(should_refresh_session_cookie("/api/sessions"));
-        assert!(should_refresh_session_cookie(
-            "/api/sessions/abc/cockpit/ws"
-        ));
+        assert!(should_refresh_session_cookie("/api/sessions/abc/acp/ws"));
         assert!(should_refresh_session_cookie("/api/settings"));
         // /api/login/elevate is gated by the session check (not
         // exempt), so its response should slide the window.
@@ -1055,12 +1388,16 @@ mod tests {
         // Bootstrap + status endpoints: the user might hit these
         // before a session exists (or after it expired) and the
         // middleware must let them through so the SPA can recover.
+        assert!(is_login_session_exempt("/"));
         assert!(is_login_session_exempt("/login"));
+        assert!(is_login_session_exempt("/session/abc"));
+        assert!(is_login_session_exempt("/session/2626c6af68754732"));
         assert!(is_login_session_exempt("/api/login"));
         assert!(is_login_session_exempt("/api/login/status"));
         assert!(is_login_session_exempt("/api/logout"));
 
         // Static assets: pre-load the SPA shell before any auth.
+        assert!(is_login_session_exempt("/theme-bootstrap.js"));
         assert!(is_login_session_exempt("/assets/index.css"));
         assert!(is_login_session_exempt("/assets/index-abc123.js"));
         assert!(is_login_session_exempt("/manifest.json"));
@@ -1068,11 +1405,12 @@ mod tests {
         assert!(is_login_session_exempt("/icon-192.png"));
         assert!(is_login_session_exempt("/fonts/inter.woff2"));
 
-        // Everything else stays gated.
-        assert!(!is_login_session_exempt("/"));
+        // Everything else stays gated, including real data/API and
+        // websocket attach routes that can send a device binding.
         assert!(!is_login_session_exempt("/api/sessions"));
         assert!(!is_login_session_exempt("/api/login/elevate"));
         assert!(!is_login_session_exempt("/api/settings"));
+        assert!(!is_login_session_exempt("/sessions/abc/ws"));
         assert!(!is_login_session_exempt("/api/sessions/abc/ws"));
         // /api/login/foo is not the same as /api/login exactly.
         assert!(!is_login_session_exempt("/api/login/foo"));
@@ -1106,7 +1444,9 @@ mod tests {
         // the browser and server agree on when the session is gone.
         let mgr = LoginManager::new(Some("test"));
         let binding = vec![0xAB; 32];
-        let session_id = mgr.create_session(&binding).await;
+        let session_id = mgr
+            .create_session(&binding, "127.0.0.1", "test-agent")
+            .await;
         assert!(mgr.validate_session(&session_id, &binding).await);
 
         let cookie = super::super::login::build_login_cookie(&session_id, false);
@@ -1131,16 +1471,24 @@ mod tests {
         assert!(requires_elevation(&Method::POST, "/api/profiles"));
         assert!(requires_elevation(
             &Method::PATCH,
-            "/api/profiles/work/settings"
-        ));
-        assert!(requires_elevation(
-            &Method::PATCH,
             "/api/profiles/work/rename"
         ));
         assert!(requires_elevation(&Method::DELETE, "/api/profiles/work"));
         // Trailing slash must not bypass the gate.
         assert!(requires_elevation(&Method::PATCH, "/api/settings/"));
-        assert!(requires_elevation(
+
+        // `PATCH /api/profiles/{name}/settings` is body-gated inside the
+        // handler (`update_profile_settings` validates each leaf via
+        // `settings_schema::validate_patch` and re-issues the 403
+        // elevation_required payload for `requires_elevation` fields). The
+        // path-level gate exempts it so safe preference fields (theme,
+        // sound, etc.) do not re-prompt the passphrase on every save.
+        // See #1510, #1692.
+        assert!(!requires_elevation(
+            &Method::PATCH,
+            "/api/profiles/work/settings"
+        ));
+        assert!(!requires_elevation(
             &Method::PATCH,
             "/api/profiles/work/settings/"
         ));
@@ -1152,21 +1500,18 @@ mod tests {
             &Method::GET,
             "/api/sessions/abc/ws-readonly"
         ));
+        assert!(!requires_elevation(&Method::GET, "/sessions/abc/acp/ws"));
         assert!(!requires_elevation(
-            &Method::GET,
-            "/sessions/abc/cockpit/ws"
+            &Method::POST,
+            "/api/sessions/abc/acp/prompt"
         ));
         assert!(!requires_elevation(
             &Method::POST,
-            "/api/sessions/abc/cockpit/prompt"
+            "/api/sessions/abc/acp/cancel"
         ));
         assert!(!requires_elevation(
             &Method::POST,
-            "/api/sessions/abc/cockpit/cancel"
-        ));
-        assert!(!requires_elevation(
-            &Method::POST,
-            "/api/sessions/abc/cockpit/approvals/nonce1"
+            "/api/sessions/abc/acp/approvals/nonce1"
         ));
         assert!(!requires_elevation(&Method::POST, "/api/sessions"));
         assert!(!requires_elevation(&Method::DELETE, "/api/sessions/abc"));
@@ -1183,8 +1528,16 @@ mod tests {
         assert!(!requires_elevation(&Method::POST, "/api/git/clone"));
         assert!(!requires_elevation(&Method::POST, "/api/projects"));
         assert!(!requires_elevation(&Method::DELETE, "/api/projects/myproj"));
+        assert!(!requires_elevation(&Method::PATCH, "/api/projects/myproj"));
         assert!(!requires_elevation(&Method::POST, "/api/push/subscribe"));
         assert!(!requires_elevation(&Method::POST, "/api/push/unsubscribe"));
+        // Cosmetic UI state: marking the web tour seen flips one bool and
+        // grants no capability, so it stays off the passphrase wall (the
+        // handler still enforces read_only). See #1832.
+        assert!(!requires_elevation(
+            &Method::POST,
+            "/api/app-state/web-tour-seen"
+        ));
 
         // Read-only GETs are NOT gated even on settings/profile paths.
         assert!(!requires_elevation(&Method::GET, "/api/settings"));
@@ -1200,5 +1553,18 @@ mod tests {
         assert!(!requires_elevation(&Method::GET, "/api/about"));
         assert!(!requires_elevation(&Method::POST, "/api/login"));
         assert!(!requires_elevation(&Method::POST, "/api/login/elevate"));
+
+        // Device / login-session management IS gated: revoking another
+        // device or signing everyone out is credential management, so a
+        // stolen session+binding cannot do it without re-proving the
+        // passphrase. See #1235.
+        assert!(requires_elevation(&Method::POST, "/api/login/logout-all"));
+        assert!(requires_elevation(
+            &Method::DELETE,
+            "/api/login/sessions/abc123"
+        ));
+        // But listing devices (read-only) and self-logout are not gated.
+        assert!(!requires_elevation(&Method::GET, "/api/devices"));
+        assert!(!requires_elevation(&Method::POST, "/api/logout"));
     }
 }

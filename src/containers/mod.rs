@@ -1,5 +1,6 @@
 pub mod container_interface;
 pub mod error;
+pub mod image_update;
 mod runtime;
 pub(crate) mod runtime_base;
 
@@ -7,7 +8,9 @@ use std::collections::HashMap;
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{ContainerConfig, ContainerRuntimeInterface, EnvEntry, VolumeMount};
+pub use container_interface::{
+    ContainerConfig, ContainerRuntimeInterface, EnvEntry, NamedVolumeMount, VolumeMount,
+};
 use error::Result;
 pub use runtime::ContainerRuntime;
 
@@ -39,7 +42,15 @@ pub fn get_container_runtime() -> ContainerRuntime {
 /// Check running state of all aoe sandbox containers in a single subprocess call.
 /// Returns a map of container name -> is_running.
 pub fn batch_container_health() -> HashMap<String, bool> {
-    get_container_runtime().batch_running_states("aoe-sandbox-")
+    let start = std::time::Instant::now();
+    let map = get_container_runtime().batch_running_states("aoe-sandbox-");
+    tracing::debug!(
+        target: "containers.runtime",
+        count = map.len(),
+        duration_ms = start.elapsed().as_millis() as u64,
+        "batch container health fetched",
+    );
+    map
 }
 
 pub struct DockerContainer {
@@ -82,29 +93,85 @@ impl DockerContainer {
             .build_create_args(&self.name, &self.image, config)
     }
 
+    #[tracing::instrument(target = "containers.runtime", skip_all, fields(name = %self.name, image = %self.image))]
     pub fn create(&self, config: &ContainerConfig) -> Result<String> {
-        self.runtime
-            .create_container(&self.name, &self.image, config)
+        tracing::info!(target: "containers.runtime", "creating container");
+        let result = self
+            .runtime
+            .create_container(&self.name, &self.image, config);
+        match &result {
+            Ok(id) => tracing::info!(target: "containers.runtime", id = %id, "created"),
+            Err(e) => tracing::error!(target: "containers.runtime", error = %e, "create failed"),
+        }
+        result
     }
 
+    #[tracing::instrument(target = "containers.runtime", skip_all, fields(name = %self.name))]
     pub fn start(&self) -> Result<()> {
-        self.runtime.start_container(&self.name)
+        tracing::info!(target: "containers.runtime", "starting container");
+        let result = self.runtime.start_container(&self.name);
+        if let Err(e) = &result {
+            tracing::error!(target: "containers.runtime", error = %e, "start failed");
+        }
+        result
     }
 
+    #[tracing::instrument(target = "containers.runtime", skip_all, fields(name = %self.name))]
     pub fn stop(&self) -> Result<()> {
-        self.runtime.stop_container(&self.name)
+        tracing::info!(target: "containers.runtime", "stopping container");
+        let result = self.runtime.stop_container(&self.name);
+        if let Err(e) = &result {
+            tracing::warn!(target: "containers.runtime", error = %e, "stop failed");
+        }
+        result
     }
 
+    #[tracing::instrument(target = "containers.runtime", skip_all, fields(name = %self.name, force))]
     pub fn remove(&self, force: bool) -> Result<()> {
-        self.runtime.remove(&self.name, force)
+        tracing::info!(target: "containers.runtime", "removing container");
+        let result = self.runtime.remove(&self.name, force);
+        if let Err(e) = &result {
+            tracing::warn!(target: "containers.runtime", error = %e, "remove failed");
+        }
+        result
+    }
+
+    /// Remove all named ignore volumes for this session (prefix = `aoe-vi-{session_id}-`).
+    ///
+    /// Must be called after container removal during session deletion. Named volumes are not
+    /// removed by `docker rm -v`; they require explicit cleanup. Safe to call even when the
+    /// container is already gone — volumes can outlive their container.
+    pub fn remove_named_ignore_volumes(&self, session_id: &str) {
+        let prefix = format!("aoe-vi-{}-", session_id);
+        if let Err(e) = self.runtime.base.remove_named_ignore_volumes(&prefix) {
+            tracing::warn!(
+                target: "containers.runtime",
+                name = %self.name,
+                %session_id,
+                error = %e,
+                "failed to remove named ignore volumes"
+            );
+        }
     }
 
     pub fn exec_command(&self, options: Option<&str>, cmd: &str) -> String {
         self.runtime.exec_command(&self.name, options, cmd)
     }
 
+    #[tracing::instrument(target = "containers.exec", skip_all, fields(name = %self.name, cmd = ?cmd))]
     pub fn exec(&self, cmd: &[&str]) -> Result<std::process::Output> {
-        self.runtime.exec(&self.name, cmd)
+        let result = self.runtime.exec(&self.name, cmd);
+        match &result {
+            Ok(out) => tracing::debug!(
+                target: "containers.exec",
+                status = ?out.status,
+                stdout_bytes = out.stdout.len(),
+                stderr_bytes = out.stderr.len(),
+                "exec completed",
+            ),
+            Err(e) => tracing::warn!(target: "containers.exec", error = %e, "exec failed"),
+        }
+        result
     }
 }
 
@@ -142,10 +209,12 @@ mod tests {
                 "/workspace/myproject/target".to_string(),
                 "/workspace/myproject/node_modules".to_string(),
             ],
+            named_ignore_volumes: vec![],
             environment: vec![],
             cpu_limit: None,
             memory_limit: None,
             port_mappings: vec![],
+            ..Default::default()
         };
 
         let args = container.build_create_args(&config);
@@ -171,10 +240,12 @@ mod tests {
             working_dir: "/workspace".to_string(),
             volumes: vec![],
             anonymous_volumes: vec![],
+            named_ignore_volumes: vec![],
             environment: vec![],
             cpu_limit: None,
             memory_limit: None,
             port_mappings: vec![],
+            ..Default::default()
         };
 
         let args = container.build_create_args(&config);

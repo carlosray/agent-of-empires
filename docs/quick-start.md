@@ -8,6 +8,21 @@ aoe
 
 This opens the dashboard. You'll see an empty session list on first run.
 
+| Key | Action |
+|-----|--------|
+| `n` | New session |
+| `b` | New session from saved project |
+| `Enter` | Attach to session |
+| `d` | Delete session |
+| `t` | Toggle Agent/Terminal view |
+| `D` | Open diff view |
+| `/` | Search sessions |
+| `?` | Show help (full keymap) |
+| `q` | Quit |
+| `Ctrl+b d` | Detach from tmux session |
+
+Press `?` in the TUI for the full keymap.
+
 ## Create Your First Session
 
 **From the TUI:** Press `n` to open the new session dialog. Fill in the path to your project (or leave it as `.` for the current directory) and press `Enter`.
@@ -28,7 +43,7 @@ To return to the TUI, press **`Ctrl+b d`** (the standard tmux detach shortcut).
 
 ## Use the Terminal View
 
-Press `t` to toggle between Agent View and Terminal View. Each agent session has a paired shell terminal where you can run builds, tests, and git commands without interrupting the agent.
+Press `t` to toggle between Structured View and Terminal View. Each agent session has a paired shell terminal where you can run builds, tests, and git commands without interrupting the agent.
 
 ## Review Changes with Diff View
 
@@ -47,6 +62,18 @@ aoe add . -w feat/my-feature -b
 ```
 
 This creates a new git branch, a worktree directory, and a session pointing at it. When you delete the session, AoE offers to clean up the worktree too.
+
+## Attach to Existing Work
+
+**Attach to an existing branch or worktree.** Omit `-b` and AoE re-uses the worktree for that branch, or checks the branch out into a new worktree if none exists:
+
+```bash
+aoe add . -w feat/my-feature
+```
+
+In the TUI, press `Ctrl+P` on the Worktree field and toggle **Attach to existing branch** (same toggle in the web wizard). Removing the session only cleans up worktrees AoE created; attached ones are left alone. See [Worktrees Reference](guides/worktrees.md) for the full matrix.
+
+**Resume a Claude Code conversation.** After attaching, run `/resume` in the Claude pane and pick a conversation. AoE captures the session ID and persists it so the next launch reattaches automatically. See [Session Resume](guides/session-resume.md), including `aoe session set-session-id` to set the Claude UUID explicitly.
 
 ## Create a Sandboxed Session
 
@@ -97,14 +124,12 @@ aoe serve --host 0.0.0.0          # accessible from other devices (use with VPN)
 aoe serve --daemon                # run in background
 ```
 
-Open the printed URL in any browser -- your phone, tablet, or another computer. You get the same session list, live terminal streaming, and session controls. Install it as a PWA for an app-like experience.
-
-See the [Web Dashboard Guide](guides/web-dashboard.md) for details.
+Open the printed URL in any browser (phone, tablet, or another computer) for the same session list, live terminal streaming, and session controls. Install it as a PWA for an app-like experience. See the [Web Dashboard Guide](guides/web-dashboard.md) for details.
 
 ## Next Steps
 
-- [Web Dashboard](guides/web-dashboard.md) -- access sessions from any browser
-- [Workflow Guide](guides/workflow.md) -- recommended setup with bare repos and parallel agents
-- [Docker Sandbox](guides/sandbox.md) -- container configuration and custom images
-- [Repo Config & Hooks](guides/repo-config.md) -- per-project settings
-- [CLI Reference](cli/reference.md) -- every command and flag
+- [Web Dashboard](guides/web-dashboard.md): access sessions from any browser
+- [Workflow Guide](guides/workflow.md): recommended setup with bare repos and parallel agents
+- [Docker Sandbox](guides/sandbox.md): container configuration and custom images
+- [Repo Config & Hooks](guides/repo-config.md): per-project settings
+- [CLI Reference](cli/reference.md): every command and flag

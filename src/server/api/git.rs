@@ -15,6 +15,36 @@ pub struct CloneRepoBody {
     pub destination: Option<String>,
     #[serde(default)]
     pub shallow: bool,
+    #[serde(default)]
+    pub bare: bool,
+}
+
+/// Returns true if `url` looks like a git clone URL accepted by this
+/// endpoint. Recognised forms: https, http, git, ssh, file schemes, and
+/// scp-style (`user@host:path`). Anything else is rejected with a 400
+/// before reaching `git clone`.
+fn looks_like_git_url(url: &str) -> bool {
+    url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("git://")
+        || url.starts_with("ssh://")
+        || url.starts_with("file://")
+        || (url.contains('@') && url.contains(':') && !url.contains(' '))
+}
+
+/// Expand a leading `~` or `~/` to the user's home directory.
+/// Leaves the path unchanged when no home dir is available.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    } else if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home;
+        }
+    }
+    std::path::PathBuf::from(path)
 }
 
 /// Extract a repository name from a git URL.
@@ -45,7 +75,7 @@ fn repo_name_from_url(url: &str) -> Option<String> {
 
 pub async fn clone_repo(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CloneRepoBody>,
+    body: Result<Json<CloneRepoBody>, axum::extract::rejection::JsonRejection>,
 ) -> impl IntoResponse {
     if state.read_only {
         return (
@@ -56,6 +86,10 @@ pub async fn clone_repo(
         )
             .into_response();
     }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
 
     let url = body.url.trim().to_string();
     if url.is_empty() {
@@ -68,16 +102,18 @@ pub async fn clone_repo(
             .into_response();
     }
 
-    // Basic URL scheme validation
-    let looks_like_url = url.starts_with("https://")
-        || url.starts_with("http://")
-        || url.starts_with("git://")
-        || url.starts_with("ssh://")
-        || (url.contains('@') && url.contains(':') && !url.contains(' '));
-    if !looks_like_url {
+    if !looks_like_git_url(&url) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "validation_failed", "message": "URL does not look like a git repository URL"})),
+        )
+            .into_response();
+    }
+
+    if body.bare && body.shallow {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "validation_failed", "message": "Cannot use both bare and shallow options"})),
         )
             .into_response();
     }
@@ -88,7 +124,7 @@ pub async fn clone_repo(
         if dest.is_empty() {
             None
         } else {
-            Some(std::path::PathBuf::from(dest))
+            Some(expand_tilde(dest))
         }
     } else {
         None
@@ -145,9 +181,14 @@ pub async fn clone_repo(
     }
 
     let shallow = body.shallow;
+    let bare = body.bare;
     let result = tokio::task::spawn_blocking(move || {
-        crate::git::clone_repo(&url, &destination, shallow)?;
-        Ok::<String, crate::git::error::GitError>(destination.display().to_string())
+        if bare {
+            crate::git::clone_bare_repo(&url, &destination)
+        } else {
+            crate::git::clone_repo(&url, &destination, shallow)?;
+            Ok(destination.display().to_string())
+        }
     })
     .await;
 
@@ -157,7 +198,7 @@ pub async fn clone_repo(
         }
         Ok(Err(e)) => {
             let msg = e.to_string();
-            tracing::warn!("Clone failed for {dest_display}: {msg}");
+            tracing::warn!(target: "http.api.git", "Clone failed for {dest_display}: {msg}");
             (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "clone_failed", "message": msg})),
@@ -165,7 +206,7 @@ pub async fn clone_repo(
                 .into_response()
         }
         Err(e) => {
-            tracing::error!("Clone task panicked: {e}");
+            tracing::error!(target: "http.api.git", "Clone task panicked: {e}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
@@ -306,5 +347,68 @@ mod tests {
             repo_name_from_url("ssh://git@host:2222/user/my-repo.git"),
             Some("my-repo".to_string())
         );
+    }
+
+    // ── looks_like_git_url tests ──────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_git_url_accepts_https() {
+        assert!(looks_like_git_url("https://github.com/u/r.git"));
+    }
+
+    #[test]
+    fn looks_like_git_url_accepts_http() {
+        assert!(looks_like_git_url("http://example.com/r.git"));
+    }
+
+    #[test]
+    fn looks_like_git_url_accepts_git_protocol() {
+        assert!(looks_like_git_url("git://example.com/u/r.git"));
+    }
+
+    #[test]
+    fn looks_like_git_url_accepts_ssh() {
+        assert!(looks_like_git_url("ssh://git@github.com/u/r.git"));
+    }
+
+    #[test]
+    fn looks_like_git_url_accepts_scp_style() {
+        assert!(looks_like_git_url("git@github.com:u/r.git"));
+    }
+
+    #[test]
+    fn looks_like_git_url_accepts_file_scheme() {
+        assert!(looks_like_git_url("file:///tmp/bare.git"));
+    }
+
+    #[test]
+    fn looks_like_git_url_rejects_bare_word() {
+        assert!(!looks_like_git_url("not-a-url"));
+    }
+
+    #[test]
+    fn looks_like_git_url_rejects_empty() {
+        assert!(!looks_like_git_url(""));
+    }
+
+    #[test]
+    fn looks_like_git_url_rejects_scp_style_with_space() {
+        assert!(!looks_like_git_url("git@host: /path"));
+    }
+
+    #[test]
+    fn expand_tilde_expands_home() {
+        let home = dirs::home_dir().expect("home dir");
+        assert_eq!(expand_tilde("~/foo"), home.join("foo"));
+        assert_eq!(expand_tilde("~"), home);
+    }
+
+    #[test]
+    fn expand_tilde_leaves_absolute_paths_alone() {
+        assert_eq!(
+            expand_tilde("/tmp/foo"),
+            std::path::PathBuf::from("/tmp/foo")
+        );
+        assert_eq!(expand_tilde("foo/bar"), std::path::PathBuf::from("foo/bar"));
     }
 }

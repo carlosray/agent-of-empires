@@ -47,6 +47,30 @@ on_launch = "npm install"
 
 For sandboxed sessions, hooks run inside the Docker container.
 
+#### Available environment variables
+
+Lifecycle hooks (`on_create`, `on_launch`, `on_destroy`) receive session metadata as environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `AOE_SESSION_ID` | Stable session identifier (e.g. `s_abc123`). |
+| `AOE_SESSION_TITLE` | Session title (also the worktree branch name). |
+| `AOE_PROJECT_PATH` | Absolute path to the working directory. Equals `$PWD` inside `on_create` / `on_launch`. |
+| `AOE_PROFILE` | Resolved profile name. |
+| `AOE_TOOL` | Agent tool name (e.g. `claude`, `codex`). |
+| `AOE_GROUP_PATH` | Group path for grouped sessions; empty otherwise. |
+| `AOE_SESSION_BRANCH` | Git branch name. Set only for worktree sessions. |
+
+Quote any expansion that may contain spaces (titles often do):
+
+```toml
+[hooks]
+on_create = ["port \"$AOE_SESSION_TITLE\""]
+on_destroy = ["port rm \"$AOE_SESSION_TITLE\""]
+```
+
+Container hooks get the same variables (forwarded via `docker exec -e`). Status-transition hooks in `[status_hooks]` add `AOE_OLD_STATUS`, `AOE_NEW_STATUS`, and `AOE_STATUS_CHANGED_AT`.
+
 ### Session
 
 ```toml
@@ -63,7 +87,7 @@ Override sandbox settings for this repo:
 ```toml
 [sandbox]
 enabled_by_default = true
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 environment = ["NODE_ENV", "DATABASE_URL", "CUSTOM_KEY=value"]
 volume_ignores = ["node_modules", ".next", "target"]
 extra_volumes = ["/data:/data:ro"]
@@ -131,7 +155,7 @@ default_tool = "claude"
 
 [sandbox]
 enabled_by_default = true
-default_image = "ghcr.io/njbrake/aoe-dev-sandbox:latest"
+default_image = "ghcr.io/agent-of-empires/aoe-dev-sandbox:latest"
 environment = ["DATABASE_URL", "REDIS_URL", "NODE_ENV=development"]
 volume_ignores = ["node_modules", ".next"]
 

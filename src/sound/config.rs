@@ -1,5 +1,6 @@
 //! Sound configuration: [`SoundConfig`], profile-level overrides, and volume helpers.
 
+use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
 
 /// How to select which sound file to play
@@ -13,36 +14,57 @@ pub enum SoundMode {
     Specific(String),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "sound", category = "Sound")]
 pub struct SoundConfig {
+    /// Play sounds on agent state transitions.
     #[serde(default)]
+    #[setting(label = "Enabled", widget = "toggle")]
     pub enabled: bool,
 
+    /// How to select sounds (Random or a specific file name).
     #[serde(default)]
+    #[setting(label = "Mode", widget = "custom:sound-mode")]
     pub mode: SoundMode,
 
-    /// Sound to play when a session starts (overrides mode)
+    /// Specify file name with extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "On Start", widget = "optional_text")]
     pub on_start: Option<String>,
 
-    /// Sound to play when a session enters running state
+    /// Specify file name with extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "On Running", widget = "optional_text")]
     pub on_running: Option<String>,
 
-    /// Sound to play when a session enters waiting state
+    /// Specify file name with extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "On Waiting", widget = "optional_text")]
     pub on_waiting: Option<String>,
 
-    /// Sound to play when a session enters idle state
+    /// Specify file name with extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "On Idle", widget = "optional_text")]
     pub on_idle: Option<String>,
 
-    /// Sound to play when a session enters error state
+    /// Specify file name with extension.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "On Error", widget = "optional_text")]
     pub on_error: Option<String>,
 
-    /// Playback volume (0.1 = min, 1.0 = normal, 1.5 = max)
+    /// Acp only. Played in the browser when a session needs permission.
+    /// Specify file name with extension. Surfaced by the acp's approval
+    /// hook (host-side playback intentionally has no approval transition; the
+    /// host audio device is the wrong side of the wire when the user is
+    /// running the dashboard on a separate machine). See #1038.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[setting(label = "On Approval", widget = "optional_text")]
+    pub on_approval: Option<String>,
+
+    /// Playback volume (0.1 = min, 1.0 = normal, 1.5 = max), step 0.1. Ignored
+    /// when aplay is the Linux backend.
     #[serde(default = "default_volume", skip_serializing_if = "is_default_volume")]
+    #[setting(label = "Volume", widget = "custom:sound-volume")]
     pub volume: f64,
 }
 
@@ -56,6 +78,7 @@ impl Default for SoundConfig {
             on_waiting: None,
             on_idle: None,
             on_error: None,
+            on_approval: None,
             volume: default_volume(),
         }
     }
@@ -67,62 +90,6 @@ pub(super) fn default_volume() -> f64 {
 
 pub(super) fn is_default_volume(v: &f64) -> bool {
     (*v - 1.0).abs() < 1e-9
-}
-
-/// Profile override for sound config (all fields optional, None = inherit)
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SoundConfigOverride {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub enabled: Option<bool>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mode: Option<SoundMode>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_start: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_running: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_waiting: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_idle: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on_error: Option<String>,
-
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub volume: Option<f64>,
-}
-
-/// Apply sound config overrides from a profile
-pub fn apply_sound_overrides(target: &mut SoundConfig, source: &SoundConfigOverride) {
-    if let Some(enabled) = source.enabled {
-        target.enabled = enabled;
-    }
-    if let Some(ref mode) = source.mode {
-        target.mode = mode.clone();
-    }
-    if source.on_start.is_some() {
-        target.on_start = source.on_start.clone();
-    }
-    if source.on_running.is_some() {
-        target.on_running = source.on_running.clone();
-    }
-    if source.on_waiting.is_some() {
-        target.on_waiting = source.on_waiting.clone();
-    }
-    if source.on_idle.is_some() {
-        target.on_idle = source.on_idle.clone();
-    }
-    if source.on_error.is_some() {
-        target.on_error = source.on_error.clone();
-    }
-    if let Some(volume) = source.volume {
-        target.volume = volume;
-    }
 }
 
 /// Returns the 15 volume level strings "0.1", "0.2", ..., "1.5"
@@ -154,6 +121,7 @@ mod tests {
         assert!(config.on_waiting.is_none());
         assert!(config.on_idle.is_none());
         assert!(config.on_error.is_none());
+        assert!(config.on_approval.is_none());
         // Fresh installs load `Config::default()` when no config.toml exists;
         // a 0.0 default here would mute all playback on first run.
         assert!((config.volume - 1.0).abs() < 1e-9);
@@ -189,25 +157,14 @@ mod tests {
     }
 
     #[test]
-    fn test_sound_config_override_default() {
-        let ovr = SoundConfigOverride::default();
-        assert!(ovr.enabled.is_none());
-        assert!(ovr.mode.is_none());
-    }
-
-    #[test]
-    fn test_apply_sound_overrides() {
-        let mut config = SoundConfig::default();
-        let ovr = SoundConfigOverride {
-            enabled: Some(true),
-            on_error: Some("alarm".to_string()),
-            ..Default::default()
-        };
-        apply_sound_overrides(&mut config, &ovr);
+    fn test_sound_config_deserialize_on_approval() {
+        let toml = r#"
+            enabled = true
+            on_approval = "alarm"
+        "#;
+        let config: SoundConfig = toml::from_str(toml).unwrap();
         assert!(config.enabled);
-        assert_eq!(config.on_error, Some("alarm".to_string()));
-        // Non-overridden fields stay default
-        assert_eq!(config.mode, SoundMode::Random);
+        assert_eq!(config.on_approval, Some("alarm".to_string()));
     }
 
     #[test]

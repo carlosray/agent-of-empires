@@ -83,9 +83,7 @@ export function useLongPressDrag(opts: {
       const dy = e.clientY - startY.current;
       // Dominant axis wins on diagonal drags.
       const horizontal = Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > HORIZONTAL_THRESHOLD;
-      const next: DragAxis = horizontal
-        ? dx > 0 ? "horizontal-right" : "horizontal-left"
-        : "vertical";
+      const next: DragAxis = horizontal ? (dx > 0 ? "horizontal-right" : "horizontal-left") : "vertical";
       if (next !== axis.current) {
         axis.current = next;
         onAxisChange?.(next);

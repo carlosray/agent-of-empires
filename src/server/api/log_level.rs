@@ -51,11 +51,12 @@ pub async fn get_log_level(State(_state): State<Arc<AppState>>) -> Json<LogLevel
 
 pub async fn patch_log_level(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<PatchRequest>,
+    req: Result<Json<PatchRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Result<Json<LogLevelResponse>, (StatusCode, String)> {
     if state.read_only {
         return Err((StatusCode::FORBIDDEN, "Server is in read-only mode".into()));
     }
+    let Json(req) = req.map_err(|rej| (rej.status(), rej.body_text()))?;
     let result = match (req.level.as_deref(), req.filter.as_deref()) {
         (Some(_), Some(_)) => {
             return Err((
@@ -83,15 +84,19 @@ pub async fn patch_log_level(
 
     match result {
         Ok(swap) => {
-            tracing::info!(
-                target: "log.runtime",
-                previous = %swap.previous,
-                current = %swap.current,
-                source = "rest",
-                "filter swapped"
-            );
-            if let Ok(app_dir) = crate::session::get_app_dir() {
-                logging::persist_runtime_filter(&swap.current, &app_dir);
+            // Skip the log and persist on a no-op swap so an unchanged
+            // directive cannot feed the file-watch loop (#1894).
+            if swap.changed {
+                tracing::info!(
+                    target: "log.runtime",
+                    previous = %swap.previous,
+                    current = %swap.current,
+                    source = "rest",
+                    "filter swapped"
+                );
+                if let Ok(app_dir) = crate::session::get_app_dir() {
+                    logging::persist_runtime_filter(&swap.current, &app_dir);
+                }
             }
             Ok(Json(LogLevelResponse {
                 previous: swap.previous,

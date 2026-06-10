@@ -1,13 +1,4 @@
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { toastBus, type ToastApi, type ToastKind } from "../lib/toastBus";
 import { requestOpenSession } from "../lib/sessionRoute";
 
@@ -67,16 +58,14 @@ export function ToastProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (typeof navigator === "undefined" || !navigator.serviceWorker) return;
     const handler = (event: MessageEvent) => {
-      const data = event.data as
-        | {
-            type?: string;
-            payload?: {
-              title?: string;
-              body?: string;
-              session_id?: string;
-            };
-          }
-        | null;
+      const data = event.data as {
+        type?: string;
+        payload?: {
+          title?: string;
+          body?: string;
+          session_id?: string;
+        };
+      } | null;
       if (!data || data.type !== "aoe-push" || !data.payload) return;
       const title = data.payload.title ?? "Agent of Empires";
       const body = data.payload.body ?? "";

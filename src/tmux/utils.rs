@@ -1,10 +1,11 @@
 //! tmux utility functions
 
+use anyhow::{bail, Result};
 use std::process::Command;
 use std::sync::OnceLock;
 
 pub fn strip_ansi(content: &str) -> String {
-    let mut result = content.to_string();
+    let mut result = strip_osc_st(content);
 
     while let Some(start) = result.find("\x1b[") {
         let rest = &result[start + 2..];
@@ -23,6 +24,41 @@ pub fn strip_ansi(content: &str) -> String {
         }
     }
 
+    result
+}
+
+/// Only targets ST-terminated (`\x1b\\`) OSC sequences; BEL-terminated ones
+/// must pass through unchanged since downstream parsers handle those correctly.
+pub(crate) fn strip_osc_st(content: &str) -> String {
+    const OSC: &str = "\x1b]";
+    const ST: &str = "\x1b\\";
+
+    let mut result = String::with_capacity(content.len());
+    let mut remaining = content;
+
+    while let Some(osc_start) = remaining.find(OSC) {
+        result.push_str(&remaining[..osc_start]);
+        let payload = &remaining[osc_start + OSC.len()..];
+
+        let bel_pos = payload.find('\x07');
+        let st_pos = payload.find(ST);
+
+        match (bel_pos, st_pos) {
+            (Some(b), Some(s)) if b < s => {
+                let end = osc_start + OSC.len() + b + 1;
+                result.push_str(&remaining[osc_start..end]);
+                remaining = &remaining[end..];
+            }
+            (_, Some(s)) => {
+                remaining = &payload[s + ST.len()..];
+            }
+            _ => {
+                result.push_str(&remaining[osc_start..osc_start + OSC.len()]);
+                remaining = &remaining[osc_start + OSC.len()..];
+            }
+        }
+    }
+    result.push_str(remaining);
     result
 }
 
@@ -217,6 +253,31 @@ pub fn tmux_prefix_display() -> &'static str {
     })
 }
 
+/// Run `tmux kill-session -t <name>`. A missing session is treated as
+/// success, since the goal is "this session is not present": `can't find
+/// session` (the session is gone, e.g. callers commonly kill the pane's
+/// process tree first, which can tear the session down before this lands)
+/// and `no server running` (no tmux server at all, so no session exists)
+/// are both swallowed in the C locale. Any other tmux failure returns
+/// `Err`. Caller is responsible for `refresh_session_cache` after a
+/// successful kill.
+pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
+    let output = Command::new("tmux")
+        .env("LC_ALL", "C")
+        .args(["kill-session", "-t", name])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let absent = stderr.contains("can't find session")
+            || stderr.contains("no server running")
+            || stderr.contains("error connecting");
+        if !absent {
+            bail!("Failed to kill tmux session '{}': {}", name, stderr);
+        }
+    }
+    Ok(())
+}
+
 /// Convert tmux's raw prefix notation (e.g. "C-a", "M-b", "F12") to the
 /// display form shown in UI hints. Preserves case from tmux so users see the
 /// same letter they typed in `~/.tmux.conf`.
@@ -264,8 +325,68 @@ mod tests {
     }
 
     #[test]
-    fn test_strip_ansi_osc_sequences() {
+    fn test_strip_ansi_osc_bel() {
         assert_eq!(strip_ansi("\x1b]0;Window Title\x07text"), "text");
+    }
+
+    #[test]
+    fn test_strip_ansi_osc_st() {
+        assert_eq!(strip_ansi("\x1b]0;Window Title\x1b\\text"), "text");
+    }
+
+    #[test]
+    fn test_strip_osc_st_hyperlink() {
+        assert_eq!(
+            strip_osc_st("\x1b]8;;https://example.com\x1b\\Click Here\x1b]8;;\x1b\\"),
+            "Click Here"
+        );
+    }
+
+    #[test]
+    fn test_strip_osc_st_preserves_surrounding_text() {
+        assert_eq!(
+            strip_osc_st("before \x1b]8;;https://github.com\x1b\\link text\x1b]8;;\x1b\\ after"),
+            "before link text after"
+        );
+    }
+
+    #[test]
+    fn test_strip_osc_st_multiple_links() {
+        let input = "\x1b]8;;https://a.com\x1b\\A\x1b]8;;\x1b\\ and \x1b]8;;https://b.com\x1b\\B\x1b]8;;\x1b\\";
+        assert_eq!(strip_osc_st(input), "A and B");
+    }
+
+    #[test]
+    fn test_strip_osc_st_no_osc() {
+        assert_eq!(strip_osc_st("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_strip_osc_st_preserves_sgr() {
+        assert_eq!(
+            strip_osc_st("\x1b[32m\x1b]8;;url\x1b\\green link\x1b]8;;\x1b\\\x1b[0m"),
+            "\x1b[32mgreen link\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn test_strip_osc_st_unterminated() {
+        assert_eq!(
+            strip_osc_st("\x1b]8;;url without terminator"),
+            "\x1b]8;;url without terminator"
+        );
+    }
+
+    #[test]
+    fn test_strip_osc_st_passes_bel_terminated_through() {
+        let bel_osc = "\x1b]0;Window Title\x07";
+        assert_eq!(strip_osc_st(bel_osc), bel_osc);
+    }
+
+    #[test]
+    fn test_strip_osc_st_mixed_bel_then_st() {
+        let input = "\x1b]0;Title\x07before\x1b]8;;https://x.com\x1b\\link\x1b]8;;\x1b\\after";
+        assert_eq!(strip_osc_st(input), "\x1b]0;Title\x07beforelinkafter");
     }
 
     #[test]
@@ -393,6 +514,60 @@ mod tests {
                 "allow-passthrough",
                 "on",
             ]
+        );
+    }
+
+    fn tmux_available() -> bool {
+        Command::new("tmux")
+            .arg("-V")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    // Serialized like every test that talks to the shared tmux server: a
+    // non-serial test that kills the server's last session makes the server
+    // exit, and a `#[serial]` peer whose `new-session` connects inside that
+    // teardown window fails with "server exited unexpectedly" (CI flake on
+    // update_status_reconciles_running_hook_to_waiting_on_claude_approval_prompt).
+    #[test]
+    #[serial_test::serial]
+    fn kill_session_if_present_swallows_missing_session() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_kill_if_present_missing";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+        assert!(kill_session_if_present(name).is_ok());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kill_session_if_present_kills_existing_session() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_kill_if_present_alive";
+        let _ = Command::new("tmux")
+            .args(["kill-session", "-t", name])
+            .output();
+        let spawn = Command::new("tmux")
+            .args(["new-session", "-d", "-s", name])
+            .status();
+        if !spawn.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        assert!(kill_session_if_present(name).is_ok());
+        let exists = Command::new("tmux")
+            .args(["has-session", "-t", name])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert!(
+            !exists,
+            "session should be gone after kill_session_if_present"
         );
     }
 }

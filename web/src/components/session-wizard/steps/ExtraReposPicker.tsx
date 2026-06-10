@@ -114,8 +114,7 @@ export function ExtraReposPicker({ primaryPath, selectedPaths, onChange }: Props
       {!loading && pickable.length === 0 && projects.length === 0 && (
         <p className="text-[11px] text-text-dim mb-3">
           No registered projects yet. Add one with{" "}
-          <code className="text-text-secondary">aoe project add &lt;path&gt;</code>{" "}
-          or via the Projects page.
+          <code className="text-text-secondary">aoe project add &lt;path&gt;</code> or via the Projects page.
         </p>
       )}
 

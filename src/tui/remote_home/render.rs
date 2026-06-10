@@ -7,7 +7,20 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
 
 use super::RemoteHomeState;
-use crate::tui::styles::Theme;
+use crate::tui::styles::{has_min_contrast, Theme};
+
+const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
+
+fn selected_row_style(style: Style, theme: &Theme) -> Style {
+    let Some(fg) = style.fg else {
+        return style.fg(theme.text);
+    };
+    if has_min_contrast(fg, theme.session_selection, SELECTED_ROW_CONTRAST_RATIO) {
+        style
+    } else {
+        style.fg(theme.text)
+    }
+}
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
     let chunks = Layout::default()
@@ -26,7 +39,7 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeSt
 fn render_header(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeState) {
     let spans = vec![
         Span::styled(
-            " Remote cockpit · ",
+            " Remote agent sessions · ",
             Style::default()
                 .fg(theme.title)
                 .add_modifier(Modifier::BOLD),
@@ -53,14 +66,14 @@ fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeS
         return;
     }
     if state.loading && state.sessions.is_empty() {
-        let para = Paragraph::new("loading remote cockpit sessions…")
-            .style(Style::default().fg(theme.hint));
+        let para =
+            Paragraph::new("loading remote agent sessions…").style(Style::default().fg(theme.hint));
         frame.render_widget(para, area);
         return;
     }
     if state.sessions.is_empty() {
         let para = Paragraph::new(
-            "No cockpit sessions on this daemon.\n\nPress r to refresh, q to quit.\n\nCockpit sessions are created via `aoe add --cockpit` on the host\n(or the web dashboard's New Session dialog).",
+            "No structured view sessions on this daemon.\n\nPress r to refresh, q to quit.\n\nAcp sessions are created via `aoe add --structured-view` on the host\n(or the web dashboard's New Session dialog).",
         )
         .style(Style::default().fg(theme.hint));
         frame.render_widget(para, area);
@@ -69,17 +82,37 @@ fn render_list(frame: &mut Frame, area: Rect, theme: &Theme, state: &RemoteHomeS
     let items: Vec<ListItem> = state
         .sessions
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(idx, s)| {
+            let is_selected = idx == state.cursor;
+            let title_style = Style::default().add_modifier(Modifier::BOLD);
+            let status_style = Style::default().fg(theme.hint);
+            let path_style = Style::default().fg(theme.dimmed);
             let line = Line::from(vec![
                 Span::styled(
                     format!(" {:<24}  ", truncate(&s.title, 24)),
-                    Style::default().add_modifier(Modifier::BOLD),
+                    if is_selected {
+                        selected_row_style(title_style, theme)
+                    } else {
+                        title_style
+                    },
                 ),
                 Span::styled(
                     format!("{:<10}  ", s.status),
-                    Style::default().fg(theme.hint),
+                    if is_selected {
+                        selected_row_style(status_style, theme)
+                    } else {
+                        status_style
+                    },
                 ),
-                Span::styled(s.project_path.clone(), Style::default().fg(theme.dimmed)),
+                Span::styled(
+                    s.project_path.clone(),
+                    if is_selected {
+                        selected_row_style(path_style, theme)
+                    } else {
+                        path_style
+                    },
+                ),
             ]);
             ListItem::new(line)
         })
@@ -123,5 +156,35 @@ fn truncate(s: &str, max: usize) -> String {
         let take = max.saturating_sub(1);
         let truncated: String = s.chars().take(take).collect();
         format!("{truncated}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selected_row_style_preserves_readable_color() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default().fg(theme.text);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn selected_row_style_sets_text_for_default_foreground() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default();
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn selected_row_style_falls_back_for_low_contrast_color() {
+        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        theme.dimmed = theme.session_selection;
+        let style = Style::default().fg(theme.dimmed);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
     }
 }

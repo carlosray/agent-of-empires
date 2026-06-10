@@ -17,11 +17,7 @@ export function StepIndicator({ steps, currentIndex }: Props) {
         <div
           key={step.id}
           className={`h-2 rounded-full transition-all duration-300 ${
-            i === currentIndex
-              ? "w-6 bg-brand-600"
-              : i < currentIndex
-                ? "w-2 bg-green-500"
-                : "w-2 bg-surface-700"
+            i === currentIndex ? "w-6 bg-brand-600" : i < currentIndex ? "w-2 bg-green-500" : "w-2 bg-surface-700"
           }`}
           title={step.label}
         />

@@ -126,14 +126,7 @@ impl PairedTerminal {
             process::kill_process_tree(pane_pid);
         }
 
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("Failed to kill {}: {}", self.kind.label(), stderr);
-        }
+        super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
 
@@ -342,6 +335,7 @@ fn build_terminal_create_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tmux::test_helpers::TmuxTestSession;
     use crate::tmux::{Session, SESSION_PREFIX};
 
     #[test]
@@ -457,7 +451,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_terminal_dead_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_terminal_dead");
+        let session_name = guard.name().to_string();
         let session = TerminalSession {
             inner: PairedTerminal {
                 name: session_name.clone(),
@@ -494,10 +489,6 @@ mod tests {
             session.is_pane_dead(),
             "Terminal session pane should be dead after command exits"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -508,7 +499,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_terminal_alive_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_terminal_alive");
+        let session_name = guard.name().to_string();
         let session = TerminalSession {
             inner: PairedTerminal {
                 name: session_name.clone(),
@@ -545,9 +537,5 @@ mod tests {
             !session.is_pane_dead(),
             "Terminal session pane should be alive while command running"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 }

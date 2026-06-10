@@ -6,11 +6,37 @@ use std::sync::mpsc::RecvTimeoutError;
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// Global count of active poller threads for budget enforcement
+/// Global count of active session-id poller threads for budget enforcement
 static ACTIVE_POLLER_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Maximum number of concurrent poller threads allowed
-const MAX_POLLER_THREADS: u32 = 20;
+/// Default ceiling on concurrent session-id poller threads.
+///
+/// Each session that loses its poller stops refreshing the agent session id
+/// shown in its TUI row, so this cap doubles as a "how many concurrent
+/// sessions can keep their identity live" budget.
+pub const DEFAULT_SESSION_ID_POLLER_MAX_THREADS: u32 = 50;
+
+/// Resolved cap, settable at runtime from the TUI Settings panel.
+///
+/// Read with `Ordering::Relaxed` inside the CAS loop in `try_acquire` so each
+/// retry observes the latest cap. The counter's own CAS uses `SeqCst` and is
+/// the authoritative gate against imbalance. There is no ordering dependency
+/// between this cap and any other memory location, so `Release`/`Acquire`
+/// would add a fence with zero semantic benefit.
+static SESSION_ID_POLLER_MAX_THREADS: AtomicU32 =
+    AtomicU32::new(DEFAULT_SESSION_ID_POLLER_MAX_THREADS);
+
+/// Push a new cap into the atomic. Clamped to ≥1 because zero would
+/// silently disable polling for every future session.
+pub fn set_session_id_poller_max_threads(n: u32) {
+    SESSION_ID_POLLER_MAX_THREADS.store(n.max(1), Ordering::Relaxed);
+}
+
+/// Read the currently effective cap. Used by the budget-exhausted warn
+/// message and by tests.
+pub fn session_id_poller_max_threads() -> u32 {
+    SESSION_ID_POLLER_MAX_THREADS.load(Ordering::Relaxed)
+}
 
 /// RAII guard that decrements `ACTIVE_POLLER_COUNT` on drop.
 ///
@@ -23,7 +49,8 @@ impl PollerCountGuard {
     fn try_acquire() -> Option<Self> {
         let mut current = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
         loop {
-            if current >= MAX_POLLER_THREADS {
+            let cap = SESSION_ID_POLLER_MAX_THREADS.load(Ordering::Relaxed);
+            if current >= cap {
                 return None;
             }
             match ACTIVE_POLLER_COUNT.compare_exchange_weak(
@@ -118,7 +145,7 @@ enum PollCommand {
 ///
 /// `stop()` sends an explicit `PollCommand::Stop` and joins the thread,
 /// providing a deterministic shutdown path for callers like `Instance::kill`
-/// and `Instance::restart`.
+/// and `Instance::restart_with_size`.
 pub struct SessionPoller {
     session_name: String,
     cmd_tx: mpsc::Sender<PollCommand>,
@@ -166,7 +193,7 @@ impl SessionPoller {
         let cmd_rx = match self.cmd_rx.take() {
             Some(rx) => rx,
             None => {
-                tracing::warn!(
+                tracing::warn!(target: "session.create",
                     "Poller for {} already started, ignoring duplicate start",
                     instance_id
                 );
@@ -177,11 +204,13 @@ impl SessionPoller {
         let _guard = match PollerCountGuard::try_acquire() {
             Some(g) => g,
             None => {
-                tracing::warn!(
-                    "Poller thread budget exhausted ({}/{}), skipping poller for {}",
+                tracing::warn!(target: "session.create",
+                    "Session-id poller budget exhausted ({}/{}), skipping poller for {}; \
+                     raise the cap from the TUI Settings panel \
+                     (Session > Max Session-ID Poller Threads) before creating new sessions",
                     ACTIVE_POLLER_COUNT.load(Ordering::SeqCst),
-                    MAX_POLLER_THREADS,
-                    instance_id
+                    SESSION_ID_POLLER_MAX_THREADS.load(Ordering::Relaxed),
+                    instance_id,
                 );
                 self.cmd_rx = Some(cmd_rx);
                 return false;
@@ -235,7 +264,7 @@ impl SessionPoller {
                     }
 
                     if crate::tmux::utils::is_pane_dead(&session_name) {
-                        tracing::info!("Pane dead for {}, stopping poller", session_name);
+                        tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", session_name);
                         break;
                     }
 
@@ -249,7 +278,7 @@ impl SessionPoller {
                 true
             }
             Err(e) => {
-                tracing::warn!("Failed to spawn poller thread {}: {}", thread_label, e);
+                tracing::warn!(target: "session.create", "Failed to spawn poller thread {}: {}", thread_label, e);
                 // Restore channels to allow retrying spawn
                 let (cmd_tx, cmd_rx) = mpsc::channel();
                 self.cmd_tx = cmd_tx;
@@ -267,12 +296,19 @@ impl SessionPoller {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_test_update(&self, instance_id: &str, session_id: &str) {
+        self.result_tx
+            .send((instance_id.to_string(), session_id.to_string()))
+            .expect("inject_test_update: result channel disconnected");
+    }
+
     /// Stop the poller thread and wait for it to finish
     pub fn stop(&mut self) {
         let _ = self.cmd_tx.send(PollCommand::Stop);
         if let Some(handle) = self.handle.take() {
             if let Err(e) = handle.join() {
-                tracing::warn!("Poller thread panicked: {:?}", e);
+                tracing::warn!(target: "session.create", "Poller thread panicked: {:?}", e);
             }
         }
     }
@@ -297,6 +333,24 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::sync::{Arc, Mutex};
+
+    /// Restores `SESSION_ID_POLLER_MAX_THREADS` to its original value on drop,
+    /// even if the test panics. Mirrors the `VibeHomeGuard` / `TmuxCleanup`
+    /// pattern used elsewhere in the test suite.
+    struct CapRestorer(u32);
+    impl Drop for CapRestorer {
+        fn drop(&mut self) {
+            set_session_id_poller_max_threads(self.0);
+        }
+    }
+
+    /// Restores `ACTIVE_POLLER_COUNT` to its original value on drop.
+    struct CountRestorer(u32);
+    impl Drop for CountRestorer {
+        fn drop(&mut self) {
+            ACTIVE_POLLER_COUNT.store(self.0, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn test_adaptive_interval_initial() {
@@ -470,9 +524,30 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_set_session_id_poller_max_threads_clamps_zero() {
+        let _restore = CapRestorer(session_id_poller_max_threads());
+        set_session_id_poller_max_threads(0);
+        assert_eq!(
+            session_id_poller_max_threads(),
+            1,
+            "zero must be clamped to 1 to avoid silently disabling polling"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_set_session_id_poller_max_threads_roundtrip() {
+        let _restore = CapRestorer(session_id_poller_max_threads());
+        set_session_id_poller_max_threads(42);
+        assert_eq!(session_id_poller_max_threads(), 42);
+    }
+
+    #[test]
+    #[serial]
     fn test_thread_budget_cap() {
-        let original = ACTIVE_POLLER_COUNT.load(Ordering::SeqCst);
-        ACTIVE_POLLER_COUNT.store(MAX_POLLER_THREADS, Ordering::SeqCst);
+        let _restore_count = CountRestorer(ACTIVE_POLLER_COUNT.load(Ordering::SeqCst));
+        let _restore_cap = CapRestorer(session_id_poller_max_threads());
+        ACTIVE_POLLER_COUNT.store(session_id_poller_max_threads(), Ordering::SeqCst);
 
         let mut poller = SessionPoller::new("test-session".to_string());
         poller.start(
@@ -490,8 +565,6 @@ mod tests {
             poller.cmd_rx.is_some(),
             "cmd_rx should be returned when budget exhausted"
         );
-
-        ACTIVE_POLLER_COUNT.store(original, Ordering::SeqCst);
     }
 
     #[test]

@@ -7,10 +7,8 @@ type PlusSide = "old" | "new";
 interface Props {
   line: RichDiffLine;
   tokens?: SyntaxToken[];
-  /** True while Shiki is loading; hides content to avoid a flash of unstyled text. */
-  highlightPending?: boolean;
   /** Hide the per-side line-number gutters. Used inside compact embedded
-   *  diffs (e.g. the cockpit Edit card) where snippet line numbers add
+   *  diffs (e.g. the structured view Edit card) where snippet line numbers add
    *  more clutter than signal. */
   hideLineNumbers?: boolean;
   /** Render the hover-revealed "+" gutter button for the diff-comments
@@ -34,7 +32,6 @@ interface Props {
 function DiffLineImpl({
   line,
   tokens,
-  highlightPending,
   hideLineNumbers,
   plusEnabled,
   plusHunkIndex,
@@ -68,10 +65,7 @@ function DiffLineImpl({
     if (tokens && tokens.length > 0) {
       const opacity = line.type === "equal" ? 1 : 0.7;
       return tokens.map((tok, i) => (
-        <span
-          key={i}
-          style={tok.color ? { color: tok.color, opacity } : { opacity }}
-        >
+        <span key={i} style={tok.color ? { color: tok.color, opacity } : { opacity }}>
           {tok.content}
         </span>
       ));
@@ -80,11 +74,7 @@ function DiffLineImpl({
   };
 
   const showPlus =
-    plusEnabled === true &&
-    plusSide != null &&
-    plusLineNum != null &&
-    plusHunkIndex != null &&
-    onPlusClick != null;
+    plusEnabled === true && plusSide != null && plusLineNum != null && plusHunkIndex != null && onPlusClick != null;
 
   return (
     <div
@@ -120,14 +110,8 @@ function DiffLineImpl({
           </span>
         </>
       )}
-      <span
-        className={`shrink-0 w-4 text-center font-mono text-[12px] ${textClass} select-none`}
-      >
-        {prefix}
-      </span>
-      <span
-        className={`flex-1 font-mono text-[12px] whitespace-pre transition-opacity duration-100${tokens ? "" : ` ${textClass}`}${highlightPending ? " opacity-0" : ""}`}
-      >
+      <span className={`shrink-0 w-4 text-center font-mono text-[12px] ${textClass} select-none`}>{prefix}</span>
+      <span className={`flex-1 font-mono text-[12px] whitespace-pre${tokens ? "" : ` ${textClass}`}`}>
         {renderContent()}
       </span>
     </div>

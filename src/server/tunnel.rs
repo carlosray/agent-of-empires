@@ -385,26 +385,28 @@ impl TunnelHandle {
     /// Cancels the health monitor first, then sends SIGTERM to cloudflared.
     /// For Tailscale funnels, leaves the funnel configuration in place on
     /// purpose: restarting aoe shouldn't tear down the PWA's origin.
+    #[tracing::instrument(target = "serve.tunnel", skip_all)]
     pub async fn shutdown(self) {
         self.cancel.cancel();
         // Brief yield to let the monitor task observe cancellation
         tokio::task::yield_now().await;
 
         let Some(child_arc) = self.child else {
-            info!("Tailscale Funnel handle released (Funnel config left in place)");
+            tracing::info!(target: "serve.tunnel", "Tailscale Funnel handle released (Funnel config left in place)");
             return;
         };
         let mut child = child_arc.lock().await;
         if let Some(id) = child.id() {
+            tracing::info!(target: "serve.tunnel", pid = id, "sending SIGTERM to cloudflared");
             let _ = nix::sys::signal::kill(
                 nix::unistd::Pid::from_raw(id as i32),
                 nix::sys::signal::Signal::SIGTERM,
             );
         }
         match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
-            Ok(_) => info!("Cloudflare tunnel stopped cleanly"),
+            Ok(_) => tracing::info!(target: "serve.tunnel", "Cloudflare tunnel stopped cleanly"),
             Err(_) => {
-                warn!("Cloudflare tunnel did not stop in 5s, killing");
+                tracing::warn!(target: "serve.tunnel", "Cloudflare tunnel did not stop in 5s, killing");
                 let _ = child.kill().await;
             }
         }
@@ -431,43 +433,65 @@ impl TunnelHandle {
                     _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
                 }
 
-                let mut child_guard = child.lock().await;
-                match child_guard.try_wait() {
-                    Ok(Some(status)) => {
-                        if has_restarted {
-                            error!(
-                                "Cloudflare tunnel exited again ({}). \
-                                 Remote access is unavailable. \
-                                 Restart with `aoe serve --remote`.",
-                                status
-                            );
-                            return;
-                        }
-
-                        warn!(
-                            "Cloudflare tunnel exited unexpectedly ({}). Attempting restart...",
-                            status
-                        );
-
-                        match restart_tunnel(&kind, port).await {
-                            Ok(new_child) => {
-                                *child_guard = new_child;
-                                has_restarted = true;
-                                info!("Cloudflare tunnel restarted successfully");
-                            }
-                            Err(e) => {
-                                error!(
-                                    "Failed to restart tunnel: {}. \
-                                     Remote access is unavailable.",
-                                    e
-                                );
-                                return;
-                            }
+                // Read try_wait under the lock, then drop the guard
+                // before any await. Holding the child mutex across
+                // restart_tunnel().await would block aoe serve --stop
+                // (which also wants the lock to terminate the child)
+                // for the multi-second cloudflared spawn time.
+                let exit_status = {
+                    let mut child_guard = child.lock().await;
+                    match child_guard.try_wait() {
+                        Ok(Some(status)) => Some(status),
+                        Ok(None) => None,
+                        Err(e) => {
+                            warn!("Error checking tunnel status: {}", e);
+                            None
                         }
                     }
-                    Ok(None) => {} // Still running
+                };
+
+                let Some(status) = exit_status else {
+                    continue;
+                };
+
+                if has_restarted {
+                    error!(
+                        "Cloudflare tunnel exited again ({}). \
+                         Remote access is unavailable. \
+                         Restart with `aoe serve --remote`.",
+                        status
+                    );
+                    return;
+                }
+
+                warn!(
+                    "Cloudflare tunnel exited unexpectedly ({}). Attempting restart...",
+                    status
+                );
+
+                let restart_result = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    r = restart_tunnel(&kind, port) => r,
+                };
+
+                match restart_result {
+                    Ok(new_child) => {
+                        // Re-acquire the lock just long enough to install
+                        // the replacement child. The previous iteration's
+                        // try_wait branch is the only other holder; it
+                        // bails on Ok(None) within the lock, so contention
+                        // is bounded.
+                        *child.lock().await = new_child;
+                        has_restarted = true;
+                        info!("Cloudflare tunnel restarted successfully");
+                    }
                     Err(e) => {
-                        warn!("Error checking tunnel status: {}", e);
+                        error!(
+                            "Failed to restart tunnel: {}. \
+                             Remote access is unavailable.",
+                            e
+                        );
+                        return;
                     }
                 }
             }
@@ -950,6 +974,35 @@ pub fn tailscale_funnel_cap_ready_sync() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The telemetry `serve_mode` signal reads `mode_label()`, so it must only
+    // ever emit the closed exposure set, and a named Cloudflare tunnel must
+    // bucket to "tunnel" rather than leak the configured tunnel name (#1885).
+    #[test]
+    fn mode_label_is_closed_and_never_leaks_tunnel_name() {
+        assert_eq!(TunnelKind::Quick.mode_label(), "tunnel");
+        assert_eq!(
+            TunnelKind::Named {
+                tunnel_name: "my-secret-corp-tunnel".to_string(),
+            }
+            .mode_label(),
+            "tunnel",
+        );
+        assert_eq!(TunnelKind::Tailscale.mode_label(), "tailscale");
+
+        for kind in [
+            TunnelKind::Quick,
+            TunnelKind::Named {
+                tunnel_name: "anything".to_string(),
+            },
+            TunnelKind::Tailscale,
+        ] {
+            assert!(
+                matches!(kind.mode_label(), "tunnel" | "tailscale"),
+                "mode_label must stay within the closed exposure set"
+            );
+        }
+    }
 
     #[test]
     fn extract_url_from_typical_output() {

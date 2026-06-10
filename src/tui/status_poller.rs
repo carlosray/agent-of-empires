@@ -58,6 +58,135 @@ pub struct StatusUpdate {
     pub tool_session: Option<ToolSession>,
     pub tool_session_probe: Option<ToolSessionProbe>,
     pub tool_session_changed: bool,
+    /// Pulled from tmux `#{session_activity}` via
+    /// `update_status_with_metadata`. Carried back so the main thread can
+    /// persist it to the real Instance; the poller mutates a clone, so any
+    /// fields not plumbed through here are dropped on the floor.
+    pub last_accessed_at: Option<DateTime<Utc>>,
+    /// Cached pane-dead reading from `tmux::PaneMetadata.pane_dead`. The
+    /// main thread writes this onto `Instance.pane_dead_observed` so the
+    /// Attention sort can treat dead panes as tier 99 without re-querying
+    /// tmux per sort.
+    pub pane_dead: bool,
+}
+
+pub(super) struct StatusPollState {
+    container_check_interval: Duration,
+    last_container_check: Instant,
+    container_states: HashMap<String, bool>,
+    credential_refresh_interval: Duration,
+    last_credential_refresh: Instant,
+    cycle_count: u64,
+}
+
+impl StatusPollState {
+    pub(super) fn new() -> Self {
+        let container_check_interval = Duration::from_secs(5);
+        let credential_refresh_interval = Duration::from_secs(1800);
+
+        Self {
+            container_check_interval,
+            last_container_check: Instant::now() - container_check_interval,
+            container_states: HashMap::new(),
+            credential_refresh_interval,
+            last_credential_refresh: Instant::now(),
+            cycle_count: TIER_COLD - 1,
+        }
+    }
+}
+
+pub(super) fn poll_statuses_once(
+    instances: Vec<Instance>,
+    state: &mut StatusPollState,
+) -> Vec<StatusUpdate> {
+    state.cycle_count = state.cycle_count.wrapping_add(1);
+
+    // Pre-scan: check if any instance would actually be polled this cycle.
+    // If not, skip the batch subprocess calls entirely.
+    let any_pollable = instances.iter().any(|inst| {
+        let tier = polling_tier(inst.status);
+        tier != 0 && state.cycle_count % tier == 0
+    });
+
+    let pane_metadata = if any_pollable {
+        crate::tmux::refresh_session_cache();
+        crate::tmux::batch_pane_metadata().unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    // Refresh container health if any sandboxed session exists and interval elapsed
+    let has_sandboxed = if any_pollable {
+        let sandboxed = instances.iter().any(|i| i.is_sandboxed());
+        if sandboxed && state.last_container_check.elapsed() >= state.container_check_interval {
+            state.container_states = crate::containers::batch_container_health();
+            state.last_container_check = Instant::now();
+        }
+        sandboxed
+    } else {
+        false
+    };
+
+    // Periodically re-sync sandbox credentials from the macOS Keychain
+    // so long-lived sessions don't lose auth mid-run.
+    if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
+    {
+        state.last_credential_refresh = Instant::now();
+        crate::session::container_config::refresh_agent_configs();
+    }
+
+    instances
+        .into_iter()
+        .filter_map(|mut inst| {
+            // Adaptive polling: skip instances whose tier interval hasn't elapsed
+            let tier = polling_tier(inst.status);
+            if tier == 0 || state.cycle_count % tier != 0 {
+                return None;
+            }
+
+            // For sandboxed sessions, check if the container is dead before
+            // falling through to tmux-based status detection.
+            if inst.is_sandboxed()
+                && !matches!(
+                    inst.status,
+                    Status::Stopped | Status::Deleting | Status::Starting | Status::Creating
+                )
+            {
+                if let Some(sandbox) = &inst.sandbox_info {
+                    if let Some(&running) = state.container_states.get(&sandbox.container_name) {
+                        if !running {
+                            return Some(StatusUpdate {
+                                id: inst.id,
+                                status: Status::Error,
+                                last_error: Some("Container is not running".to_string()),
+                                idle_entered_at: None,
+                                last_accessed_at: inst.last_accessed_at,
+                                // Sandboxed sessions don't have a tmux pane in the
+                                // usual sense; the Error tier itself sinks the row.
+                                pane_dead: false,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Look up pre-fetched metadata for this instance's tmux session
+            let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+            let metadata = pane_metadata.get(&session_name);
+            let pane_dead = metadata.map(|m| m.pane_dead).unwrap_or(false);
+
+            inst.update_status_with_metadata(metadata);
+
+            Some(StatusUpdate {
+                id: inst.id,
+                status: inst.status,
+                last_error: inst.last_error,
+                idle_entered_at: inst.idle_entered_at,
+                last_accessed_at: inst.last_accessed_at,
+                pane_dead,
+            })
+        })
+        .collect()
 }
 
 /// Background thread that polls session status without blocking the UI
@@ -87,136 +216,10 @@ impl StatusPoller {
         request_rx: mpsc::Receiver<Vec<Instance>>,
         result_tx: mpsc::Sender<Vec<StatusUpdate>>,
     ) {
-        let container_check_interval = Duration::from_secs(5);
-        // Initialize to the past so the first check runs immediately
-        let mut last_container_check = Instant::now() - container_check_interval;
-        let mut container_states: HashMap<String, bool> = HashMap::new();
-
-        // Credential refresh: re-sync every 30 minutes so long-lived sandbox
-        // sessions pick up rotated OAuth tokens from the macOS Keychain.
-        let credential_refresh_interval = Duration::from_secs(1800);
-        // Start at now (not in the past) -- credentials are fresh from container creation
-        let mut last_credential_refresh = Instant::now();
-
-        // Start at TIER_COLD - 1 so the first wrapping_add produces TIER_COLD,
-        // which is divisible by all tier intervals -- ensuring every session is
-        // polled on the very first cycle.
-        let mut cycle_count: u64 = TIER_COLD - 1;
+        let mut state = StatusPollState::new();
 
         while let Ok(instances) = request_rx.recv() {
-            cycle_count = cycle_count.wrapping_add(1);
-
-            // Pre-scan: check if any instance would actually be polled this cycle.
-            // If not, skip the batch subprocess calls entirely.
-            let any_pollable = instances.iter().any(|inst| {
-                let tier = polling_tier(inst.status);
-                tier != 0 && cycle_count % tier == 0
-            });
-
-            let pane_metadata = if any_pollable {
-                crate::tmux::refresh_session_cache();
-                crate::tmux::batch_pane_metadata()
-            } else {
-                HashMap::new()
-            };
-
-            // Refresh container health if any sandboxed session exists and interval elapsed
-            let has_sandboxed = if any_pollable {
-                let sandboxed = instances.iter().any(|i| i.is_sandboxed());
-                if sandboxed && last_container_check.elapsed() >= container_check_interval {
-                    container_states = crate::containers::batch_container_health();
-                    last_container_check = Instant::now();
-                }
-                sandboxed
-            } else {
-                false
-            };
-
-            // Periodically re-sync sandbox credentials from the macOS Keychain
-            // so long-lived sessions don't lose auth mid-run.
-            if has_sandboxed && last_credential_refresh.elapsed() >= credential_refresh_interval {
-                last_credential_refresh = Instant::now();
-                crate::session::container_config::refresh_agent_configs();
-            }
-
-            let updates: Vec<StatusUpdate> = instances
-                .into_iter()
-                .filter_map(|mut inst| {
-                    // Adaptive polling: skip instances whose tier interval hasn't elapsed
-                    let tier = polling_tier(inst.status);
-                    if tier == 0 || cycle_count % tier != 0 {
-                        return None;
-                    }
-
-                    // For sandboxed sessions, check if the container is dead before
-                    // falling through to tmux-based status detection.
-                    if inst.is_sandboxed()
-                        && !matches!(
-                            inst.status,
-                            Status::Stopped
-                                | Status::Deleting
-                                | Status::Starting
-                                | Status::Creating
-                        )
-                    {
-                        if let Some(sandbox) = &inst.sandbox_info {
-                            if let Some(&running) = container_states.get(&sandbox.container_name) {
-                                if !running {
-                                    return Some(StatusUpdate {
-                                        id: inst.id,
-                                        status: Status::Error,
-                                        last_error: Some("Container is not running".to_string()),
-                                        idle_entered_at: None,
-                                        tool_session: None,
-                                        tool_session_probe: None,
-                                        tool_session_changed: false,
-                                    });
-                                }
-                            }
-                        }
-                    }
-
-                    // Look up pre-fetched metadata for this instance's tmux session
-                    let session_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-                    let metadata = pane_metadata.get(&session_name);
-
-                    inst.update_status_with_metadata(metadata);
-
-                    // Run tool_session refresh on a slower cadence than the
-                    // status tier. Each refresh fans out to lsof or sqlite3
-                    // subprocesses; running it every cycle multiplies that
-                    // cost by the session count and starves the UI thread.
-                    // Sessions with a Pending probe (the launch grace window)
-                    // still refresh every cycle so the initial bind happens
-                    // promptly.
-                    let in_initial_bind_window = inst.tool_session.is_none()
-                        && matches!(
-                            inst.tool_session_probe.as_ref().map(|p| p.state),
-                            Some(crate::session::ToolSessionProbeState::Pending)
-                        );
-                    let tool_session_change = if in_initial_bind_window
-                        || cycle_count % TOOL_SESSION_REFRESH_EVERY == 0
-                    {
-                        crate::session::tool_session::refresh(&inst).ok().flatten()
-                    } else {
-                        None
-                    };
-
-                    Some(StatusUpdate {
-                        id: inst.id,
-                        status: inst.status,
-                        last_error: inst.last_error,
-                        idle_entered_at: inst.idle_entered_at,
-                        tool_session: tool_session_change
-                            .as_ref()
-                            .and_then(|change| change.tool_session.clone()),
-                        tool_session_probe: tool_session_change
-                            .as_ref()
-                            .and_then(|change| change.tool_session_probe.clone()),
-                        tool_session_changed: tool_session_change.is_some(),
-                    })
-                })
-                .collect();
+            let updates = poll_statuses_once(instances, &mut state);
 
             if result_tx.send(updates).is_err() {
                 break;
@@ -263,6 +266,8 @@ mod tests {
             tool_session: None,
             tool_session_probe: None,
             tool_session_changed: false,
+            last_accessed_at: None,
+            pane_dead: false,
         };
         assert_eq!(update.idle_entered_at, Some(ts));
     }

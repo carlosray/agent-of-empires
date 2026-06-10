@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { fetchUpdateStatus } from "../lib/api";
 import type { UpdateStatus } from "../lib/api";
+import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 const DISMISS_KEY = "aoe-update-dismissed-version";
 
@@ -11,33 +12,26 @@ const DISMISS_KEY = "aoe-update-dismissed-version";
 const MIN_POLL_MINUTES = 5;
 
 function readDismissed(): string | null {
-  try {
-    return localStorage.getItem(DISMISS_KEY);
-  } catch {
-    return null;
-  }
+  return safeGetItem(DISMISS_KEY);
 }
 
 function writeDismissed(version: string) {
-  try {
-    localStorage.setItem(DISMISS_KEY, version);
-  } catch {
-    // ignore
-  }
+  safeSetItem(DISMISS_KEY, version);
 }
 
 /**
  * Top-of-app banner shown when `update_available` is true. Dismiss
  * persists by latest_version, so a newer release re-surfaces it.
  * Polls on mount + at `web_poll_interval_minutes` cadence + on tab
- * visibilitychange. Honors `check_enabled`: server returns
- * `update_available: false` when off, so nothing renders. See #984.
+ * visibilitychange. Honors `update_check_mode`: server returns
+ * `update_available: false` when mode = off, so nothing renders.
+ * Mode = auto also suppresses the banner (the runtime installs
+ * silently and the user picks the new binary up next launch).
+ * See #984 and #1140.
  */
 export function UpdateBanner() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
-  const [dismissedVersion, setDismissedVersion] = useState<string | null>(
-    () => readDismissed(),
-  );
+  const [dismissedVersion, setDismissedVersion] = useState<string | null>(() => readDismissed());
 
   useEffect(() => {
     let cancelled = false;
@@ -47,14 +41,11 @@ export function UpdateBanner() {
       const s = await fetchUpdateStatus();
       if (cancelled) return;
       if (s) setStatus(s);
-      const minutes = Math.max(
-        MIN_POLL_MINUTES,
-        s?.web_poll_interval_minutes ?? 60,
-      );
+      const minutes = Math.max(MIN_POLL_MINUTES, s?.web_poll_interval_minutes ?? 60);
       timer = setTimeout(poll, minutes * 60_000);
     };
 
-    poll();
+    const initialTimer = setTimeout(() => void poll(), 0);
 
     const onVisibility = () => {
       if (document.visibilityState === "visible") {
@@ -67,6 +58,7 @@ export function UpdateBanner() {
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
+      clearTimeout(initialTimer);
       document.removeEventListener("visibilitychange", onVisibility);
     };
   }, []);
@@ -74,6 +66,9 @@ export function UpdateBanner() {
   if (!status || !status.update_available || !status.latest_version) {
     return null;
   }
+  // Suppress the banner in auto mode (the runtime is handling the install
+  // in the background; nothing for the user to do).
+  if (status.update_check_mode === "auto") return null;
   if (dismissedVersion === status.latest_version) return null;
 
   const onDismiss = () => {

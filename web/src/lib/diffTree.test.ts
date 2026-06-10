@@ -26,10 +26,7 @@ describe("buildDiffTree", () => {
   });
 
   it("groups files by directory with aggregated stats", () => {
-    const files = [
-      makeFile("src/main.rs", "modified", 10, 2),
-      makeFile("src/lib.rs", "added", 5, 0),
-    ];
+    const files = [makeFile("src/main.rs", "modified", 10, 2), makeFile("src/lib.rs", "added", 5, 0)];
     const nodes = buildDiffTree(files, new Set());
     // Should be: dir:src, file:src/lib.rs, file:src/main.rs
     expect(nodes).toHaveLength(3);
@@ -43,11 +40,7 @@ describe("buildDiffTree", () => {
   });
 
   it("hides children of collapsed directories", () => {
-    const files = [
-      makeFile("src/main.rs"),
-      makeFile("src/lib.rs"),
-      makeFile("README.md"),
-    ];
+    const files = [makeFile("src/main.rs"), makeFile("src/lib.rs"), makeFile("README.md")];
     const nodes = buildDiffTree(files, new Set(["src"]));
     // Should be: dir:src (collapsed), file:README.md
     expect(nodes).toHaveLength(2);
@@ -79,10 +72,7 @@ describe("buildDiffTree", () => {
   });
 
   it("collapsing a parent hides nested directories too", () => {
-    const files = [
-      makeFile("src/cli/add.rs"),
-      makeFile("src/main.rs"),
-    ];
+    const files = [makeFile("src/cli/add.rs"), makeFile("src/main.rs")];
     const nodes = buildDiffTree(files, new Set(["src"]));
     // Only the src dir should be visible
     expect(nodes).toHaveLength(1);
@@ -90,12 +80,7 @@ describe("buildDiffTree", () => {
   });
 
   it("sorts directories before files, both alphabetically", () => {
-    const files = [
-      makeFile("z_file.rs"),
-      makeFile("a_dir/z.rs"),
-      makeFile("b_dir/a.rs"),
-      makeFile("a_file.rs"),
-    ];
+    const files = [makeFile("z_file.rs"), makeFile("a_dir/z.rs"), makeFile("b_dir/a.rs"), makeFile("a_file.rs")];
     const nodes = buildDiffTree(files, new Set());
     // Expected: a_dir, a_dir/z.rs, b_dir, b_dir/a.rs, a_file.rs, z_file.rs
     expect(nodes.map((n) => (n.kind === "dir" ? `dir:${n.name}` : n.file.path))).toEqual([

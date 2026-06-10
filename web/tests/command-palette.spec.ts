@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./helpers/mockedTest";
 
 test.describe("Command palette", () => {
   test("opens with Ctrl+K", async ({ page }) => {
@@ -6,7 +6,11 @@ test.describe("Command palette", () => {
     await page.goto("/");
     await page.locator("body").click();
     await page.keyboard.press("ControlOrMeta+k");
-    await expect(page.getByPlaceholder("Search actions, sessions, settings…")).toBeVisible();
+    const search = page.getByPlaceholder("Search actions, sessions, settings…");
+    await expect(search).toBeVisible();
+    // The search input must receive focus on open so the user can type
+    // immediately (ported from the live shortcut-palette story).
+    await expect(search).toBeFocused();
   });
 
   test("opens with Meta+K", async ({ page }) => {
@@ -93,7 +97,7 @@ test.describe("Command palette", () => {
     // time out waiting for the button to become enabled. The dashboard
     // offline-indicator test in dashboard.spec.ts exercises the
     // opposite case (no stub → offline UI surfaces).
-    await page.route("**/api/sessions", (r) => r.fulfill({ json: [] }));
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
     await page.setViewportSize({ width: 1280, height: 720 });
     await page.goto("/");
     await page.getByLabel("New session").first().click();

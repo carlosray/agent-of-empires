@@ -25,8 +25,41 @@ use axum::{
 /// permanently broken pane. Picked from the application-reserved
 /// 4000-4999 range; not used elsewhere. See #1107.
 const CLOSE_CODE_PTY_DEAD: u16 = 4001;
+
+/// WebSocket close code 1001 ("going away"). Sent when the daemon is
+/// shutting down so the client can distinguish a server-side exit from
+/// a transient transport error and skip its reconnect backoff for one
+/// cycle. See #1198.
+const CLOSE_CODE_GOING_AWAY: u16 = 1001;
+
+/// WebSocket close code 1011 ("internal server error"). Sent on the
+/// OS-level early-return paths in `handle_terminal_ws` (openpty,
+/// attach-session spawn, PTY reader/writer clone). Browser falls through
+/// to its standard retry ladder with a parseable reason. Beats the
+/// opaque 1006 that early `return;` would otherwise produce. See #1455.
+const CLOSE_CODE_INTERNAL_ERROR: u16 = 1011;
+
+/// WebSocket close code 1013 ("try again later"). Sent when the tmux
+/// pane is not ready within the bounded readiness window. Browser
+/// retries on the fast-start ladder. Distinct from 1011 (internal
+/// server fault) and 4001 (permanently dead pane) so logs separate
+/// transient warm-up from genuine failure. See #1455.
+const CLOSE_CODE_TRY_AGAIN_LATER: u16 = 1013;
+
+/// Total time we'll spend waiting for the tmux session + pane to be
+/// attachable before giving up and closing 1013. 2s covers tmux warm-up
+/// across the slow machines we've seen reports from while staying short
+/// enough that a truly dead pane doesn't hold the upgrade open for the
+/// user. See #1455.
+const TMUX_READY_TIMEOUT: Duration = Duration::from_millis(2000);
+
+/// Poll interval for the readiness wait. 50ms gives ~40 probes inside
+/// the 2s window; each probe shells out to `tmux has-session` and (if
+/// that passes) `tmux list-panes`, which is cheap.
+const TMUX_READY_POLL: Duration = Duration::from_millis(50);
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, trace, warn};
 
 /// Per-message byte tracing is hidden behind `AOE_TERMINAL_TRACE=1` so the
@@ -55,6 +88,7 @@ pub async fn paired_terminal_ws(
     let read_only = state.read_only;
     let primaries = Arc::clone(&state.session_primaries);
     let pause_counts = Arc::clone(&state.session_pause_counts);
+    let shutdown = state.shutdown.clone();
 
     let Some(inst) = inst else {
         warn!(target: "terminal.ws", session = %id, kind = "paired", "session not found, returning 404");
@@ -91,7 +125,14 @@ pub async fn paired_terminal_ws(
     // itself is not echoed, only the marker.
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| {
-            handle_terminal_ws(socket, tmux_name, read_only, primaries, pause_counts)
+            handle_terminal_ws(
+                socket,
+                tmux_name,
+                read_only,
+                primaries,
+                pause_counts,
+                shutdown,
+            )
         })
         .into_response()
 }
@@ -174,6 +215,7 @@ pub async fn container_terminal_ws(
     let read_only = state.read_only;
     let primaries = Arc::clone(&state.session_primaries);
     let pause_counts = Arc::clone(&state.session_pause_counts);
+    let shutdown = state.shutdown.clone();
 
     let Some(inst) = inst else {
         warn!(target: "terminal.ws", session = %id, kind = "container", "session not found, returning 404");
@@ -205,7 +247,14 @@ pub async fn container_terminal_ws(
     // itself is not echoed, only the marker.
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| {
-            handle_terminal_ws(socket, tmux_name, read_only, primaries, pause_counts)
+            handle_terminal_ws(
+                socket,
+                tmux_name,
+                read_only,
+                primaries,
+                pause_counts,
+                shutdown,
+            )
         })
         .into_response()
 }
@@ -278,6 +327,7 @@ pub async fn terminal_ws(
     let read_only = state.read_only;
     let primaries = Arc::clone(&state.session_primaries);
     let pause_counts = Arc::clone(&state.session_pause_counts);
+    let shutdown = state.shutdown.clone();
 
     match session_info {
         // Accept the "aoe-auth" subprotocol so the browser's handshake
@@ -288,7 +338,14 @@ pub async fn terminal_ws(
         Some(tmux_name) => ws
             .protocols(["aoe-auth"])
             .on_upgrade(move |socket| {
-                handle_terminal_ws(socket, tmux_name, read_only, primaries, pause_counts)
+                handle_terminal_ws(
+                    socket,
+                    tmux_name,
+                    read_only,
+                    primaries,
+                    pause_counts,
+                    shutdown,
+                )
             })
             .into_response(),
         None => {
@@ -336,11 +393,12 @@ type SessionPrimaries = Arc<RwLock<std::collections::HashMap<String, String>>>;
 type SessionPauseCounts = Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>;
 
 async fn handle_terminal_ws(
-    socket: WebSocket,
+    mut socket: WebSocket,
     tmux_name: String,
     read_only: bool,
     primaries: SessionPrimaries,
     pause_counts: SessionPauseCounts,
+    shutdown: CancellationToken,
 ) {
     use futures_util::{SinkExt, StreamExt};
 
@@ -359,6 +417,40 @@ async fn handle_terminal_ws(
         "ws upgrade complete, starting PTY relay"
     );
 
+    // Wait for tmux session + at least one live pane to be attachable
+    // before spawning `tmux attach-session`. Closes the race where the
+    // browser dialed in fractions of a second after the session was
+    // created and the attach raced the tmux daemon's pane bookkeeping.
+    // The `terminal_ws` (agent main) route lacks an analog of
+    // `respawn_paired_if_dead`, so without this poll a fresh `aoe serve`
+    // would let the first attach exit with PTY EOF, the send task would
+    // close 4001 (pty_dead), and the client would burn its retry budget
+    // on a session that was about to become healthy. See #1455.
+    match wait_for_tmux_ready(&tmux_name).await {
+        PaneReadiness::Ready => {}
+        PaneReadiness::Dead => {
+            warn!(
+                target: "terminal.ws",
+                client = %client_id,
+                tmux = %tmux_name,
+                "all panes reported dead during readiness wait, closing 4001"
+            );
+            close_early(&mut socket, CLOSE_CODE_PTY_DEAD, "pty_dead").await;
+            return;
+        }
+        PaneReadiness::NotReady => {
+            warn!(
+                target: "terminal.ws",
+                client = %client_id,
+                tmux = %tmux_name,
+                timeout_ms = TMUX_READY_TIMEOUT.as_millis() as u64,
+                "tmux not ready within bounded wait, closing 1013"
+            );
+            close_early(&mut socket, CLOSE_CODE_TRY_AGAIN_LATER, "tmux_not_ready").await;
+            return;
+        }
+    }
+
     // Spawn tmux attach inside a PTY
     let pty_system = NativePtySystem::default();
     let pair = match pty_system.openpty(PtySize {
@@ -375,41 +467,13 @@ async fn handle_terminal_ws(
                 tmux = %tmux_name,
                 "openpty failed, aborting ws: {}", e
             );
+            close_early(&mut socket, CLOSE_CODE_INTERNAL_ERROR, "openpty_failed").await;
             return;
         }
     };
 
     let mut cmd = CommandBuilder::new("tmux");
-    // Workaround for vercel-labs/wterm#49 (SCS not implemented). Tmux uses
-    // the DEC alternate character set to draw '─', '│', and corner glyphs
-    // for pane separators (and Claude Code does the same for its dialog
-    // borders). Without SCS support wterm renders the literal 'q', 'x',
-    // and so on, producing the long "qqqq…" rows in the web dashboard.
-    //
-    // Strip smacs/rmacs/acsc so tmux can't pick the SCS encoding, and
-    // mark the terminal as U8 so tmux uses its UTF-8/ASCII fallback when
-    // rendering box-drawing cells. With wterm 0.1.x the practical effect
-    // is ASCII fallback ('-'/'+'/'|'), which is a clean separator glyph
-    // and a major improvement over the literal 'q'. `-a` appends to
-    // tmux's existing overrides; the pattern matches any 256-color
-    // terminal type aoe might attach as. Idempotent: the override is a
-    // server option, so reapplying on every attach is harmless.
-    //
-    // Affects all clients of this tmux server, including the user's TUI
-    // direct attach. Modern terminal emulators render '-'/'+'/'|' as
-    // recognizable separators, so the TUI experience degrades from
-    // "fancy box-drawing" to "ASCII box-drawing"; that's a worthwhile
-    // tradeoff while wterm is missing SCS. Remove when wterm ships it.
-    cmd.args([
-        "set-option",
-        "-as",
-        "terminal-overrides",
-        "*256col*:U8=1:smacs@:rmacs@:acsc@",
-        ";",
-        "attach-session",
-        "-t",
-        &tmux_name,
-    ]);
+    cmd.args(["attach-session", "-t", &tmux_name]);
     cmd.env("TERM", "xterm-256color");
     // Allow nesting: unset TMUX so the attach works when aoe serve runs inside tmux
     cmd.env_remove("TMUX");
@@ -423,6 +487,12 @@ async fn handle_terminal_ws(
                 tmux = %tmux_name,
                 "spawn tmux attach-session failed: {}", e
             );
+            close_early(
+                &mut socket,
+                CLOSE_CODE_INTERNAL_ERROR,
+                "attach_spawn_failed",
+            )
+            .await;
             return;
         }
     };
@@ -452,6 +522,7 @@ async fn handle_terminal_ws(
             );
             let _ = child.kill();
             let _ = child.wait();
+            close_early(&mut socket, CLOSE_CODE_INTERNAL_ERROR, "pty_reader_failed").await;
             return;
         }
     };
@@ -467,6 +538,7 @@ async fn handle_terminal_ws(
             );
             let _ = child.kill();
             let _ = child.wait();
+            close_early(&mut socket, CLOSE_CODE_INTERNAL_ERROR, "pty_writer_failed").await;
             return;
         }
     };
@@ -538,6 +610,7 @@ async fn handle_terminal_ws(
     // Task 2: PTY output + control messages -> WebSocket sender
     let send_client = client_id.clone();
     let send_tmux = tmux_name.clone();
+    let send_shutdown = shutdown.clone();
     let send_handle = tokio::spawn(async move {
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -548,6 +621,16 @@ async fn handle_terminal_ws(
         let exit_reason: &'static str;
         loop {
             tokio::select! {
+                _ = send_shutdown.cancelled() => {
+                    debug!(
+                        target: "terminal.ws",
+                        client = %send_client,
+                        tmux = %send_tmux,
+                        "shutdown signaled, send task exiting"
+                    );
+                    exit_reason = "shutdown";
+                    break;
+                }
                 data = output_rx.recv() => {
                     match data {
                         Some(data) => {
@@ -647,13 +730,16 @@ async fn handle_terminal_ws(
         // at WS upgrade catches the common cases; an exit here that
         // close on the heels of the upgrade is almost always a
         // permanently broken pane that retrying won't fix. See #1107.
-        let close_frame = if exit_reason == "pty_output_channel_closed" {
-            Some(CloseFrame {
+        let close_frame = match exit_reason {
+            "pty_output_channel_closed" => Some(CloseFrame {
                 code: CLOSE_CODE_PTY_DEAD,
                 reason: "pty_dead".into(),
-            })
-        } else {
-            None
+            }),
+            "shutdown" => Some(CloseFrame {
+                code: CLOSE_CODE_GOING_AWAY,
+                reason: "server shutdown".into(),
+            }),
+            _ => None,
         };
         let _ = ws_sender.send(Message::Close(close_frame)).await;
     });
@@ -673,6 +759,7 @@ async fn handle_terminal_ws(
 
     let recv_client = client_id.clone();
     let recv_tmux = tmux_name.clone();
+    let recv_shutdown = shutdown.clone();
     let recv_handle = tokio::spawn(async move {
         // Track the last resize the browser requested so we can apply it
         // when this client becomes primary.
@@ -686,7 +773,25 @@ async fn handle_terminal_ws(
             // child + free its PTY pair. Server-originated Pings in the
             // send task elicit Pongs that arrive here and reset the
             // timer, so live-but-idle sessions stay open indefinitely.
-            let msg = match tokio::time::timeout(IDLE_TIMEOUT, ws_receiver.next()).await {
+            //
+            // The outer `select!` also races against the daemon's
+            // shutdown token so a SIGINT/SIGTERM tears this task down
+            // promptly instead of waiting for the next client message
+            // or the idle timeout. See #1198.
+            let timeout_result = tokio::select! {
+                _ = recv_shutdown.cancelled() => {
+                    debug!(
+                        target: "terminal.ws",
+                        client = %recv_client,
+                        tmux = %recv_tmux,
+                        "shutdown signaled, recv task exiting"
+                    );
+                    exit_reason = "shutdown";
+                    break;
+                }
+                next = tokio::time::timeout(IDLE_TIMEOUT, ws_receiver.next()) => next,
+            };
+            let msg = match timeout_result {
                 Err(_) => {
                     warn!(
                         target: "terminal.ws",
@@ -780,6 +885,10 @@ async fn handle_terminal_ws(
                     .await;
                 }
                 Message::Text(text) => {
+                    // Stamp arrival before parse so a timing_ping can report
+                    // the server's own parse-to-enqueue cost. Cheap, and text
+                    // control frames are rare (not per-keystroke).
+                    let text_recv = Instant::now();
                     // JSON control messages (resize, activate) are always allowed
                     if let Ok(control) = serde_json::from_str::<ControlMessage>(&text) {
                         match control {
@@ -894,6 +1003,22 @@ async fn handle_terminal_ws(
                                     &this_ws_paused_for_recv,
                                 )
                                 .await;
+                            }
+                            ControlMessage::TimingPing { seq, client_t } => {
+                                // Bounce straight back over the control
+                                // channel. Never touches the PTY, never
+                                // logs (a sub-second cadence would flood the
+                                // log). server_busy_us captures parse +
+                                // dispatch + serialize on this task.
+                                let pong = TimingPong {
+                                    kind: "timing_pong",
+                                    seq,
+                                    client_t,
+                                    server_busy_us: text_recv.elapsed().as_micros() as u64,
+                                };
+                                if let Ok(text) = serde_json::to_string(&pong) {
+                                    let _ = ctrl_tx_for_recv.send(text).await;
+                                }
                             }
                         }
                     } else if !read_only {
@@ -1135,6 +1260,103 @@ async fn resize_pty(
     .await;
 }
 
+/// Send a Close frame on an early-return path that hasn't split the
+/// socket yet. The `let _ = ` discards send errors: if the peer is
+/// already gone the close frame is moot, and we're returning anyway.
+async fn close_early(socket: &mut WebSocket, code: u16, reason: &'static str) {
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: reason.into(),
+        })))
+        .await;
+}
+
+/// Outcome of one tmux-readiness probe. `Ready` lets the caller proceed
+/// to `tmux attach-session`; `NotReady` means try again after the poll
+/// interval; `Dead` short-circuits the wait when every pane is reported
+/// dead (no point in polling further).
+#[derive(Debug, PartialEq, Eq)]
+enum PaneReadiness {
+    Ready,
+    NotReady,
+    Dead,
+}
+
+/// Parse `tmux list-panes -F "#{pane_dead}"` output: one line per pane,
+/// each line `0` (alive) or `1` (dead). Empty output means the session
+/// exists but has no panes yet (not ready). All-dead means the pane has
+/// permanently exited.
+fn parse_pane_dead_output(output: &str) -> PaneReadiness {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return PaneReadiness::NotReady;
+    }
+    if lines.contains(&"0") {
+        PaneReadiness::Ready
+    } else {
+        PaneReadiness::Dead
+    }
+}
+
+/// Poll `tmux has-session` + `tmux list-panes` at TMUX_READY_POLL until
+/// the session has at least one alive pane, or until TMUX_READY_TIMEOUT
+/// expires. Returns the final outcome so the caller can distinguish a
+/// transient warm-up (`NotReady` -> retryable 1013) from a permanently
+/// dead pane (`Dead` -> 4001 short-circuit). Bails out early on `Dead`
+/// rather than polling further because no amount of waiting will make
+/// an exited pane reattachable.
+async fn wait_for_tmux_ready(tmux_name: &str) -> PaneReadiness {
+    let deadline = Instant::now() + TMUX_READY_TIMEOUT;
+    loop {
+        match probe_tmux_readiness(tmux_name).await {
+            PaneReadiness::Ready => return PaneReadiness::Ready,
+            PaneReadiness::Dead => return PaneReadiness::Dead,
+            PaneReadiness::NotReady => {
+                if Instant::now() >= deadline {
+                    return PaneReadiness::NotReady;
+                }
+                tokio::time::sleep(TMUX_READY_POLL).await;
+            }
+        }
+    }
+}
+
+/// One probe iteration: `tmux has-session` then (on success) `tmux
+/// list-panes -F "#{pane_dead}"`. Both shell out to the tmux binary;
+/// they're cheap (microseconds in the happy path) so the 50ms poll
+/// floor dominates wall time, not subprocess overhead.
+async fn probe_tmux_readiness(tmux_name: &str) -> PaneReadiness {
+    let name = tmux_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let has_session = std::process::Command::new("tmux")
+            .args(["has-session", "-t", &name])
+            .output();
+        let has_session_ok = match has_session {
+            Ok(o) => o.status.success(),
+            Err(_) => false,
+        };
+        if !has_session_ok {
+            return PaneReadiness::NotReady;
+        }
+        let panes = std::process::Command::new("tmux")
+            .args(["list-panes", "-t", &name, "-F", "#{pane_dead}"])
+            .output();
+        match panes {
+            Ok(o) if o.status.success() => {
+                parse_pane_dead_output(&String::from_utf8_lossy(&o.stdout))
+            }
+            _ => PaneReadiness::NotReady,
+        }
+    })
+    .await
+    .unwrap_or(PaneReadiness::NotReady)
+}
+
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
 enum ControlMessage {
@@ -1158,6 +1380,27 @@ enum ControlMessage {
     /// `pause_output`. SIGCONT to a non-stopped process is a no-op.
     #[serde(rename = "resume_output")]
     ResumeOutput,
+    /// Latency probe from the web terminal under `?debug=terminal-timing`.
+    /// Bounced straight back as a `timing_pong` over the control channel,
+    /// never reaching the PTY. `client_t` is an opaque client timestamp
+    /// echoed unchanged so the browser can compute the round trip. The
+    /// variant is always parseable but only exercised by debug clients, so
+    /// normal sessions pay nothing beyond one extra serde tag. See #1453.
+    #[serde(rename = "timing_ping")]
+    TimingPing { seq: u64, client_t: f64 },
+}
+
+/// Server reply to a [`ControlMessage::TimingPing`]. `server_busy_us` is
+/// this handler's own parse-to-enqueue duration, so the client can
+/// subtract it from the observed round trip to isolate network plus
+/// WebSocket transit without any client/server clock sync. See #1453.
+#[derive(serde::Serialize)]
+struct TimingPong {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    seq: u64,
+    client_t: f64,
+    server_busy_us: u64,
 }
 
 #[cfg(test)]
@@ -1231,6 +1474,66 @@ mod tests {
         let p = make_primaries();
         release_primary(&p, "session-1", "ws-0").await;
         assert!(p.read().await.is_empty());
+    }
+
+    #[test]
+    fn parse_pane_dead_empty_is_not_ready() {
+        // `list-panes` succeeded but the session has no panes yet
+        // (transient state during tmux session creation).
+        assert_eq!(parse_pane_dead_output(""), PaneReadiness::NotReady);
+        assert_eq!(parse_pane_dead_output("   \n\n  "), PaneReadiness::NotReady);
+    }
+
+    #[test]
+    fn parse_pane_dead_single_alive_is_ready() {
+        assert_eq!(parse_pane_dead_output("0\n"), PaneReadiness::Ready);
+        assert_eq!(parse_pane_dead_output("0"), PaneReadiness::Ready);
+    }
+
+    #[test]
+    fn parse_pane_dead_single_dead_is_dead() {
+        assert_eq!(parse_pane_dead_output("1\n"), PaneReadiness::Dead);
+    }
+
+    #[test]
+    fn parse_pane_dead_mixed_is_ready() {
+        // One alive pane is enough; tmux attach finds the alive one.
+        assert_eq!(parse_pane_dead_output("1\n0\n"), PaneReadiness::Ready);
+        assert_eq!(parse_pane_dead_output("0\n1\n1\n"), PaneReadiness::Ready);
+    }
+
+    #[test]
+    fn parse_pane_dead_all_dead_is_dead() {
+        assert_eq!(parse_pane_dead_output("1\n1\n1\n"), PaneReadiness::Dead);
+    }
+
+    #[test]
+    fn timing_ping_deserializes() {
+        let msg: ControlMessage =
+            serde_json::from_str(r#"{"type":"timing_ping","seq":7,"client_t":1234.5}"#).unwrap();
+        match msg {
+            ControlMessage::TimingPing { seq, client_t } => {
+                assert_eq!(seq, 7);
+                assert_eq!(client_t, 1234.5);
+            }
+            _ => panic!("expected TimingPing"),
+        }
+    }
+
+    #[test]
+    fn timing_pong_serializes_with_type_tag() {
+        let pong = TimingPong {
+            kind: "timing_pong",
+            seq: 7,
+            client_t: 1234.5,
+            server_busy_us: 42,
+        };
+        let json = serde_json::to_string(&pong).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["type"], "timing_pong");
+        assert_eq!(parsed["seq"], 7);
+        assert_eq!(parsed["client_t"], 1234.5);
+        assert_eq!(parsed["server_busy_us"], 42);
     }
 
     #[tokio::test]

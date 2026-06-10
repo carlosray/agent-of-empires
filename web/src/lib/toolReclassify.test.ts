@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { reclassifyBash } from "./toolReclassify";
-import type { ToolCall } from "./cockpitTypes";
+import type { ToolCall } from "./acpTypes";
 
 function bash(command: string, kind = "execute"): ToolCall {
   return {
@@ -43,9 +43,7 @@ describe("reclassifyBash", () => {
   });
 
   it("rejects destructive find flags", () => {
-    expect(reclassifyBash(bash("find . -name '*.tmp' -delete")).kind).toBe(
-      "execute",
-    );
+    expect(reclassifyBash(bash("find . -name '*.tmp' -delete")).kind).toBe("execute");
     expect(reclassifyBash(bash("find . -exec rm {} +")).kind).toBe("execute");
   });
 

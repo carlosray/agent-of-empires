@@ -5,9 +5,15 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 
 /** Animated spinner frames from rattles (https://github.com/vyfor/rattles) */
 const RATTLES: Record<string, { frames: string[]; interval: number }> = {
-  dots:         { frames: ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"], interval: 220 },
-  orbit:        { frames: ["⠃","⠉","⠘","⠰","⢠","⣀","⡄","⠆"], interval: 400 },
-  breathe:      { frames: ["⠀","⠂","⠌","⡑","⢕","⢝","⣫","⣟","⣿","⣟","⣫","⢝","⢕","⡑","⠌","⠂","⠀"], interval: 180 },
+  dots: {
+    frames: ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"],
+    interval: 220,
+  },
+  orbit: { frames: ["⠃", "⠉", "⠘", "⠰", "⢠", "⣀", "⡄", "⠆"], interval: 400 },
+  breathe: {
+    frames: ["⠀", "⠂", "⠌", "⡑", "⢕", "⢝", "⣫", "⣟", "⣿", "⣟", "⣫", "⢝", "⢕", "⡑", "⠌", "⠂", "⠀"],
+    interval: 180,
+  },
 };
 
 /** Which statuses get animated spinners vs static glyphs */
@@ -60,17 +66,9 @@ export function StatusGlyph({
 }) {
   const idleDecayWindowMs = useIdleDecayWindowMs();
   const isFresh =
-    status === "Idle" &&
-    isFreshIdle(
-      { status, idle_entered_at: idleEnteredAt ?? null },
-      idleDecayWindowMs,
-    );
+    status === "Idle" && isFreshIdle({ status, idle_entered_at: idleEnteredAt ?? null }, idleDecayWindowMs);
   const rattleKey = STATUS_RATTLE[status];
-  const rattle = isFresh
-    ? FRESH_IDLE_RATTLE
-    : rattleKey
-      ? RATTLES[rattleKey]
-      : undefined;
+  const rattle = isFresh ? FRESH_IDLE_RATTLE : rattleKey ? RATTLES[rattleKey] : undefined;
   const parsed = createdAt ? Date.parse(createdAt) : 0;
   const epoch = Number.isNaN(parsed) ? 0 : parsed;
   const [frame, setFrame] = useState(() => {
@@ -81,11 +79,13 @@ export function StatusGlyph({
   useEffect(() => {
     if (!rattle) return;
     const r = rattle;
-    const computeFrame = () =>
-      Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
-    setFrame(computeFrame());
+    const computeFrame = () => Math.floor((Date.now() - epoch) / r.interval) % r.frames.length;
+    const initial = setTimeout(() => setFrame(computeFrame()), 0);
     const id = setInterval(() => setFrame(computeFrame()), r.interval);
-    return () => clearInterval(id);
+    return () => {
+      clearTimeout(initial);
+      clearInterval(id);
+    };
   }, [rattle, epoch]);
 
   if (!rattle) {

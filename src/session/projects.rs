@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -64,6 +65,13 @@ impl ProjectScope {
 pub struct Project {
     pub name: String,
     pub path: String,
+    /// Default base branch for new worktree branches created against this
+    /// project's repo, whether it is the launch repo or an extra repo in a
+    /// multi-repo workspace. An explicit session base wins; when `None`,
+    /// resolution falls back to the global/profile `worktree.default_base_branch`,
+    /// then the repo's detected default branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_base_branch: Option<String>,
     /// Populated by the loader; not persisted.
     #[serde(skip, default = "default_scope")]
     pub scope: ProjectScope,
@@ -78,8 +86,16 @@ impl Project {
         Self {
             name: name.into(),
             path: path.into(),
+            default_base_branch: None,
             scope,
         }
+    }
+
+    /// Set the project's default base branch, treating an empty/whitespace
+    /// string as "unset".
+    pub fn with_base_branch(mut self, base: Option<String>) -> Self {
+        self.default_base_branch = base.map(|b| b.trim().to_string()).filter(|b| !b.is_empty());
+        self
     }
 }
 
@@ -107,14 +123,8 @@ fn read_file(path: &Path, scope: ProjectScope) -> Result<Vec<Project>> {
 }
 
 fn write_file(path: &Path, projects: &[Project]) -> Result<()> {
-    if path.exists() {
-        let backup = path.with_extension("json.bak");
-        if let Err(e) = fs::copy(path, &backup) {
-            warn!("Failed to back up {}: {}", path.display(), e);
-        }
-    }
     let content = serde_json::to_string_pretty(projects)?;
-    fs::write(path, content)?;
+    super::atomic_write(path, content.as_bytes())?;
     Ok(())
 }
 
@@ -158,11 +168,72 @@ pub fn load_merged(profile: &str) -> Result<Vec<Project>> {
     Ok(merged)
 }
 
-fn canonical_key(path: &str) -> String {
+pub(crate) fn canonical_key(path: &str) -> String {
     PathBuf::from(path)
         .canonicalize()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| path.to_string())
+}
+
+/// Display label for a repo path: its final path segment, with readable
+/// fallbacks for the root and empty cases. This is the header a project
+/// renders under in the project-grouped view, so a registered project and
+/// the sessions living in the same repo collapse under one header.
+///
+/// Shared so the TUI's session-derived grouping and the empty-project
+/// injection below agree on the label, and so a future server endpoint can
+/// reuse the same derivation instead of re-implementing it in TypeScript.
+pub fn repo_label(path: &str) -> String {
+    let p = Path::new(path);
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| {
+            if path == "/" || path.is_empty() {
+                "(root)".to_string()
+            } else {
+                path.to_string()
+            }
+        })
+}
+
+/// A registered project that has no live session keeping its header alive in
+/// the project-grouped view, so a surface can render it as an empty header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnpopulatedProject {
+    /// Header label (the repo basename), matching [`repo_label`].
+    pub label: String,
+    /// Canonical repo path, used to unpin the entry and to launch new
+    /// sessions under it.
+    pub path: String,
+}
+
+/// Given the set of project-header labels that already have at least one live
+/// session and the registered projects, return the registered projects whose
+/// header would otherwise be invisible. Deduped by canonical path (the stable
+/// repo identity), so two repos that merely share a basename are not folded
+/// into one entry. A registered project whose label collides with a populated
+/// header is omitted, the populated header already carries it (and the pin
+/// indicator is derived separately, against the header's own repo path).
+///
+/// Pure and side-effect free so it can be unit-tested directly and reused by
+/// any surface that wants to show pinned-but-empty projects.
+pub fn unpopulated_projects(
+    populated_labels: &HashSet<String>,
+    registered: &[Project],
+) -> Vec<UnpopulatedProject> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for p in registered {
+        let label = repo_label(&p.path);
+        if populated_labels.contains(&label) || !seen.insert(canonical_key(&p.path)) {
+            continue;
+        }
+        out.push(UnpopulatedProject {
+            label,
+            path: p.path.clone(),
+        });
+    }
+    out
 }
 
 /// Replace the contents of one scope's registry file.
@@ -277,6 +348,45 @@ pub fn remove(
     Ok(removed)
 }
 
+/// Set or clear the default base branch on the entry matching `name_or_path`
+/// in the given scope. `base` is normalized via `Project::with_base_branch`
+/// (trimmed; empty becomes unset). Returns the updated project, or `NotFound`
+/// if no entry matches.
+///
+/// This is a read-modify-write over the scope's registry file. There is no
+/// optimistic-concurrency guard; for a single-user local tool last-writer-wins
+/// across racing `aoe` processes is acceptable.
+pub fn update_base_branch(
+    profile: &str,
+    scope: ProjectScope,
+    name_or_path: &str,
+    base: Option<String>,
+) -> std::result::Result<Project, RegistryError> {
+    let mut existing = match scope {
+        ProjectScope::Global => load_global().map_err(RegistryError::Other)?,
+        ProjectScope::Profile => load_profile(profile).map_err(RegistryError::Other)?,
+    };
+
+    let canonical_target = canonical_key(name_or_path);
+    let idx = existing
+        .iter()
+        .position(|p| {
+            p.name.eq_ignore_ascii_case(name_or_path) || canonical_key(&p.path) == canonical_target
+        })
+        .ok_or_else(|| {
+            RegistryError::NotFound(format!(
+                "No project '{}' in {} scope",
+                name_or_path,
+                scope.as_str()
+            ))
+        })?;
+
+    existing[idx] = existing[idx].clone().with_base_branch(base);
+    let updated = existing[idx].clone();
+    save_scope(profile, scope, &existing).map_err(RegistryError::Other)?;
+    Ok(updated)
+}
+
 /// Resolve a list of project names against the merged registry. Errors on the
 /// first unknown name with the available names listed.
 pub fn resolve_names(profile: &str, names: &[String]) -> Result<Vec<Project>> {
@@ -314,8 +424,142 @@ mod tests {
 
     fn setup(temp: &Path) {
         std::env::set_var("HOME", temp);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp.join(".config"));
+    }
+
+    #[test]
+    fn repo_label_uses_basename_with_root_fallbacks() {
+        assert_eq!(repo_label("/home/me/myrepo"), "myrepo");
+        assert_eq!(repo_label("/home/me/myrepo/"), "myrepo");
+        assert_eq!(repo_label("/"), "(root)");
+        assert_eq!(repo_label(""), "(root)");
+    }
+
+    #[test]
+    fn unpopulated_projects_skips_populated_and_keys_on_path() {
+        let registered = vec![
+            Project::new("alpha", "/work/alpha", ProjectScope::Global),
+            Project::new("beta", "/work/beta", ProjectScope::Global),
+            // Same basename as the first beta entry but a distinct repo: it
+            // must NOT be folded away by the shared basename, the identity is
+            // the path.
+            Project::new("beta-other", "/other/beta", ProjectScope::Profile),
+        ];
+        // `alpha` has a live session keeping its header alive, so only the
+        // two distinct beta repos surface as empty headers.
+        let populated: HashSet<String> = ["alpha".to_string()].into_iter().collect();
+
+        let empties = unpopulated_projects(&populated, &registered);
+        let paths: Vec<&str> = empties.iter().map(|p| p.path.as_str()).collect();
+        assert_eq!(paths, vec!["/work/beta", "/other/beta"]);
+        assert!(empties.iter().all(|p| p.label == "beta"));
+    }
+
+    #[test]
+    fn unpopulated_projects_dedupes_same_path() {
+        let registered = vec![
+            Project::new("beta", "/work/beta", ProjectScope::Global),
+            // Same canonical path registered again (e.g. global + profile
+            // shadow): collapse to a single header.
+            Project::new("beta", "/work/beta", ProjectScope::Profile),
+        ];
+        let populated: HashSet<String> = HashSet::new();
+        let empties = unpopulated_projects(&populated, &registered);
+        assert_eq!(empties.len(), 1);
+        assert_eq!(empties[0].path, "/work/beta");
+    }
+
+    #[test]
+    fn unpopulated_projects_empty_when_all_populated() {
+        let registered = vec![Project::new("alpha", "/work/alpha", ProjectScope::Global)];
+        let populated: HashSet<String> = ["alpha".to_string()].into_iter().collect();
+        assert!(unpopulated_projects(&populated, &registered).is_empty());
+    }
+
+    #[test]
+    fn with_base_branch_trims_and_treats_empty_as_unset() {
+        let p = Project::new("r", "/tmp/r", ProjectScope::Global);
+        assert_eq!(p.clone().with_base_branch(None).default_base_branch, None);
+        assert_eq!(
+            p.clone()
+                .with_base_branch(Some("  ".to_string()))
+                .default_base_branch,
+            None
+        );
+        assert_eq!(
+            p.with_base_branch(Some("  develop ".to_string()))
+                .default_base_branch,
+            Some("develop".to_string())
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn default_base_branch_persists_through_add_and_load() -> Result<()> {
+        let temp = tempdir()?;
+        setup(temp.path());
+        let repo = temp.path().join("repoBase");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("repoBase", repo.to_string_lossy(), ProjectScope::Global)
+                .with_base_branch(Some("develop".to_string())),
+            false,
+        )?;
+
+        let loaded = load_global()?;
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].default_base_branch.as_deref(), Some("develop"));
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn update_base_branch_sets_clears_and_reports_not_found() -> Result<()> {
+        let temp = tempdir()?;
+        setup(temp.path());
+        let repo = temp.path().join("repoUpd");
+        let _ = git2::Repository::init(&repo);
+
+        add(
+            "default",
+            ProjectScope::Global,
+            Project::new("repoUpd", repo.to_string_lossy(), ProjectScope::Global),
+            false,
+        )?;
+
+        // Set, looking the project up by name.
+        let updated = update_base_branch(
+            "default",
+            ProjectScope::Global,
+            "repoUpd",
+            Some("develop".into()),
+        )?;
+        assert_eq!(updated.default_base_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            load_global()?[0].default_base_branch.as_deref(),
+            Some("develop")
+        );
+
+        // Whitespace clears it back to unset, looking up by canonical path.
+        let cleared = update_base_branch(
+            "default",
+            ProjectScope::Global,
+            &repo.to_string_lossy(),
+            Some("   ".into()),
+        )?;
+        assert_eq!(cleared.default_base_branch, None);
+        assert_eq!(load_global()?[0].default_base_branch, None);
+
+        // Unknown project is a NotFound.
+        assert!(matches!(
+            update_base_branch("default", ProjectScope::Global, "nope", Some("x".into())),
+            Err(RegistryError::NotFound(_))
+        ));
+        Ok(())
     }
 
     #[test]

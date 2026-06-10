@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./helpers/mockedTest";
 
 const NEW_SESSION_PANE_NAME = /New session Pick a project, then launch a new session/i;
 
@@ -37,6 +37,20 @@ test.describe("Sidebar", () => {
   test("sidebar toggle button exists", async ({ page }) => {
     await page.goto("/");
     await expect(page.getByRole("button", { name: "Toggle sidebar" })).toBeVisible();
+  });
+
+  test("sidebar Projects button opens the Projects view", async ({ page }) => {
+    // Ported from the live projects-open story: the sidebar footer's
+    // Projects button navigates to /projects and ProjectsView mounts.
+    await page.route("**/api/projects*", (r) => r.fulfill({ json: [] }));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await page.getByRole("button", { name: "Projects", exact: true }).click();
+
+    await expect(page).toHaveURL(/\/projects/);
+    await expect(page.getByRole("heading", { name: "Projects", exact: true })).toBeVisible();
+    await expect(page.getByText(/Saved repositories you can multi-select/i)).toBeVisible();
   });
 
   test("sidebar can be toggled closed and open on desktop", async ({ page }) => {
@@ -89,6 +103,21 @@ test.describe("Create session from home screen", () => {
     await page.getByRole("button", { name: NEW_SESSION_PANE_NAME }).click();
     await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
     await page.keyboard.press("Escape");
+    await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
+  });
+
+  test("sidebar New session opens wizard and the header X closes it", async ({ page }) => {
+    // Ported from the live wizard-open-close story. Stub /api/sessions
+    // so useSessions reports the server reachable; otherwise the
+    // offline-state UI disables the sidebar "New session" trigger.
+    await page.route("**/api/sessions", (r) => r.fulfill({ json: { sessions: [], workspace_ordering: [] } }));
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await page.goto("/");
+
+    await page.getByLabel("New session").first().click();
+    await expect(page.getByRole("heading", { name: "New session" })).toBeVisible();
+
+    await page.getByRole("button", { name: "Close" }).click();
     await expect(page.getByRole("heading", { name: "New session" })).not.toBeVisible();
   });
 
@@ -207,9 +236,7 @@ test.describe("Mobile responsive", () => {
 test.describe("Design system", () => {
   test("uses dark surface background", async ({ page }) => {
     await page.goto("/");
-    const bg = await page.evaluate(() =>
-      getComputedStyle(document.body).backgroundColor,
-    );
+    const bg = await page.evaluate(() => getComputedStyle(document.body).backgroundColor);
     // surface-900 = #1c1c1f = rgb(28, 28, 31)
     expect(bg).toContain("28");
     expect(bg).not.toBe("rgb(255, 255, 255)");
@@ -217,9 +244,7 @@ test.describe("Design system", () => {
 
   test("loads Geist Sans body font", async ({ page }) => {
     await page.goto("/");
-    const fonts = await page.evaluate(() =>
-      getComputedStyle(document.body).fontFamily,
-    );
+    const fonts = await page.evaluate(() => getComputedStyle(document.body).fontFamily);
     expect(fonts.toLowerCase()).toContain("geist");
   });
 

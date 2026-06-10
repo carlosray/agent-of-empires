@@ -40,9 +40,7 @@ export const STATUS_TEXT_CLASS: Record<SessionStatus, string> = {
  *  Returns null for non-Idle sessions, sessions without an
  *  `idle_entered_at` timestamp (legacy state), or timestamps in the future
  *  (clock skew). */
-export function idleAgeMs(
-  session: Pick<SessionResponse, "status" | "idle_entered_at">,
-): number | null {
+export function idleAgeMs(session: Pick<SessionResponse, "status" | "idle_entered_at">): number | null {
   if (session.status !== "Idle") return null;
   if (!session.idle_entered_at) return null;
   const since = Date.parse(session.idle_entered_at);
@@ -95,9 +93,7 @@ export function getStatusTextClass(
  *  has just finished and is awaiting the user's next prompt. Fresh-idle is
  *  bucketed with active so dashboard counts and filters surface it. */
 export function isSessionActive(
-  session:
-    | Pick<SessionResponse, "status" | "idle_entered_at">
-    | SessionStatus,
+  session: Pick<SessionResponse, "status" | "idle_entered_at"> | SessionStatus,
   windowMs: number = IDLE_DECAY_WINDOW_MS,
 ): boolean {
   if (typeof session === "string") {

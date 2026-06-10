@@ -124,6 +124,7 @@ impl CreationPoller {
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
+            scratch: data.scratch,
         };
 
         let build_result =
@@ -146,6 +147,7 @@ impl CreationPoller {
         let has_on_create = hooks.as_ref().is_some_and(|h| !h.on_create.is_empty());
         let has_on_launch = hooks.as_ref().is_some_and(|h| !h.on_launch.is_empty());
         let mut container_started = false;
+        let hook_env = repo_config::lifecycle_env_vars(&instance);
 
         // Execute on_create hooks after worktree setup, before starting
         if has_on_create {
@@ -170,8 +172,9 @@ impl CreationPoller {
                         &sandbox.container_name,
                         &workdir,
                         progress_tx,
+                        &hook_env,
                     ) {
-                        tracing::warn!("on_create hook failed in container: {:#}", e);
+                        tracing::warn!(target: "session.create", "on_create hook failed in container: {:#}", e);
                         return CreationResult::Error(format!("on_create hook failed: {:#}", e));
                     }
                 }
@@ -179,6 +182,7 @@ impl CreationPoller {
                 &hooks.on_create,
                 std::path::Path::new(&instance.project_path),
                 progress_tx,
+                &hook_env,
             ) {
                 builder::cleanup_instance(
                     &instance,
@@ -197,7 +201,7 @@ impl CreationPoller {
                 if !container_started {
                     if let Err(e) = instance.get_container_for_instance() {
                         let msg = format!("Container startup warning: {:#}", e);
-                        tracing::warn!("{}", msg);
+                        tracing::warn!(target: "session.create", "{}", msg);
                         let _ = progress_tx.send(HookProgress::Output(msg));
                     } else {
                         container_started = true;
@@ -211,8 +215,9 @@ impl CreationPoller {
                             &sandbox.container_name,
                             &workdir,
                             progress_tx,
+                            &hook_env,
                         ) {
-                            tracing::warn!("on_launch hook failed in container: {}", e);
+                            tracing::warn!(target: "session.create", "on_launch hook failed in container: {}", e);
                         }
                     }
                 }
@@ -220,8 +225,9 @@ impl CreationPoller {
                 &hooks.on_launch,
                 std::path::Path::new(&instance.project_path),
                 progress_tx,
+                &hook_env,
             ) {
-                tracing::warn!("on_launch hook failed: {}", e);
+                tracing::warn!(target: "session.create", "on_launch hook failed: {}", e);
             }
         }
 
@@ -258,7 +264,7 @@ impl CreationPoller {
             .send((request, self.progress_tx.clone()))
             .is_err()
         {
-            tracing::error!("Failed to send creation request: receiver thread died");
+            tracing::error!(target: "session.create", "Failed to send creation request: receiver thread died");
             self.pending = false;
         }
     }

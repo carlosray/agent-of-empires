@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
-use crate::containers::{ContainerConfig, EnvEntry, VolumeMount};
+use crate::containers::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
 use crate::git::GitWorktree;
+use crate::session::config::VolumeIgnoresStrategy;
 
 use super::environment::collect_environment;
 use super::instance::SandboxInfo;
@@ -256,6 +257,18 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "antigravity",
+        host_rel: ".gemini/antigravity-cli",
+        container_suffix: ".gemini/antigravity-cli",
+        skip_entries: &["sandbox", "logs", "cache"],
+        seed_files: &[],
+        copy_dirs: &["plugins"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &["antigravity-oauth-token"],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
@@ -292,7 +305,7 @@ fn sync_agent_config(
     // just potentially overwriting container-side customizations).
     let has_prior_data = sandbox_dir.join("projects").exists();
     if has_prior_data {
-        tracing::info!(
+        tracing::info!(target: "session.profile",
             "sync_agent_config: sandbox={} has prior session data, skipping general file copy",
             sandbox_dir.display()
         );
@@ -311,7 +324,7 @@ fn sync_agent_config(
         let metadata = match std::fs::metadata(entry.path()) {
             Ok(m) => m,
             Err(e) => {
-                tracing::warn!("Skipping {}: {}", entry.path().display(), e);
+                tracing::warn!(target: "session.profile", "Skipping {}: {}", entry.path().display(), e);
                 continue;
             }
         };
@@ -320,7 +333,7 @@ fn sync_agent_config(
             if copy_dirs.iter().any(|&d| d == name_str.as_ref()) {
                 let dest = sandbox_dir.join(&name);
                 if let Err(e) = copy_dir_recursive(&entry.path(), &dest) {
-                    tracing::warn!("Failed to copy dir {}: {}", name_str, e);
+                    tracing::warn!(target: "session.profile", "Failed to copy dir {}: {}", name_str, e);
                 }
             }
             continue;
@@ -342,7 +355,7 @@ fn sync_agent_config(
         }
 
         if let Err(e) = std::fs::copy(entry.path(), &dest) {
-            tracing::warn!("Failed to copy {}: {}", name_str, e);
+            tracing::warn!(target: "session.profile", "Failed to copy {}: {}", name_str, e);
         }
     }
 
@@ -377,7 +390,7 @@ fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<(
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!("Failed to read {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to read {}: {}", path.display(), e);
                 continue;
             }
         };
@@ -385,7 +398,7 @@ fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<(
         let mut value: serde_json::Value = match serde_json::from_str(&content) {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("Failed to parse {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to parse {}: {}", path.display(), e);
                 continue;
             }
         };
@@ -396,7 +409,7 @@ fn rewrite_claude_plugin_paths(sandbox_dir: &Path, host_home: &Path) -> Result<(
         if changed {
             let serialized = serde_json::to_string(&value)?;
             if let Err(e) = std::fs::write(&path, serialized) {
-                tracing::warn!("Failed to write {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to write {}: {}", path.display(), e);
             }
         }
     }
@@ -492,7 +505,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
         // Exit code 36 = errSecInteractionNotAllowed (keychain locked or ACL denied)
         // Exit code 44 = errSecItemNotFound
         if code == 36 {
-            tracing::warn!(
+            tracing::warn!(target: "session.profile",
                 "Keychain access denied for service '{}' (exit code 36). \
                  The keychain may be locked. Run 'security unlock-keychain' and restart. \
                  Stderr: {}",
@@ -500,13 +513,13 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
                 stderr.trim()
             );
         } else if code == 44 {
-            tracing::debug!(
+            tracing::debug!(target: "session.profile",
                 "No keychain entry found for service '{}' (account '{}')",
                 service,
                 user
             );
         } else {
-            tracing::warn!(
+            tracing::warn!(target: "session.profile",
                 "Failed to extract keychain credential for service '{}' \
                  (account '{}', exit code {}): {}",
                 service,
@@ -521,7 +534,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
     let content = String::from_utf8_lossy(&output.stdout);
     let trimmed = content.trim();
     if trimmed.is_empty() {
-        tracing::warn!(
+        tracing::warn!(target: "session.profile",
             "Keychain entry for service '{}' exists but has empty content",
             service
         );
@@ -532,7 +545,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
     if dest.exists() {
         if let Ok(existing_content) = std::fs::read_to_string(dest) {
             if !should_overwrite_credential(&existing_content, trimmed) {
-                tracing::debug!(
+                tracing::debug!(target: "session.profile",
                     "Keychain credential for '{}' is not fresher than sandbox, keeping sandbox",
                     service,
                 );
@@ -542,7 +555,7 @@ fn extract_keychain_credential(service: &str, dest: &Path) -> Result<bool> {
     }
 
     std::fs::write(dest, trimmed)?;
-    tracing::debug!(
+    tracing::debug!(target: "session.profile",
         "Extracted keychain credential for '{}' -> {}",
         service,
         dest.display()
@@ -568,7 +581,7 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
         let path = sandbox_dir.join(name);
         if path.exists() {
             if let Err(e) = std::fs::remove_file(&path) {
-                tracing::warn!("Failed to clean {}: {}", path.display(), e);
+                tracing::warn!(target: "session.profile", "Failed to clean {}: {}", path.display(), e);
             }
         }
     }
@@ -585,7 +598,7 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
 
         if mount.tool_name == "claude" {
             if let Err(e) = rewrite_claude_plugin_paths(&sandbox_dir, home) {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "Failed to rewrite Claude plugin paths in {}: {}",
                     sandbox_dir.display(),
                     e
@@ -595,7 +608,7 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
 
         if let Some((service, filename)) = mount.keychain_credential {
             if let Err(e) = extract_keychain_credential(service, &sandbox_dir.join(filename)) {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "Failed to extract keychain credential for {}: {}",
                     mount.host_rel,
                     e
@@ -806,15 +819,294 @@ pub(crate) fn refresh_agent_configs() {
         return;
     };
 
+    let hooks_enabled = super::config::Config::load()
+        .map(|c| c.session.agent_status_hooks)
+        .unwrap_or(true);
+
     for mount in AGENT_CONFIG_MOUNTS {
-        if let Err(e) = prepare_sandbox_dir(mount, &home) {
-            tracing::warn!(
-                "Failed to refresh agent config for {}: {}",
-                mount.host_rel,
-                e
-            );
+        let refresh_codex_hooks = hooks_enabled && should_refresh_codex_hooks(mount, &home);
+        let preserved_codex_state = if refresh_codex_hooks {
+            let config_path = home
+                .join(mount.host_rel)
+                .join(SANDBOX_SUBDIR)
+                .join("config.toml");
+            match crate::hooks::snapshot_codex_hooks_state(&config_path) {
+                Ok(state) => state,
+                Err(e) => {
+                    tracing::warn!(target: "session.profile",
+                        "Failed to read Codex sandbox hook state from {}: {}",
+                        config_path.display(),
+                        e
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        match prepare_sandbox_dir(mount, &home) {
+            Ok(sandbox_dir) => {
+                if refresh_codex_hooks {
+                    refresh_codex_sandbox_hooks(&sandbox_dir, preserved_codex_state);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "session.profile",
+                    "Failed to refresh agent config for {}: {}",
+                    mount.host_rel,
+                    e
+                );
+            }
         }
     }
+}
+
+fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
+    if mount.tool_name != "codex" || mount.host_rel != ".codex" {
+        return false;
+    }
+
+    let host_config = home.join(mount.host_rel).join("config.toml");
+    let sandbox_config = home
+        .join(mount.host_rel)
+        .join(SANDBOX_SUBDIR)
+        .join("config.toml");
+    host_config.exists() || sandbox_config.exists()
+}
+
+fn refresh_codex_sandbox_hooks(sandbox_dir: &Path, preserved_state: Option<toml_edit::Item>) {
+    let Some(hook_cfg) = crate::agents::get_agent("codex").and_then(|a| a.hook_config.as_ref())
+    else {
+        return;
+    };
+
+    let config_path = sandbox_dir.join("config.toml");
+    if let Err(e) = crate::hooks::install_codex_hooks_with_preserved_state(
+        &config_path,
+        hook_cfg.events,
+        preserved_state,
+    ) {
+        tracing::warn!(
+            "Failed to refresh Codex hooks in sandbox config {}: {}",
+            config_path.display(),
+            e
+        );
+    }
+}
+
+fn resolve_active_agent(
+    tool: &str,
+    detect_as: Option<&str>,
+    session_config: &super::config::SessionConfig,
+) -> Option<&'static crate::agents::AgentDef> {
+    crate::agents::get_agent(tool)
+        .or_else(|| {
+            detect_as
+                .filter(|name| !name.is_empty())
+                .and_then(crate::agents::get_agent)
+        })
+        .or_else(|| {
+            session_config
+                .agent_detect_as
+                .get(tool)
+                .and_then(|detect_as| crate::agents::get_agent(detect_as))
+        })
+}
+
+fn agent_config_container_path(
+    mount: &AgentConfigMount,
+    container_home: &str,
+    environment: &[EnvEntry],
+) -> String {
+    let default_path = format!("{}/{}", container_home, mount.container_suffix);
+    if mount.tool_name != "codex" || mount.host_rel != ".codex" {
+        return default_path;
+    }
+
+    let Some(codex_home) = environment
+        .iter()
+        .find(|entry| entry.key() == "CODEX_HOME")
+        .map(EnvEntry::value)
+    else {
+        return default_path;
+    };
+
+    if codex_home == "/" || !codex_home.starts_with('/') {
+        tracing::warn!(
+            "Ignoring sandbox CODEX_HOME for Codex config mount because it is not a usable absolute container directory: {}",
+            codex_home
+        );
+        return default_path;
+    }
+
+    let normalized = codex_home.trim_end_matches('/');
+    if normalized.is_empty() {
+        tracing::warn!(
+            "Ignoring sandbox CODEX_HOME for Codex config mount because it resolves to an empty container directory"
+        );
+        return default_path;
+    }
+
+    normalized.to_string()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ContainerAgentSelection<'a> {
+    tool: &'a str,
+    detect_as: Option<&'a str>,
+}
+
+impl<'a> ContainerAgentSelection<'a> {
+    pub(crate) fn new(tool: &'a str, detect_as: Option<&'a str>) -> Self {
+        Self { tool, detect_as }
+    }
+}
+
+/// A `volume_ignores` entry containing glob metacharacters is expanded against the
+/// mounted workspace roots at container-create time (#2045); a literal entry is
+/// concatenated onto each mount base unconditionally. This distinguishes the two.
+pub(crate) fn has_glob_metachars(entry: &str) -> bool {
+    entry.contains(['*', '?', '[', ']'])
+}
+
+/// Expand one glob `volume_ignores` entry against the host filesystem under each
+/// mounted workspace root, returning the container-side mount paths for every
+/// directory that matches right now.
+///
+/// `roots` is `(host_path, container_path)` for each project mount. Expansion is a
+/// point-in-time snapshot: Docker needs concrete mount paths when the container
+/// starts, so a directory created later by an in-container build is not shadowed.
+/// Only directories are returned; files can't be ignore mounts. The glob's leading
+/// host prefix is escaped so a literal `[` in the real path isn't treated as a
+/// character class.
+fn expand_glob_ignore(entry: &str, roots: &[(String, String)]) -> Vec<String> {
+    let mut out = Vec::new();
+    for (host_base, container_base) in roots {
+        let host_trimmed = host_base.trim_end_matches('/');
+        let pattern = format!("{}/{}", glob::Pattern::escape(host_trimmed), entry);
+        let matches = match glob::glob(&pattern) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    target: "session.profile",
+                    "Skipping volume_ignores glob '{}': invalid pattern: {}",
+                    entry, e
+                );
+                continue;
+            }
+        };
+        for matched in matches {
+            let path = match matched {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::debug!(target: "session.profile", "glob walk error for '{}': {}", entry, e);
+                    continue;
+                }
+            };
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(host_trimmed) else {
+                continue;
+            };
+            let rel = rel.to_string_lossy();
+            if rel.is_empty() {
+                continue;
+            }
+            out.push(format!("{}/{}", container_base, rel));
+        }
+    }
+    out
+}
+
+/// One glob `volume_ignores` entry paired with the directories it currently
+/// matches, expressed as container-side mount paths. The empty-`matches` case is
+/// kept (rather than dropped) so callers can tell "configured but matched nothing"
+/// from "no glob configured".
+#[derive(Debug, Clone)]
+pub(crate) struct GlobIgnoreExpansion {
+    pub pattern: String,
+    pub matched_container_paths: Vec<String>,
+}
+
+/// Compute how glob `volume_ignores` entries would expand for a session rooted at
+/// `project_path_str`, without creating any container. The TUI confirm gate and the
+/// web preview endpoint both call this so they describe the exact snapshot
+/// [`build_container_config`] will materialize. Literal (non-glob) entries are
+/// excluded; an `Ok(vec![])` means nothing needs confirming.
+pub(crate) fn preview_glob_volume_ignores(
+    project_path_str: &str,
+    workspace_info: Option<&super::WorkspaceInfo>,
+    volume_ignores: &[String],
+) -> Result<Vec<GlobIgnoreExpansion>> {
+    // An empty project path (scratch session) has no workspace to expand
+    // against; globbing it would resolve to filesystem-root patterns. Nothing
+    // to preview.
+    if project_path_str.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let glob_entries: Vec<&String> = volume_ignores
+        .iter()
+        .filter(|e| has_glob_metachars(e))
+        .collect();
+    if glob_entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let project_path = Path::new(project_path_str);
+    let (project_volumes, _workspace_path) = if let Some(ws_info) = workspace_info {
+        compute_workspace_volume_paths(project_path, ws_info)?
+    } else {
+        compute_volume_paths(project_path, project_path_str)?
+    };
+    let roots = glob_roots(&project_volumes);
+
+    Ok(glob_entries
+        .into_iter()
+        .map(|pattern| GlobIgnoreExpansion {
+            pattern: pattern.clone(),
+            matched_container_paths: expand_glob_ignore(pattern, &roots),
+        })
+        .collect())
+}
+
+/// `(host_path, container_path)` pairs for the project mounts, the roots glob
+/// `volume_ignores` are expanded against.
+fn glob_roots(project_volumes: &[VolumeMount]) -> Vec<(String, String)> {
+    project_volumes
+        .iter()
+        .map(|v| (v.host_path.clone(), v.container_path.clone()))
+        .collect()
+}
+
+/// Produce a deterministic Docker volume name for a named volume_ignores mount.
+///
+/// Uses the full session ID as a prefix so volumes can be enumerated on deletion.
+/// A short hash of the container path is appended to handle slug collisions.
+fn named_volume_for(session_id: &str, container_path: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let slug: String = sanitize(container_path.trim_start_matches('/'))
+        .chars()
+        .take(40)
+        .collect();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    container_path.hash(&mut h);
+    let hash = format!("{:x}", h.finish());
+    let hash12 = &hash[..12.min(hash.len())];
+    format!("aoe-vi-{}-{}-{}", session_id, slug, hash12)
 }
 
 /// Build a full `ContainerConfig` for creating a sandboxed container.
@@ -825,7 +1117,7 @@ pub(crate) fn refresh_agent_configs() {
 pub(crate) fn build_container_config(
     project_path_str: &str,
     sandbox_info: &SandboxInfo,
-    tool: &str,
+    agent_selection: ContainerAgentSelection<'_>,
     is_yolo_mode: bool,
     instance_id: &str,
     workspace_info: Option<&super::WorkspaceInfo>,
@@ -834,6 +1126,15 @@ pub(crate) fn build_container_config(
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
 
     let project_path = Path::new(project_path_str);
+    let resolved_profile = super::config::effective_profile(profile);
+    let profile_session_config =
+        super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    let active_agent = resolve_active_agent(
+        agent_selection.tool,
+        agent_selection.detect_as,
+        &profile_session_config,
+    );
+    let config_tool = active_agent.map_or(agent_selection.tool, |agent| agent.name);
 
     // Determine mount path(s) and working directory.
     // For multi-repo workspaces, mount the workspace dir and all main repos.
@@ -856,13 +1157,16 @@ pub(crate) fn build_container_config(
         volume_ignore_bases.push(workspace_path.clone());
     }
 
+    // (host, container) roots for expanding glob volume_ignores against the live
+    // filesystem. Captured before `project_volumes` is moved into `volumes`.
+    let glob_roots = glob_roots(&project_volumes);
+
     let mut volumes = project_volumes;
 
     let sandbox_config = {
-        let resolved_profile = super::config::effective_profile(profile);
         match super::repo_config::resolve_config_with_repo(&resolved_profile, project_path) {
             Ok(c) => {
-                tracing::debug!(
+                tracing::debug!(target: "session.profile",
                     "Loaded sandbox config: extra_volumes={:?}, mount_ssh={}, volume_ignores={:?}",
                     c.sandbox.extra_volumes,
                     c.sandbox.mount_ssh,
@@ -871,13 +1175,15 @@ pub(crate) fn build_container_config(
                 c.sandbox
             }
             Err(e) => {
-                tracing::warn!("Failed to load config, using defaults: {}", e);
+                tracing::warn!(target: "session.profile", "Failed to load config, using defaults: {}", e);
                 Default::default()
             }
         }
     };
 
     const CONTAINER_HOME: &str = "/root";
+
+    let mut environment = collect_environment(&sandbox_config, sandbox_info);
 
     let gitconfig = home.join(".gitconfig");
     if gitconfig.exists() {
@@ -905,7 +1211,7 @@ pub(crate) fn build_container_config(
     // just because the user has the flag exported globally.
     // `GOOGLE_APPLICATION_CREDENTIALS` is not forwarded as an env var; client libraries
     // discover the well-known path automatically.
-    if tool == "claude" && super::environment::host_vertex_enabled() {
+    if agent_selection.tool == "claude" && super::environment::host_vertex_enabled() {
         let container_cred_path = format!(
             "{}/.config/gcloud/application_default_credentials.json",
             CONTAINER_HOME
@@ -919,7 +1225,7 @@ pub(crate) fn build_container_config(
                     read_only: true,
                 });
             } else {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "GOOGLE_APPLICATION_CREDENTIALS points to non-existent file: {}",
                     cred_path
                 );
@@ -939,13 +1245,16 @@ pub(crate) fn build_container_config(
     // Sync host agent config into a shared sandbox directory per agent and
     // bind-mount it read-write. Only mount the config for the active tool.
     // Agent definitions are in AGENT_CONFIG_MOUNTS -- add new agents there, not here.
-    for mount in AGENT_CONFIG_MOUNTS.iter().filter(|m| m.tool_name == tool) {
-        let container_path = format!("{}/{}", CONTAINER_HOME, mount.container_suffix);
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|m| m.tool_name == config_tool)
+    {
+        let container_path = agent_config_container_path(mount, CONTAINER_HOME, &environment);
 
         let sandbox_dir = match prepare_sandbox_dir(mount, &home) {
             Ok(dir) => dir,
             Err(e) => {
-                tracing::warn!(
+                tracing::warn!(target: "session.profile",
                     "Failed to prepare sandbox dir for {}, skipping: {}",
                     mount.host_rel,
                     e
@@ -954,7 +1263,7 @@ pub(crate) fn build_container_config(
             }
         };
 
-        tracing::debug!(
+        tracing::debug!(target: "session.profile",
             "Sandbox dir ready for {}, binding {} -> {}",
             mount.host_rel,
             sandbox_dir.display(),
@@ -980,19 +1289,18 @@ pub(crate) fn build_container_config(
         }
     }
 
-    let hooks_enabled = super::config::Config::load()
-        .map(|c| c.session.agent_status_hooks)
-        .unwrap_or(true);
-    if let Some(agent) = crate::agents::get_agent(tool) {
+    let hooks_enabled = profile_session_config.agent_status_hooks;
+    if let Some(agent) = active_agent {
         if hooks_enabled {
-            // Hermes (YAML) and Kiro (per-agent JSON) use schemas the generic
-            // hook_config path below cannot emit, so they're special-cased here.
-            let hermes_hooks = tool == "hermes";
-            let kiro_hooks = tool == "kiro";
-            if hermes_hooks || kiro_hooks || agent.hook_config.is_some() {
-                let hook_dir = crate::hooks::hook_status_dir(instance_id);
+            // Sidecar agents (hermes YAML, kiro per-agent JSON) use schemas the
+            // generic hook_config path below cannot emit; they install through
+            // their SidecarHooks installer at the sandbox config subpath.
+            if agent.sidecar_hooks.is_some() || agent.hook_config.is_some() {
+                let hook_dir = crate::hooks::hook_status_dir(instance_id).context(
+                    "refusing to mount hook directory: AOE_INSTANCE_ID failed validation",
+                )?;
                 if let Err(e) = std::fs::create_dir_all(&hook_dir) {
-                    tracing::warn!(
+                    tracing::warn!(target: "session.profile",
                         "Failed to create hook directory {}: {}",
                         hook_dir.display(),
                         e
@@ -1005,32 +1313,36 @@ pub(crate) fn build_container_config(
                 });
             }
 
-            if hermes_hooks {
-                let sandbox_dir = home.join(".hermes").join(SANDBOX_SUBDIR);
-                let config_file = sandbox_dir.join("config.yaml");
-                if let Err(e) = crate::hooks::install_hermes_hooks(&config_file) {
-                    tracing::warn!("Failed to install hermes hooks in sandbox: {}", e);
-                }
-            } else if kiro_hooks {
-                let sandbox_dir = home.join(".kiro").join(SANDBOX_SUBDIR);
-                let config_file = sandbox_dir.join("agents").join("aoe-hooks.json");
-                if let Err(e) = crate::hooks::install_kiro_hooks(&config_file) {
-                    tracing::warn!("Failed to install kiro hooks in sandbox: {}", e);
+            if let Some(sidecar) = &agent.sidecar_hooks {
+                let config_file = home.join(sidecar.sandbox_config_subpath);
+                if let Err(e) = (sidecar.install)(&config_file) {
+                    tracing::warn!(target: "session.profile", "Failed to install {} hooks in sandbox: {}", agent.name, e);
                 }
             } else if let Some(hook_cfg) = &agent.hook_config {
-                // Install hooks into sandbox settings.json for the containerized agent.
+                // Install hooks into the sandbox config file for the containerized agent.
                 // Shell one-liners work inside containers since they only use sh/mkdir/printf.
-                let config_dir_name = std::path::Path::new(hook_cfg.settings_rel_path)
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."));
+                let rel_path = std::path::Path::new(hook_cfg.settings_rel_path);
+                let config_dir_name = rel_path.parent().unwrap_or(std::path::Path::new("."));
+                let config_file_name = rel_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("settings.json");
                 // Find the matching agent config mount to locate the sandbox dir
                 for mount in AGENT_CONFIG_MOUNTS {
-                    if mount.host_rel == config_dir_name.to_string_lossy() {
+                    if std::path::Path::new(mount.host_rel) == config_dir_name {
                         let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
-                        let settings_file = sandbox_dir.join("settings.json");
-                        if let Err(e) = crate::hooks::install_hooks(&settings_file, hook_cfg.events)
-                        {
-                            tracing::warn!("Failed to install hooks in sandbox settings: {}", e);
+                        let settings_file = sandbox_dir.join(config_file_name);
+                        let result = if agent.name == "codex" {
+                            crate::hooks::install_codex_hooks(&settings_file, hook_cfg.events)
+                        } else {
+                            crate::hooks::install_hooks(
+                                &settings_file,
+                                hook_cfg.events,
+                                crate::hooks::HookInstallTarget::Sandbox,
+                            )
+                        };
+                        if let Err(e) = result {
+                            tracing::warn!(target: "session.profile", "Failed to install hooks in sandbox config: {}", e);
                         }
                         break;
                     }
@@ -1039,9 +1351,7 @@ pub(crate) fn build_container_config(
         }
     }
 
-    let mut environment = collect_environment(&sandbox_config, sandbox_info);
-
-    if let Some(agent) = crate::agents::get_agent(tool) {
+    if let Some(agent) = active_agent {
         for &(key, value) in agent.container_env {
             environment.push(EnvEntry::Literal {
                 key: key.to_string(),
@@ -1060,7 +1370,7 @@ pub(crate) fn build_container_config(
 
     // Add extra_volumes from config (host:container format)
     // Also collect container paths to filter conflicting volume_ignores later
-    tracing::debug!(
+    tracing::debug!(target: "session.profile",
         "extra_volumes from config: {:?}",
         sandbox_config.extra_volumes
     );
@@ -1069,7 +1379,7 @@ pub(crate) fn build_container_config(
     for entry in &sandbox_config.extra_volumes {
         let parts: Vec<&str> = entry.splitn(3, ':').collect();
         if parts.len() >= 2 {
-            tracing::info!(
+            tracing::info!(target: "session.profile",
                 "Mounting extra volume: {} -> {} (ro: {})",
                 parts[0],
                 parts[1],
@@ -1082,32 +1392,58 @@ pub(crate) fn build_container_config(
                 read_only: parts.get(2) == Some(&"ro"),
             });
         } else {
-            tracing::warn!("Ignoring malformed extra_volume entry: {}", entry);
+            tracing::warn!(target: "session.profile", "Ignoring malformed extra_volume entry: {}", entry);
         }
     }
 
-    // Filter anonymous_volumes to exclude paths that conflict with extra_volumes
-    // (extra_volumes should take precedence over volume_ignores)
-    // Conflicts include:
-    //   - Exact match: both point to same path
-    //   - Anonymous volume is parent of extra_volume (would shadow the mount)
-    //   - Anonymous volume is inside extra_volume (redundant/conflicting)
-    let anonymous_volumes: Vec<String> = volume_ignore_bases
-        .iter()
-        .flat_map(|base_path| {
-            sandbox_config
-                .volume_ignores
-                .iter()
-                .map(move |ignore| format!("{}/{}", base_path, ignore))
-        })
-        .filter(|anon_path| {
+    // Resolve volume_ignores into concrete container mount paths. Literal entries
+    // mount unconditionally at every workspace base (the path need not exist yet,
+    // since the anonymous/named volume shadows it once created). Glob entries are
+    // expanded against the host filesystem now (#2045): a point-in-time snapshot,
+    // since Docker needs concrete mount paths when the container starts.
+    let mut resolved_ignore_paths: Vec<String> = Vec::new();
+    for ignore in &sandbox_config.volume_ignores {
+        if has_glob_metachars(ignore) {
+            resolved_ignore_paths.extend(expand_glob_ignore(ignore, &glob_roots));
+        } else {
+            for base_path in &volume_ignore_bases {
+                resolved_ignore_paths.push(format!("{}/{}", base_path, ignore));
+            }
+        }
+    }
+
+    // Drop duplicates (a glob can match the same dir under overlapping bases) and
+    // filter conflicts with extra_volumes, which take precedence over
+    // volume_ignores. Conflicts: exact match, ignore is a parent of an extra, or
+    // ignore sits inside an extra.
+    let mut seen_ignore = std::collections::HashSet::new();
+    let expanded_ignore_paths: Vec<String> = resolved_ignore_paths
+        .into_iter()
+        .filter(|path| seen_ignore.insert(path.clone()))
+        .filter(|path| {
             !extra_volume_container_paths.iter().any(|extra_path| {
-                anon_path == extra_path
-                    || extra_path.starts_with(&format!("{}/", anon_path))
-                    || anon_path.starts_with(&format!("{}/", extra_path))
+                path == extra_path
+                    || extra_path.starts_with(&format!("{}/", path))
+                    || path.starts_with(&format!("{}/", extra_path))
             })
         })
         .collect();
+
+    // Route by strategy: anonymous volumes are the default; named volumes fix VirtioFS on macOS.
+    let (anonymous_volumes, named_ignore_volumes): (Vec<String>, Vec<NamedVolumeMount>) =
+        match sandbox_config.volume_ignores_strategy {
+            VolumeIgnoresStrategy::Anonymous => (expanded_ignore_paths, vec![]),
+            VolumeIgnoresStrategy::Named => {
+                let named = expanded_ignore_paths
+                    .into_iter()
+                    .map(|container_path| NamedVolumeMount {
+                        volume_name: named_volume_for(instance_id, &container_path),
+                        container_path,
+                    })
+                    .collect();
+                (vec![], named)
+            }
+        };
 
     // Deduplicate volumes by container_path (last writer wins, so extra_volumes
     // from user config override automatic mounts).
@@ -1117,7 +1453,7 @@ pub(crate) fn build_container_config(
         if seen.insert(vol.container_path.clone()) {
             deduped.push(vol);
         } else {
-            tracing::debug!("Dropping duplicate mount for {}", vol.container_path);
+            tracing::debug!(target: "session.profile", "Dropping duplicate mount for {}", vol.container_path);
         }
     }
     deduped.reverse();
@@ -1126,10 +1462,12 @@ pub(crate) fn build_container_config(
         working_dir: workspace_path,
         volumes: deduped,
         anonymous_volumes,
+        named_ignore_volumes,
         environment,
         cpu_limit: sandbox_config.cpu_limit,
         memory_limit: sandbox_config.memory_limit,
         port_mappings: sandbox_config.port_mappings.clone(),
+        selinux_relabel: sandbox_config.selinux_relabel,
     })
 }
 
@@ -1795,6 +2133,17 @@ mod tests {
         assert_eq!(hermes_mounts.len(), 1);
         assert_eq!(hermes_mounts[0].host_rel, ".hermes");
 
+        let antigravity_mounts: Vec<_> = AGENT_CONFIG_MOUNTS
+            .iter()
+            .filter(|m| m.tool_name == "antigravity")
+            .collect();
+        assert_eq!(antigravity_mounts.len(), 1);
+        assert_eq!(antigravity_mounts[0].host_rel, ".gemini/antigravity-cli");
+        assert_eq!(
+            antigravity_mounts[0].container_suffix,
+            ".gemini/antigravity-cli"
+        );
+
         // Unknown tool should match nothing
         let unknown_mounts: Vec<_> = AGENT_CONFIG_MOUNTS
             .iter()
@@ -2302,7 +2651,7 @@ mod tests {
         // Isolate HOME so global/profile config doesn't interfere
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Create a project directory with repo config
@@ -2336,7 +2685,7 @@ extra_volumes = ["/host/data:/container/data:ro"]
         let config = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2385,6 +2734,680 @@ extra_volumes = ["/host/data:/container/data:ro"]
         );
     }
 
+    #[test]
+    fn test_has_glob_metachars() {
+        assert!(has_glob_metachars("**/bin"));
+        assert!(has_glob_metachars("**/obj/"));
+        assert!(has_glob_metachars("target/*"));
+        assert!(has_glob_metachars("build?"));
+        assert!(has_glob_metachars("cache[0-9]"));
+        assert!(!has_glob_metachars("target"));
+        assert!(!has_glob_metachars("node_modules"));
+        assert!(!has_glob_metachars("src/bin"));
+        assert!(!has_glob_metachars(".venv"));
+    }
+
+    /// Feature test for #2045: glob volume_ignores entries are expanded against the
+    /// live workspace at build time, emitting one mount per matched directory, while
+    /// literal entries still mount unconditionally and no `*` ever reaches a mount
+    /// path (the #2036 host-littering regression must not return).
+    #[test]
+    #[serial_test::serial]
+    fn test_volume_ignores_expands_glob_entries() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        // Nested generated dirs the .NET-style globs should find.
+        fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
+        fs::create_dir_all(project_dir.path().join("src/App/obj")).unwrap();
+        fs::create_dir_all(project_dir.path().join("tests/Lib/bin")).unwrap();
+
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+volume_ignores = ["**/bin", "**/obj", "target"]
+"#,
+        )
+        .unwrap();
+
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let project_path_str = project_dir.path().to_str().unwrap();
+        let config = build_container_config(
+            project_path_str,
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
+        let expect = |p: &str| format!("/workspace/{}/{}", dir_name, p);
+
+        for matched in ["src/App/bin", "tests/Lib/bin", "src/App/obj"] {
+            assert!(
+                config.anonymous_volumes.contains(&expect(matched)),
+                "glob should have expanded to {}, got: {:?}",
+                matched,
+                config.anonymous_volumes
+            );
+        }
+        assert!(
+            config.anonymous_volumes.contains(&expect("target")),
+            "literal 'target' entry should still mount, got: {:?}",
+            config.anonymous_volumes
+        );
+        assert!(
+            !config
+                .anonymous_volumes
+                .iter()
+                .any(|p| p.contains('*') || p.contains('?')),
+            "no glob metachar may reach a mount path, got: {:?}",
+            config.anonymous_volumes
+        );
+    }
+
+    /// `preview_glob_volume_ignores` reports the same expansion the build performs,
+    /// keeps a configured-but-unmatched pattern with an empty match list, and ignores
+    /// literal entries entirely.
+    #[test]
+    #[serial_test::serial]
+    fn test_preview_glob_volume_ignores() {
+        let project_dir = TempDir::new().unwrap();
+        fs::create_dir_all(project_dir.path().join("src/App/bin")).unwrap();
+        // A file (not a dir) named like a match must be ignored.
+        fs::write(project_dir.path().join("notes.bin"), "x").unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let project_path_str = project_dir.path().to_str().unwrap();
+
+        let ignores = vec![
+            "**/bin".to_string(),
+            "**/missing".to_string(),
+            "target".to_string(),
+        ];
+        let expansions = preview_glob_volume_ignores(project_path_str, None, &ignores).unwrap();
+
+        // Two glob entries (literal "target" excluded); order preserved.
+        assert_eq!(expansions.len(), 2);
+        assert_eq!(expansions[0].pattern, "**/bin");
+        let dir_name = project_dir.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            expansions[0].matched_container_paths,
+            vec![format!("/workspace/{}/src/App/bin", dir_name)],
+            "only the directory should match, not notes.bin"
+        );
+        assert_eq!(expansions[1].pattern, "**/missing");
+        assert!(
+            expansions[1].matched_container_paths.is_empty(),
+            "an unmatched glob is kept with no matches"
+        );
+    }
+
+    #[test]
+    fn test_preview_glob_volume_ignores_empty_without_globs() {
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let ignores = vec!["target".to_string(), ".venv".to_string()];
+        let expansions =
+            preview_glob_volume_ignores(project_dir.path().to_str().unwrap(), None, &ignores)
+                .unwrap();
+        assert!(expansions.is_empty());
+    }
+
+    /// Regression: when project_path is a sibling worktree, `.agent-of-empires/config.toml`
+    /// lives in the main repo, not the worktree. `build_container_config` must
+    /// resolve repo config from the main repo path so extra_volumes still mount.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_sibling_worktree_loads_main_repo_extra_volumes() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        // Main repo with repo config under .agent-of-empires/
+        let parent = TempDir::new().unwrap();
+        let main_repo = parent.path().join("main");
+        fs::create_dir_all(&main_repo).unwrap();
+        let repo = git2::Repository::init(&main_repo).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+            .unwrap();
+
+        let config_dir = main_repo.join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+extra_volumes = ["/host/screenshots:/root/screenshots"]
+"#,
+        )
+        .unwrap();
+
+        // Sibling worktree under <parent>/worktrees/feat
+        let worktree_path = parent.path().join("worktrees").join("feat");
+        fs::create_dir_all(worktree_path.parent().unwrap()).unwrap();
+        let out = std::process::Command::new("git")
+            .args(["worktree", "add", worktree_path.to_str().unwrap(), "HEAD"])
+            .current_dir(&main_repo)
+            .output()
+            .expect("git worktree add");
+        if !out.status.success() {
+            // git not available or worktree add failed; skip.
+            return;
+        }
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let config = build_container_config(
+            worktree_path.to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("claude", None),
+            false,
+            "test-instance-id",
+            None,
+            "",
+        )
+        .unwrap();
+
+        let volume_pairs: Vec<(&str, &str)> = config
+            .volumes
+            .iter()
+            .map(|v| (v.host_path.as_str(), v.container_path.as_str()))
+            .collect();
+        assert!(
+            volume_pairs.contains(&("/host/screenshots", "/root/screenshots")),
+            "extra_volumes from main-repo config should mount in sibling worktree session, got: {:?}",
+            volume_pairs
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_installs_codex_hooks_files() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(!codex_sandbox.join("hooks.json").exists());
+        assert!(!codex_sandbox.join("settings.json").exists());
+        let codex_config = fs::read_to_string(codex_sandbox.join("config.toml")).unwrap();
+        assert!(codex_config.contains("[[hooks.PreToolUse]]"));
+        assert!(codex_config.contains("aoe-hooks"));
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+
+        let hook_dir =
+            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        assert!(
+            config
+                .volumes
+                .iter()
+                .any(|v| v.host_path == hook_dir.to_string_lossy()),
+            "status hook directory should be mounted"
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    // Regression guard for the trap in #958: a sidecar agent (settl TOML,
+    // hermes YAML, kiro per-agent JSON) that lands without wiring up the
+    // sandbox install branch silently breaks status detection in containers.
+    // Driving every sandboxable sidecar agent through build_container_config
+    // and asserting its config lands at `sandbox_config_subpath` (plus a
+    // mounted hook dir) means a future agent that forgets to set
+    // `sidecar_hooks` fails this test instead of shipping broken.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_installs_sidecar_hooks_files() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sidecar_agents: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS
+            .iter()
+            .filter(|a| a.sidecar_hooks.is_some() && !a.host_only)
+            .collect();
+        assert!(
+            sidecar_agents.iter().any(|a| a.name == "hermes")
+                && sidecar_agents.iter().any(|a| a.name == "kiro"),
+            "expected hermes and kiro to be sandboxable sidecar agents"
+        );
+
+        for agent in sidecar_agents {
+            let sidecar = agent.sidecar_hooks.as_ref().unwrap();
+            assert!(
+                !sidecar.sandbox_config_subpath.is_empty(),
+                "{} is sandboxable so it needs a sandbox_config_subpath",
+                agent.name
+            );
+
+            let sandbox_info = super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+            };
+            let instance_id = format!("{}-sidecar-sandbox-test", agent.name);
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new(agent.name, None),
+                false,
+                &instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+
+            let sandbox_config = temp_home.path().join(sidecar.sandbox_config_subpath);
+            assert!(
+                sandbox_config.exists(),
+                "{} sandbox hook config should be installed at {}",
+                agent.name,
+                sandbox_config.display()
+            );
+            let contents = fs::read_to_string(&sandbox_config).unwrap();
+            assert!(
+                contents.contains("aoe-hooks"),
+                "{} sandbox config should contain the AoE hook marker",
+                agent.name
+            );
+
+            let hook_dir = crate::hooks::hook_status_dir(&instance_id)
+                .expect("test id must be allowlist-safe");
+            assert!(
+                config
+                    .volumes
+                    .iter()
+                    .any(|v| v.host_path == hook_dir.to_string_lossy()),
+                "{} should mount its status hook directory",
+                agent.name
+            );
+            crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_refuses_unsafe_instance_id() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            "../etc",
+            None,
+            "",
+        );
+
+        let err = match result {
+            Ok(_) => panic!("must refuse unsafe instance id"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("AOE_INSTANCE_ID"),
+            "error must surface validator failure, got: {msg}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_respects_profile_hooks_disabled() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let profile_dir = crate::session::get_profile_dir("sandbox-hooks-disabled").unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "[session]\nagent_status_hooks = false\n",
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-hooks-disabled-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "sandbox-hooks-disabled",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(!codex_sandbox.join("config.toml").exists());
+
+        let hook_dir =
+            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        assert!(
+            !config
+                .volumes
+                .iter()
+                .any(|v| v.host_path == hook_dir.to_string_lossy()),
+            "status hook directory should not be mounted when profile disables hooks"
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_uses_detected_codex_for_custom_wrapper_hooks() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let mut global = crate::session::config::Config::default();
+        global.session.agent_status_hooks = false;
+        crate::session::config::save_config(&global).unwrap();
+
+        let profile_dir = crate::session::get_profile_dir("sandbox-wrapped-codex").unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            r#"[session]
+agent_status_hooks = true
+agent_detect_as = { "wrapped-codex" = "codex" }
+"#,
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "wrapped-codex-sandbox-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("wrapped-codex", None),
+            false,
+            instance_id,
+            None,
+            "sandbox-wrapped-codex",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+
+        let codex_config = fs::read_to_string(codex_sandbox.join("config.toml")).unwrap();
+        assert!(codex_config.contains("[[hooks.PreToolUse]]"));
+        assert!(codex_config.contains("aoe-hooks"));
+
+        let hook_dir =
+            crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        assert!(
+            config
+                .volumes
+                .iter()
+                .any(|v| v.host_path == hook_dir.to_string_lossy()),
+            "status hook directory should be mounted for custom Codex wrappers"
+        );
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_refresh_agent_configs_preserves_codex_hooks_and_trust_state() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let codex_dir = temp_home.path().join(".codex");
+        fs::create_dir_all(&codex_dir).unwrap();
+        fs::write(codex_dir.join("config.toml"), r#"model = "initial""#).unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-refresh-hooks-test";
+        build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR);
+        let sandbox_config_path = codex_sandbox.join("config.toml");
+        let mut sandbox_config = fs::read_to_string(&sandbox_config_path).unwrap();
+        sandbox_config.push_str(
+            r#"
+
+[hooks.state.trusted]
+enabled = true
+trusted_hash = "keep"
+"#,
+        );
+        fs::write(&sandbox_config_path, sandbox_config).unwrap();
+        fs::write(codex_dir.join("config.toml"), r#"model = "updated""#).unwrap();
+
+        refresh_agent_configs();
+
+        let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
+        let config: toml::Value = toml::from_str(&config_text).unwrap();
+        assert_eq!(config["model"].as_str(), Some("updated"));
+        assert_eq!(
+            config["hooks"]["state"]["trusted"]["trusted_hash"].as_str(),
+            Some("keep")
+        );
+        assert!(config_text.contains("[[hooks.PreToolUse]]"));
+        assert!(config_text.contains("aoe-hooks"));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_mounts_codex_home_from_extra_env() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: Some(vec!["CODEX_HOME=/root/custom-codex".to_string()]),
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-extra-env-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy()
+                && v.container_path == "/root/custom-codex"
+        }));
+        assert!(!config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_mounts_codex_home_from_sandbox_environment() {
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        let config_dir = project_dir.path().join(".agent-of-empires");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(
+            config_dir.join("config.toml"),
+            r#"
+[sandbox]
+environment = ["CODEX_HOME=/root/profile-codex"]
+"#,
+        )
+        .unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+        let instance_id = "codex-sandbox-config-env-hooks-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("codex", None),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        assert!(codex_sandbox.join("config.toml").exists());
+        assert!(config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy()
+                && v.container_path == "/root/profile-codex"
+        }));
+        assert!(!config.volumes.iter().any(|v| {
+            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+        }));
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
     /// Regression test: when an instance was created under a non-default profile,
     /// `build_container_config` must resolve sandbox overrides (extra_volumes here)
     /// against THAT profile, not the user's globally configured default profile.
@@ -2395,15 +3418,15 @@ extra_volumes = ["/host/data:/container/data:ro"]
     fn test_build_container_config_uses_passed_profile_not_global_default() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
             .path()
             .join(".config")
-            .join(crate::session::APP_DIR_NAME_LINUX);
-        #[cfg(not(target_os = "linux"))]
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
 
         let profiles_dir = app_dir.join("profiles");
@@ -2464,7 +3487,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         let cfg_personal = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2502,7 +3525,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         let cfg_default = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2523,7 +3546,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
         let cfg_empty = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2543,7 +3566,7 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
     fn test_volume_ignores_applied_to_parent_repo_mount() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let (_dir, repo_path) = setup_regular_repo();
@@ -2576,8 +3599,10 @@ extra_volumes = ["/host/personal-only:/container/personal-only:ro"]
             return; // git not available, skip
         }
 
-        // Write repo-level config with volume_ignores
-        let config_dir = worktree_path.join(".agent-of-empires");
+        // Write repo-level config in the main repo dir, since
+        // resolve_config_with_repo loads it from there (find_main_repo) even
+        // when the session targets a sibling worktree.
+        let config_dir = repo_path.join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
@@ -2601,7 +3626,7 @@ volume_ignores = ["target", "node_modules"]
         let config = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2658,7 +3683,7 @@ volume_ignores = ["target", "node_modules"]
     fn test_volume_ignores_applied_to_bare_repo_worktree() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let (_dir, main_repo_path, worktree_path) = setup_bare_repo_with_worktree();
@@ -2667,8 +3692,10 @@ volume_ignores = ["target", "node_modules"]
             return; // git worktree add failed, skip
         }
 
-        // Write repo-level config with volume_ignores
-        let config_dir = worktree_path.join(".agent-of-empires");
+        // Write repo-level config in the main repo dir, since
+        // resolve_config_with_repo loads it from there (find_main_repo) even
+        // when the session targets a sibling worktree.
+        let config_dir = main_repo_path.join(".agent-of-empires");
         fs::create_dir_all(&config_dir).unwrap();
         fs::write(
             config_dir.join("config.toml"),
@@ -2692,7 +3719,7 @@ volume_ignores = ["target"]
         let config = build_container_config(
             project_path_str,
             &sandbox_info,
-            "claude",
+            ContainerAgentSelection::new("claude", None),
             false,
             "test-instance-id",
             None,
@@ -2857,7 +3884,7 @@ volume_ignores = ["target"]
         build_container_config(
             project_dir.to_str().unwrap(),
             &info,
-            tool,
+            ContainerAgentSelection::new(tool, None),
             false,
             "test-instance-id",
             None,
@@ -2871,7 +3898,7 @@ volume_ignores = ["target"]
     fn test_vertex_mounts_default_adc_when_flag_set_and_tool_is_claude() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -2897,7 +3924,7 @@ volume_ignores = ["target"]
     fn test_vertex_mounts_custom_path_from_google_application_credentials() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
 
@@ -2927,7 +3954,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_flag_unset() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -2948,7 +3975,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_tool_is_not_claude() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -2971,7 +3998,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_flag_is_empty_string() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -2994,7 +4021,7 @@ volume_ignores = ["target"]
     fn test_vertex_skips_mount_when_adc_file_missing() {
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
         std::env::set_var("CLAUDE_CODE_USE_VERTEX", "1");
         std::env::remove_var("GOOGLE_APPLICATION_CREDENTIALS");
@@ -3010,5 +4037,68 @@ volume_ignores = ["target"]
         );
 
         std::env::remove_var("CLAUDE_CODE_USE_VERTEX");
+    }
+
+    // --- named_volume_for tests ---
+
+    #[test]
+    fn test_named_volume_for_is_deterministic() {
+        let a = named_volume_for("sess-abc123", "/workspace/node_modules");
+        let b = named_volume_for("sess-abc123", "/workspace/node_modules");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_named_volume_for_differs_by_path() {
+        let a = named_volume_for("sess-abc123", "/workspace/node_modules");
+        let b = named_volume_for("sess-abc123", "/workspace/.venv");
+        assert_ne!(a, b, "Different paths must produce different volume names");
+    }
+
+    #[test]
+    fn test_named_volume_for_differs_by_session_id() {
+        let a = named_volume_for("sess-aaa", "/workspace/node_modules");
+        let b = named_volume_for("sess-bbb", "/workspace/node_modules");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_named_volume_for_sanitizes_unsafe_chars() {
+        let name = named_volume_for("sess-1", "/workspace/path with spaces/foo:bar");
+        assert!(
+            !name.contains(' ') && !name.contains(':'),
+            "Volume name must not contain spaces or colons"
+        );
+    }
+
+    #[test]
+    fn test_named_volume_for_starts_with_prefix() {
+        let name = named_volume_for("sess-xyz", "/workspace/target");
+        assert!(name.starts_with("aoe-vi-sess-xyz-"));
+    }
+
+    #[test]
+    fn test_named_volume_for_slug_collision_prevented_by_hash() {
+        // Two paths that have the same 40-char slug prefix (unlikely but possible for long paths)
+        // are disambiguated by the hash suffix.
+        let path1 = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v1";
+        let path2 = "/workspace/a-very-long-directory-name-that-exceeds-40-chars-v2";
+        let a = named_volume_for("sess-1", path1);
+        let b = named_volume_for("sess-1", path2);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_named_volume_for_prefix_does_not_match_longer_session_id() {
+        // "sess1" must not match volumes belonging to "sess10".
+        // The cleanup prefix is "aoe-vi-{session_id}-" (trailing dash), so a volume
+        // named "aoe-vi-sess10-..." must NOT start with "aoe-vi-sess1-".
+        let vol_sess10 = named_volume_for("sess10", "/workspace/node_modules");
+        let prefix_sess1 = format!("aoe-vi-{}-", "sess1");
+        assert!(
+            !vol_sess10.starts_with(&prefix_sess1),
+            "Volume for sess10 must not match the cleanup prefix for sess1: {}",
+            vol_sess10
+        );
     }
 }

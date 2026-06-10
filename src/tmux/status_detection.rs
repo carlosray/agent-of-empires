@@ -4,12 +4,57 @@ use crate::session::Status;
 
 use super::utils::strip_ansi;
 
-const SPINNER_CHARS: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_CHARS: &[&str] = &[
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠘", "⠣", "⠆", "⠳", "⠰", "⠞", "⣻",
+];
+const LIVE_ACTIVITY_WORDS: &[&str] = &[
+    "analyzing",
+    "applying",
+    "building",
+    "editing",
+    "executing",
+    "fetching",
+    "generating",
+    "grepping",
+    "processing",
+    "reading",
+    "running",
+    "searching",
+    "testing",
+    "thinking",
+    "working",
+    "writing",
+];
+const COMPLETED_ACTIVITY_MARKERS: &[&str] = &[
+    "complete",
+    "completed",
+    "done",
+    "finished",
+    "success",
+    "successful",
+    "successfully",
+];
 
 fn has_any_spinner(lines: &[&str]) -> bool {
     lines
         .iter()
         .any(|line| SPINNER_CHARS.iter().any(|s| line.contains(s)))
+}
+
+fn has_live_activity_word(text_lower: &str) -> bool {
+    LIVE_ACTIVITY_WORDS
+        .iter()
+        .any(|word| status_line_starts_with_phrase(text_lower.trim(), word))
+}
+
+fn has_spinner_activity_line(lines: &[&str]) -> bool {
+    lines.iter().any(|line| {
+        let line_lower = line.to_lowercase();
+        has_any_spinner(&[*line])
+            && LIVE_ACTIVITY_WORDS
+                .iter()
+                .any(|word| line_lower.contains(word))
+    })
 }
 
 fn contains_approval_prompt(text_lower: &str, extra: &[&str]) -> bool {
@@ -77,6 +122,16 @@ pub fn detect_claude_status(content: &str) -> Status {
     let recent_joined = recent.join("\n");
     let recent_lower = recent_joined.to_lowercase();
 
+    // A blocking approval prompt has to outrank the spinner. Claude keeps its
+    // live "Working…" line rendered *below* the permission prompt while it
+    // waits for the user, so a sandboxed session (whose in-container hook
+    // status the host can't read, see `claude_poll_fn_sandboxed`) would
+    // otherwise match the spinner and report Running the whole time it is
+    // blocked. See #1913.
+    if claude_has_approval_prompt(&recent, &recent_lower) {
+        return Status::Waiting;
+    }
+
     if recent_lower.contains("esc to interrupt") || recent_lower.contains("ctrl+c to interrupt") {
         return Status::Running;
     }
@@ -141,6 +196,59 @@ fn claude_line_is_active_spinner(line: &str) -> bool {
     let first_word = &rest[..first_word_end];
     let starts_uppercase = first_word.chars().next().is_some_and(|c| c.is_uppercase());
     starts_uppercase && first_word.contains('…')
+}
+
+/// Claude renders a blocking approval prompt when a tool needs the user's
+/// permission (Bash command, file edit, plan exit, ...). Every variant pairs
+/// a yes/no question ("Do you want to proceed?", "Do you want to make this
+/// edit to <file>?", "Would you like to proceed?") with a numbered choice
+/// menu. Requiring both keeps an assistant-authored numbered list from being
+/// mistaken for a prompt. `recent_lower` is the lowercased join of `recent`.
+fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
+    let has_question = recent_lower.contains("do you want to")
+        || recent_lower.contains("would you like to proceed");
+    has_question
+        && recent
+            .iter()
+            .any(|line| claude_line_is_numbered_choice(line))
+}
+
+/// A numbered menu option, optionally preceded by the `❯`/`>` selection
+/// cursor: `❯ 1. Yes`, `2. No`, `3. No, and tell Claude ...`.
+fn claude_line_is_numbered_choice(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix('❯')
+        .or_else(|| trimmed.strip_prefix('>'))
+        .map(str::trim_start)
+        .unwrap_or(trimmed);
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('1'..='9')) && matches!(chars.next(), Some('.'))
+}
+
+/// Strip ANSI and scan the recent pane lines for an approval prompt. Shares
+/// the same recent-window shape as `detect_claude_status`; this entry point
+/// exists for callers that hold raw (un-stripped) `capture-pane -e` output.
+fn claude_pane_has_approval_prompt(raw_content: &str) -> bool {
+    let clean = strip_ansi(raw_content);
+    let non_empty: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let recent: Vec<&str> = non_empty.iter().rev().take(30).rev().copied().collect();
+    let recent_lower = recent.join("\n").to_lowercase();
+    claude_has_approval_prompt(&recent, &recent_lower)
+}
+
+/// When Claude's status hook reports Running, the pane can still be parked on a
+/// blocking approval prompt. Claude keeps its live spinner rendered below the
+/// prompt and re-emits running-mapped hook events (`PreToolUse`,
+/// `UserPromptSubmit`) while the prompt is up, so the last hook write stays
+/// `running` even though the agent is blocked on the user. Mirrors
+/// `reconcile_codex_hook_status`: downgrade Running -> Waiting when the pane
+/// shows an approval prompt, otherwise trust the hook. See #1913.
+pub(crate) fn reconcile_claude_hook_status(hook_status: Status, raw_content: &str) -> Status {
+    if hook_status == Status::Running && claude_pane_has_approval_prompt(raw_content) {
+        return Status::Waiting;
+    }
+    hook_status
 }
 
 pub fn detect_opencode_status(raw_content: &str) -> Status {
@@ -316,12 +424,11 @@ pub fn detect_vibe_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
-/// Codex doesn't use hooks yet (tracked in #1126), so we infer status from the
-/// pane text. Strategy, in priority order:
+/// Fallback Codex status detection from pane text. Strategy, in priority order:
 ///
-///   1. Explicit `Waiting` signals like `enter to submit answer` /
-///      `(unanswered)` win immediately, since Codex sometimes renders these
-///      alongside a stale spinner from earlier in the turn.
+///   1. Structured Plan-mode radio prompts win immediately, since Codex
+///      sometimes renders these alongside a stale spinner from earlier in the
+///      turn.
 ///   2. Running is detected from the *current turn block* only, i.e. the lines
 ///      below the most recent `─ Worked for ... ─` divider. This stops stale
 ///      `• Working ...` markers from a previous turn leaking into a turn that
@@ -352,9 +459,7 @@ pub fn detect_codex_status(raw_content: &str) -> Status {
         .join("\n");
     let last_lines_lower = last_lines.to_lowercase();
 
-    if last_lines_lower.contains("enter to submit answer")
-        || last_lines_lower.contains("(unanswered)")
-    {
+    if codex_has_plan_radio_prompt(&non_empty_lines) {
         return Status::Waiting;
     }
 
@@ -362,36 +467,295 @@ pub fn detect_codex_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
-    if contains_codex_approval_prompt(&last_lines_lower) {
+    if contains_approval_prompt(
+        &last_lines_lower,
+        &[
+            "continue?",
+            "proceed?",
+            "execute?",
+            "run command?",
+            "enter to select",
+            "esc to cancel",
+        ],
+    ) {
         return Status::Waiting;
     }
 
-    for line in non_empty_lines.iter().rev().take(10) {
-        let trimmed = line.trim();
-        let after_cursor = trimmed
-            .strip_prefix("❯")
-            .or_else(|| trimmed.strip_prefix("›"));
-        if let Some(rest) = after_cursor {
-            let after_cursor = rest.trim_start();
-            if after_cursor.starts_with("1.")
-                || after_cursor.starts_with("2.")
-                || after_cursor.starts_with("3.")
-            {
-                return Status::Waiting;
-            }
-        }
+    if codex_has_recent_numbered_choice_prompt(&non_empty_lines) {
+        return Status::Waiting;
     }
 
-    if codex_has_input_prompt(&non_empty_lines) && codex_has_interruption_prompt(&last_lines_lower)
+    // Interrupted-turn prompts ask the user to tell Codex what to do
+    // differently. The pane shows the interruption message with an input
+    // prompt below it. Show Waiting so the user knows Codex needs a new
+    // direction, not just another task (which would be Idle).
+    if codex_has_interruption_prompt(&non_empty_lines)
+        && codex_has_non_numbered_cursor_prompt(&non_empty_lines)
     {
         return Status::Waiting;
     }
 
+    // The `codex>` REPL prompt means Codex is at its input gate. Treat as
+    // Waiting so the session is visually distinct from a fully idle session.
     if matches_input_prompt(&non_empty_lines, 10, &["codex>"]) {
         return Status::Waiting;
     }
 
+    if codex_has_interrupted_turn_without_new_activity(&non_empty_lines) {
+        return Status::Idle;
+    }
+
     Status::Idle
+}
+
+pub(crate) fn reconcile_codex_hook_status(hook_status: Status, raw_content: &str) -> Status {
+    if hook_status != Status::Running {
+        return hook_status;
+    }
+
+    detect_codex_hook_gap_status(raw_content).unwrap_or(hook_status)
+}
+
+fn detect_codex_hook_gap_status(raw_content: &str) -> Option<Status> {
+    let clean = strip_ansi(raw_content);
+    let content = clean.to_lowercase();
+    let non_empty_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    // A cancelled Plan-mode radio prompt remains in scrollback above the
+    // interruption marker, so the newer interruption must win here.
+    if codex_has_interrupted_turn_without_new_activity(&non_empty_lines) {
+        return Some(Status::Idle);
+    }
+
+    if codex_has_plan_radio_prompt(&non_empty_lines)
+        || codex_has_recent_numbered_choice_prompt(&non_empty_lines)
+    {
+        return Some(Status::Waiting);
+    }
+
+    if codex_has_completed_turn_prompt(&non_empty_lines) {
+        return Some(Status::Idle);
+    }
+
+    if codex_has_completed_review_prompt(&non_empty_lines) {
+        return Some(Status::Idle);
+    }
+
+    None
+}
+
+fn codex_has_plan_radio_prompt(non_empty_lines: &[&str]) -> bool {
+    let recent_start = non_empty_lines.len().saturating_sub(40);
+    let recent = &non_empty_lines[recent_start..];
+
+    let Some(question_index) = recent.iter().rposition(|line| {
+        let trimmed = line.trim();
+        trimmed.starts_with("question ") && trimmed.contains("unanswered")
+    }) else {
+        return false;
+    };
+    let Some(choice_index) = recent
+        .iter()
+        .rposition(|line| codex_line_has_numbered_choice_cursor(line.trim()))
+    else {
+        return false;
+    };
+    let Some(submit_hint_index) = recent
+        .iter()
+        .rposition(|line| line.contains("enter to submit answer"))
+    else {
+        return false;
+    };
+
+    if !(question_index <= choice_index && choice_index <= submit_hint_index) {
+        return false;
+    }
+
+    !codex_has_running_signal(&recent[submit_hint_index + 1..])
+}
+
+fn codex_line_has_numbered_choice_cursor(line: &str) -> bool {
+    let Some(rest) = line
+        .strip_prefix("❯")
+        .or_else(|| line.strip_prefix("›"))
+        .map(str::trim_start)
+    else {
+        return false;
+    };
+
+    let mut chars = rest.chars();
+    matches!(chars.next(), Some('1'..='9')) && matches!(chars.next(), Some('.'))
+}
+
+fn codex_has_recent_numbered_choice_prompt(non_empty_lines: &[&str]) -> bool {
+    let recent_start = non_empty_lines.len().saturating_sub(10);
+    let recent = &non_empty_lines[recent_start..];
+    let Some(choice_index) = recent
+        .iter()
+        .rposition(|line| codex_line_has_numbered_choice_cursor(line.trim()))
+    else {
+        return false;
+    };
+    let lines_after_choice = &recent[choice_index + 1..];
+
+    !codex_has_running_signal(lines_after_choice)
+        && !codex_has_non_numbered_cursor_prompt(lines_after_choice)
+}
+
+fn codex_has_non_numbered_cursor_prompt(non_empty_lines: &[&str]) -> bool {
+    non_empty_lines
+        .iter()
+        .any(|line| codex_is_non_numbered_cursor_prompt(line.trim()))
+}
+
+fn codex_has_tail_non_numbered_cursor_prompt(non_empty_lines: &[&str]) -> bool {
+    let Some(prompt_index) = non_empty_lines
+        .iter()
+        .rposition(|line| codex_is_non_numbered_cursor_prompt(line.trim()))
+    else {
+        return false;
+    };
+
+    non_empty_lines[prompt_index + 1..]
+        .iter()
+        .all(|line| codex_is_terminal_footer_line(line.trim()))
+}
+
+fn codex_is_non_numbered_cursor_prompt(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("❯").or_else(|| line.strip_prefix("›")) else {
+        return false;
+    };
+
+    !rest.trim_start().is_empty() && !codex_line_has_numbered_choice_cursor(line)
+}
+
+// The footer Codex prints under its input prompt looks like
+// `gpt-5.5 xhigh fast · ~/project`. The model-prefix list is intentionally
+// narrow so unrelated lines (e.g. assistant prose containing ` · `) don't
+// accidentally satisfy the tail check. If Codex ships a new model family
+// prefix this list needs to grow; the safe failure mode is that the hook
+// keeps reporting Running until it catches up on its own.
+fn codex_is_terminal_footer_line(line: &str) -> bool {
+    line.contains(" · ")
+        && (line.starts_with("gpt-") || line.starts_with("o3") || line.starts_with("o4"))
+}
+
+fn codex_has_interrupted_turn_without_new_activity(non_empty_lines: &[&str]) -> bool {
+    let Some(marker_index) = codex_interruption_marker_end_index(non_empty_lines) else {
+        return false;
+    };
+
+    let lines_after_marker = &non_empty_lines[marker_index + 1..];
+    if codex_has_running_signal(lines_after_marker)
+        || codex_has_plan_radio_prompt(lines_after_marker)
+        || codex_has_recent_numbered_choice_prompt(lines_after_marker)
+        || codex_has_approval_prompt(lines_after_marker)
+        || codex_cursor_prompt_count(lines_after_marker) > 1
+    {
+        return false;
+    }
+
+    true
+}
+
+fn codex_has_completed_turn_prompt(non_empty_lines: &[&str]) -> bool {
+    codex_has_idle_prompt_after_marker(non_empty_lines, |line| {
+        codex_is_completed_work_divider(line.trim())
+    })
+}
+
+fn codex_has_completed_review_prompt(non_empty_lines: &[&str]) -> bool {
+    codex_has_idle_prompt_after_marker(non_empty_lines, |line| {
+        line.trim().contains("<< code review finished >>")
+    })
+}
+
+fn codex_has_idle_prompt_after_marker(
+    non_empty_lines: &[&str],
+    is_marker: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(marker_index) = non_empty_lines.iter().rposition(|line| is_marker(line)) else {
+        return false;
+    };
+
+    let lines_after_marker = &non_empty_lines[marker_index + 1..];
+    !codex_has_running_signal(lines_after_marker)
+        && !codex_has_plan_radio_prompt(lines_after_marker)
+        && !codex_has_recent_numbered_choice_prompt(lines_after_marker)
+        && !codex_has_approval_prompt(lines_after_marker)
+        && codex_has_tail_non_numbered_cursor_prompt(lines_after_marker)
+}
+
+fn codex_interruption_marker_end_index(non_empty_lines: &[&str]) -> Option<usize> {
+    const INTERRUPTED_MARKER: &str =
+        "conversation interrupted - tell the model what to do differently";
+    const MAX_MARKER_LINES: usize = 4;
+
+    for start in (0..non_empty_lines.len()).rev() {
+        let end_exclusive = (start + MAX_MARKER_LINES).min(non_empty_lines.len());
+        let mut joined = String::new();
+
+        for (end, line) in non_empty_lines
+            .iter()
+            .enumerate()
+            .take(end_exclusive)
+            .skip(start)
+        {
+            if !joined.is_empty() {
+                joined.push(' ');
+            }
+            joined.push_str(codex_interruption_line_body(line));
+
+            if collapse_ascii_whitespace(&joined).contains(INTERRUPTED_MARKER) {
+                return Some(end);
+            }
+        }
+    }
+
+    None
+}
+
+fn codex_interruption_line_body(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    trimmed
+        .strip_prefix('■')
+        .map(str::trim_start)
+        .unwrap_or(trimmed)
+}
+
+fn collapse_ascii_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn codex_has_approval_prompt(non_empty_lines: &[&str]) -> bool {
+    let text = non_empty_lines.join("\n");
+    contains_approval_prompt(
+        &text,
+        &[
+            "continue?",
+            "proceed?",
+            "execute?",
+            "run command?",
+            "enter to select",
+            "esc to cancel",
+        ],
+    )
+}
+
+fn codex_cursor_prompt_count(non_empty_lines: &[&str]) -> usize {
+    non_empty_lines
+        .iter()
+        .filter(|line| {
+            let trimmed = line.trim();
+            let Some(rest) = trimmed
+                .strip_prefix("❯")
+                .or_else(|| trimmed.strip_prefix("›"))
+            else {
+                return false;
+            };
+            !rest.trim_start().is_empty()
+        })
+        .count()
 }
 
 fn codex_line_starts_with_activity(line: &str) -> bool {
@@ -478,85 +842,134 @@ fn codex_is_completed_work_divider(line: &str) -> bool {
         .starts_with("worked for")
 }
 
+/// Shared with Codex (`codex_line_starts_with_activity`,
+/// `codex_line_starts_with_live_interrupt_activity`) as well as the Cursor and
+/// Antigravity fallbacks, so the completion-marker suppression applies to every
+/// caller. The completion list is kept small and explicit to avoid swallowing
+/// legitimate activity descriptions that happen to contain past-tense words.
 fn status_line_starts_with_phrase(line: &str, phrase: &str) -> bool {
     let Some(rest) = line.strip_prefix(phrase) else {
         return false;
     };
-    rest.chars()
+    let has_valid_boundary = rest
+        .chars()
         .next()
-        .is_none_or(|c| c.is_whitespace() || c == '.' || c == '…' || c == ':')
+        .is_none_or(|c| c.is_whitespace() || c == '.' || c == '…' || c == ':');
+    has_valid_boundary && !activity_tail_has_completion_marker(rest)
 }
 
-fn codex_has_input_prompt(non_empty_lines: &[&str]) -> bool {
-    non_empty_lines.iter().rev().take(5).any(|line| {
-        let trimmed = line.trim();
-        let Some(rest) = trimmed
-            .strip_prefix("›")
-            .or_else(|| trimmed.strip_prefix("❯"))
-        else {
-            return false;
-        };
-        let rest = rest.trim_start();
-        !rest.starts_with("1.") && !rest.starts_with("2.") && !rest.starts_with("3.")
-    })
+fn activity_tail_has_completion_marker(rest: &str) -> bool {
+    let tail =
+        rest.trim_start_matches(|c: char| c.is_whitespace() || c == '.' || c == '…' || c == ':');
+    if tail.is_empty() {
+        return false;
+    }
+
+    tail.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .take(5)
+        .map(str::to_lowercase)
+        .any(|word| COMPLETED_ACTIVITY_MARKERS.contains(&word.as_str()))
 }
 
-fn codex_has_interruption_prompt(recent_lower: &str) -> bool {
-    recent_lower.contains("conversation interrupted")
-        || recent_lower.contains("tell the model what to do differently")
+fn codex_has_interruption_prompt(non_empty_lines: &[&str]) -> bool {
+    let text = non_empty_lines.join("\n").to_lowercase();
+    text.contains("conversation interrupted")
+        || text.contains("tell the model what to do differently")
 }
 
-fn contains_codex_approval_prompt(recent_lower: &str) -> bool {
-    let direct_prompts = [
-        "(y/n)",
-        "[y/n]",
-        "continue?",
-        "proceed?",
-        "execute?",
-        "run command?",
-        "enter to select",
-        "esc to cancel",
-    ];
-    if direct_prompts
-        .iter()
-        .any(|prompt| recent_lower.contains(prompt))
+/// Cursor agent status is detected via hooks first, but pane parsing is still
+/// needed when hooks are missing or the Cursor CLI is executing a long-running
+/// turn between hook writes.
+pub fn detect_cursor_status(raw_content: &str) -> Status {
+    let content = raw_content.to_lowercase();
+    let recent: Vec<&str> = {
+        let non_empty: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        non_empty.iter().rev().take(30).rev().copied().collect()
+    };
+    let recent_lower = recent.join("\n");
+
+    if contains_approval_prompt(
+        &recent_lower,
+        &[
+            "permission required",
+            "approval required",
+            "allow command",
+            "allow this command",
+            "run this command",
+            "enter to approve",
+            "enter to select",
+            "esc to cancel",
+        ],
+    ) {
+        return Status::Waiting;
+    }
+
+    // The interrupt hint, spinner, and verb-prefixed activity line all live on
+    // or below Cursor's bottom status bar while a turn is running. Restricting
+    // the check to the last follow-up prompt and the lines below it mirrors the
+    // boundary already used elsewhere and keeps stale scrollback (e.g. a
+    // `ctrl+c to stop` from the previous turn) from re-triggering Running.
+    let active_region = cursor_active_region(&recent);
+    let active_joined = active_region.join("\n");
+
+    if active_joined.contains("ctrl+c to stop")
+        || active_joined.contains("ctrl+c to interrupt")
+        || active_joined.contains("esc to interrupt")
     {
-        return true;
+        return Status::Running;
     }
 
-    let has_questioned_approval = recent_lower
-        .lines()
-        .any(|line| line.contains('?') && (line.contains("approve") || line.contains("allow")));
-    if has_questioned_approval {
-        return true;
+    if has_spinner_activity_line(active_region) {
+        return Status::Running;
     }
 
-    let option_context = ["approve", "allow", "command", "execute", "run"]
+    if active_region
         .iter()
-        .any(|word| recent_lower.contains(word));
-    option_context && codex_approval_option_count(recent_lower) >= 2
-}
+        .any(|line| has_live_activity_word(line))
+    {
+        return Status::Running;
+    }
 
-fn codex_approval_option_count(text: &str) -> usize {
-    text.lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            let mut chars = trimmed.chars();
-            let numbered = matches!(
-                (chars.next(), chars.next()),
-                (Some(first), Some('.')) if first.is_ascii_digit()
-            );
-            numbered
-                && ["yes", "no", "allow", "approve"]
-                    .iter()
-                    .any(|word| trimmed.contains(word))
-        })
-        .count()
-}
+    if cursor_has_follow_up_prompt(&recent) {
+        return Status::Idle;
+    }
 
-/// Cursor agent status is detected via hooks (file-based), same as Claude Code.
-pub fn detect_cursor_status(_content: &str) -> Status {
+    if cursor_has_background_task(&recent_lower) {
+        return Status::Running;
+    }
+
     Status::Idle
+}
+
+fn cursor_has_background_task(text_lower: &str) -> bool {
+    text_lower.contains("background task") || text_lower.contains("background tasks")
+}
+
+fn cursor_has_follow_up_prompt(lines: &[&str]) -> bool {
+    cursor_last_follow_up_prompt_index(lines).is_some()
+}
+
+/// The active region is the last follow-up prompt plus the lines below it.
+/// Cursor renders its live status bar (interrupt hint, spinner, verb-prefixed
+/// activity) on this prompt line or just below; anything above belongs to the
+/// previous turn's scrollback and must not be treated as a live signal.
+fn cursor_active_region<'a>(lines: &'a [&'a str]) -> &'a [&'a str] {
+    match cursor_last_follow_up_prompt_index(lines) {
+        Some(index) => &lines[index..],
+        None => lines,
+    }
+}
+
+fn cursor_last_follow_up_prompt_index(lines: &[&str]) -> Option<usize> {
+    lines
+        .iter()
+        .rposition(|line| cursor_is_follow_up_prompt(line))
+}
+
+fn cursor_is_follow_up_prompt(line: &str) -> bool {
+    let clean_line = line.trim();
+    clean_line == "→" || clean_line.starts_with("→ add a follow-up")
 }
 
 /// Copilot CLI status detection via tmux pane parsing.
@@ -717,11 +1130,103 @@ pub fn detect_droid_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
-/// Hermes status is detected via shell-script hooks (YAML-based) registered
-/// in `~/.hermes/config.yaml`, not tmux pane parsing. This stub exists so
-/// the agent registry has a valid function pointer; it only runs as a
-/// fallback when the hook hasn't written a status file yet.
-pub fn detect_hermes_status(_content: &str) -> Status {
+/// Hermes (NousResearch) status detection via tmux pane parsing.
+/// Used as a fallback when the YAML hook system hasn't written a status file yet.
+/// Detects spinner faces (◜ ◠ ✧), tool execution prefix (┊), thinking verbs,
+/// dangerous-command approval prompt, and input prompt (❯ / ⚡).
+pub fn detect_hermes_status(raw_content: &str) -> Status {
+    let content = raw_content.to_lowercase();
+    let lines: Vec<&str> = content.lines().collect();
+    let non_empty_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+
+    let last_lines: String = non_empty_lines
+        .iter()
+        .rev()
+        .take(30)
+        .rev()
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    // Hermes spinner faces animate during LLM calls; only present while active
+    // (unicode, unaffected by to_lowercase).
+    const HERMES_SPINNERS: &[&str] = &["◜", "◠", "✧"];
+    if lines
+        .iter()
+        .any(|line| HERMES_SPINNERS.iter().any(|s| line.contains(s)))
+    {
+        return Status::Running;
+    }
+
+    // While running, Hermes replaces the input prompt with
+    // "❯ Ctrl+C to interrupt…". Check this before the idle-prompt
+    // detection below so we don't misidentify Running as Waiting.
+    if non_empty_lines
+        .iter()
+        .rev()
+        .take(5)
+        .any(|l| l.contains("ctrl+c to interrupt"))
+    {
+        return Status::Running;
+    }
+
+    // Input prompt ❯ (default skin) or ⚡ (cyberpunk skin) on its own means
+    // the agent finished its turn and is ready for the next message — Idle,
+    // not Waiting (which in AoE means "needs user approval for a dangerous
+    // command"). Placed before scrollback activity words to avoid false-positive
+    // Running from a previous turn.
+    for line in non_empty_lines.iter().rev().take(5) {
+        let clean = strip_ansi(line).trim().to_string();
+        if clean == "❯" || clean.starts_with("❯ ") || clean == "⚡" || clean.starts_with("⚡ ")
+        {
+            return Status::Idle;
+        }
+    }
+
+    // Active streaming lines are prefixed with ┊; check recent lines only
+    // to avoid triggering on scrollback from a completed turn.
+    if non_empty_lines
+        .iter()
+        .rev()
+        .take(10)
+        .any(|l| l.contains("┊"))
+    {
+        return Status::Running;
+    }
+
+    // Thinking verbs from the default skin and community Hermes skins.
+    let activity_indicators = [
+        "reasoning",
+        "pondering",
+        "contemplating",
+        "forging",
+        "plotting",
+        "jacking in",
+        "decrypting",
+        "uploading",
+        "processing",
+        "analyzing",
+        "computing",
+        "evaluating",
+    ];
+    for indicator in &activity_indicators {
+        if last_lines.contains(indicator) {
+            return Status::Running;
+        }
+    }
+
+    // Dangerous-command approval prompt.
+    if contains_approval_prompt(
+        &last_lines,
+        &["choice [o/s/a/d]:", "[o]nce", "dangerous command"],
+    ) {
+        return Status::Waiting;
+    }
+
     Status::Idle
 }
 
@@ -851,14 +1356,211 @@ pub fn detect_qwen_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
+pub fn detect_antigravity_status(raw_content: &str) -> Status {
+    let content = raw_content.to_lowercase();
+    let lines: Vec<&str> = content.lines().collect();
+    let non_empty_lines: Vec<&str> = lines
+        .iter()
+        .filter(|l| !l.trim().is_empty())
+        .copied()
+        .collect();
+
+    let last_lines_lower: String = non_empty_lines
+        .iter()
+        .rev()
+        .take(30)
+        .rev()
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    if last_lines_lower.contains("not signed in")
+        || last_lines_lower.contains("signing in")
+        || last_lines_lower.contains("authorization url")
+        || last_lines_lower.contains("authorization code")
+        || last_lines_lower.contains("google sign-in")
+    {
+        return Status::Waiting;
+    }
+
+    // "Approval Required" is the actual header Antigravity renders above tool
+    // permission prompts. The substring "approve" does NOT appear in
+    // "approval", so the base contains_approval_prompt list misses it; match
+    // explicitly. "deny access" is the rejection button rendered alongside.
+    // "awaiting user approval" is the status line shown while the agent is
+    // blocked on the user's decision.
+    if last_lines_lower.contains("approval required")
+        || last_lines_lower.contains("awaiting user approval")
+        || last_lines_lower.contains("deny access")
+    {
+        return Status::Waiting;
+    }
+
+    if contains_approval_prompt(
+        &last_lines_lower,
+        &[
+            "permission request",
+            "do you trust the contents",
+            "yes, i trust this folder",
+            "execute?",
+            "run command?",
+            "enter to select",
+            "enter confirm",
+            "esc to cancel",
+        ],
+    ) {
+        return Status::Waiting;
+    }
+
+    if last_lines_lower.contains("esc to interrupt")
+        || last_lines_lower.contains("ctrl+c to interrupt")
+        || last_lines_lower.contains("ctrl+c to stop")
+    {
+        return Status::Running;
+    }
+
+    if has_any_spinner(&lines) {
+        return Status::Running;
+    }
+
+    if non_empty_lines
+        .iter()
+        .rev()
+        .take(10)
+        .any(|line| has_live_activity_word(line))
+    {
+        return Status::Running;
+    }
+
+    Status::Idle
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_detect_cursor_status_is_stub() {
-        // Cursor uses hook-based detection; the stub always returns Idle
-        assert_eq!(detect_cursor_status("anything"), Status::Idle);
+    fn test_detect_cursor_status_running_on_live_activity() {
+        let content = "\
+  Grepped \"legacy_engine\" in .
+
+ ⠘⠣ Reading  6.66k tokens
+
+  → Add a follow-up                                      ctrl+c to stop
+
+  Composer 2.5 · 48.2%                                  Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_calling_spinner() {
+        let content = "\
+ ⠀⠞ Calling  23.62k tokens
+
+
+  → Add a follow-up  ctrl+c to stop
+
+
+  Composer 2.5 · 55.7% · 49 files edited  Auto-run
+";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_background_task_after_follow_up_prompt() {
+        let content = "\
+  → Add a follow-up
+
+
+  1 background task
+  Composer 2.5 · 39.2% · 20 files edited  Auto-run
+";
+        assert_eq!(detect_cursor_status(content), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_background_task_without_prompt() {
+        let content = "\
+  Started processing the request.
+
+  1 background task
+  Composer 2.5 · 39.2% · 20 files edited  Auto-run
+";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_running_on_editing_spinner() {
+        let content = "\
+  ┌──────────────────────────────┐
+  │ Editing src/app/submit/page.tsx
+  └──────────────────────────────┘
+
+ ⠘⠆ Editing  39.76k tokens";
+        assert_eq!(detect_cursor_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_waiting_for_permission_prompt() {
+        let content = "\
+Run this command?
+
+> Allow this command
+  Deny
+
+enter to select · esc to cancel";
+        assert_eq!(detect_cursor_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_completed_output() {
+        let content = "\
+  Finished the requested changes.
+
+  → Add a follow-up
+
+  Composer 2.5 · 60.9% · 4 files edited                 Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_completed_activity_phrases() {
+        for content in [
+            "Running tests completed successfully.\n\n→ Add a follow-up",
+            "Reading config.toml finished.\n\n→ Add a follow-up",
+            "Editing src/app.rs done.\n\n→ Add a follow-up",
+            "Testing finished with success.\n\n→ Add a follow-up",
+        ] {
+            assert_eq!(detect_cursor_status(content), Status::Idle);
+        }
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_completed_activity_without_prompt() {
+        // Exercises activity_tail_has_completion_marker directly: no follow-up
+        // prompt line is present, so the result depends on the verb-prefixed
+        // line being suppressed because of the completion marker that follows.
+        for content in [
+            "Running tests completed successfully.\n  Composer 2.5",
+            "Reading config.toml finished.\n  Composer 2.5",
+            "Editing src/app.rs done.\n  Composer 2.5",
+            "Testing finished with success.\n  Composer 2.5",
+        ] {
+            assert_eq!(detect_cursor_status(content), Status::Idle);
+        }
+    }
+
+    #[test]
+    fn test_detect_cursor_status_idle_on_stale_spinner_before_follow_up_prompt() {
+        let content = "\
+ ⠘⠆ Editing  39.76k tokens
+
+  Updated src/app/submit/page.tsx
+
+  → Add a follow-up
+
+  Composer 2.5 · 56.1% · 26 files edited  Auto-run";
+        assert_eq!(detect_cursor_status(content), Status::Idle);
     }
 
     #[test]
@@ -954,6 +1656,107 @@ mod tests {
             content.push('\n');
         }
         assert_eq!(detect_claude_status(&content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_bash_permission_prompt() {
+        // Regression for #1913: a sandboxed Claude session reaches the
+        // pane fallback (the host can't read the in-container hook status),
+        // and Claude keeps its live spinner line rendered *below* the
+        // approval prompt while it waits. The prompt must outrank the
+        // spinner or the session reports Running (green) the whole time
+        // it is blocked on the user.
+        let content = "\
+  Bash command
+
+    SANDBOX=aoe-sandbox-ee1a86c7
+    echo \"checking sandbox gitconfig\"
+
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. No
+
+  Esc to cancel · Tab to amend
+
+✶ Herding… (53s · ↓ 7.0k tokens)
+  Tip: Use /bts to ask a quick side question without interrupting Claude's current work";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_edit_permission_prompt() {
+        let content = "\
+  Do you want to make this edit to src/main.rs?
+  ❯ 1. Yes
+    2. Yes, allow all edits during this session (shift+tab)
+    3. No, and tell Claude what to do differently (esc)
+
+✶ Cooking… (8s · ↓ 412 tokens)";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_waiting_on_plan_exit_prompt() {
+        let content = "\
+  Would you like to proceed?
+  ❯ 1. Yes, and auto-accept edits
+    2. Yes, and manually approve edits
+    3. No, keep planning";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_not_confused_by_numbered_prose() {
+        // A numbered list in assistant prose must not be mistaken for an
+        // approval prompt: without a "do you want to" / "would you like to
+        // proceed" question, the live spinner still wins.
+        let content = "\
+  Here is the plan:
+  1. Read the config
+  2. Patch the parser
+
+✶ Working… (4s · ↓ 88 tokens)
+  esc to interrupt";
+        assert_eq!(detect_claude_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_waiting_on_approval_prompt() {
+        // The hook reports Running (PreToolUse fired) but the pane is parked
+        // on a permission prompt with the spinner still alive below it. The
+        // reconciler must downgrade to Waiting. ANSI is preserved here to
+        // exercise the strip path the live capture goes through. See #1913.
+        let pane = "\x1b[1m  Do you want to proceed?\x1b[0m\n\
+  ❯ 1. Yes\n    2. No\n\n  Esc to cancel · Tab to amend\n\
+\x1b[38;5;174m✶\x1b[0m Herding… (53s · ↓ 7.0k tokens)";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_keeps_running_without_prompt() {
+        let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_claude_hook_status_passes_non_running_through() {
+        // A Notification(permission_prompt) hook that does fire writes
+        // Waiting directly; the reconciler must not second-guess it, and an
+        // Idle/Waiting hook is trusted as-is even with no pane evidence.
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Waiting, ""),
+            Status::Waiting
+        );
+        assert_eq!(
+            reconcile_claude_hook_status(Status::Idle, "Do you want to proceed?\n1. Yes"),
+            Status::Idle
+        );
     }
 
     #[test]
@@ -1190,6 +1993,15 @@ mod tests {
             ),
             Status::Idle
         );
+        // A bare `›` or `›` with text that is not a numbered choice is Idle.
+        assert_eq!(
+            detect_codex_status("› Find and fix a bug in @filename"),
+            Status::Idle
+        );
+        assert_eq!(
+            detect_codex_status("› Run /review on my current changes"),
+            Status::Idle
+        );
     }
 
     #[test]
@@ -1252,7 +2064,33 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_codex_status_waiting_after_interruption() {
+    fn test_detect_codex_status_idle_for_normal_prompt_tails() {
+        let lithuanians = r#"
+• Fixed and staged src/tui/home/render.rs:695. The margin span now uses Span::raw(" "), avoiding clippy::repeat_once.
+
+  Verification passed: cargo clippy --lib -- -D warnings.
+
+
+› Find and fix a bug in @filename
+
+  gpt-5.5 xhigh fast · ~/appsSource/agent-of-empires
+"#;
+
+        let persians = r#"
+• You picked: Banana.
+
+
+› Run /review on my current changes
+
+  gpt-5.5 xhigh fast · ~/appsSource/agent-of-empires
+"#;
+
+        assert_eq!(detect_codex_status(lithuanians), Status::Idle);
+        assert_eq!(detect_codex_status(persians), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_codex_status_idle_after_interruption() {
         let pane = r#"
   If your API supports an array/operator filter like value_in, then this could be shorter,
   but based on your working example, aliases are the safest GraphQL-native way to query all of them in one request.
@@ -1269,11 +2107,39 @@ mod tests {
   gpt-5.5 medium · ~/tomatom/connector-plus-shopty/shopty
 "#;
 
+        assert_eq!(detect_codex_status(pane), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_codex_status_waiting_after_stale_interruption_before_approval() {
+        let pane = r#"
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+› Try again
+
+run this command? (y/n)
+"#;
+
         assert_eq!(detect_codex_status(pane), Status::Waiting);
     }
 
     #[test]
-    fn test_detect_codex_status_waiting_after_completed_turn() {
+    fn test_detect_codex_status_idle_after_stale_interruption_before_prompt() {
+        let pane = r#"
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.
+
+› Try again
+
+• No action taken.
+
+› What next?
+"#;
+
+        assert_eq!(detect_codex_status(pane), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_codex_status_idle_after_completed_turn() {
         let pane = r#"
   Note: git status still shows MM src/tmux/status_detection.rs, meaning earlier staged changes exist and this latest fix is
   unstaged on top.
@@ -1295,7 +2161,7 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_codex_status_waiting_with_spinner_examples_in_scrollback() {
+    fn test_detect_codex_status_idle_with_spinner_examples_in_scrollback() {
         let pane = r#"
   tmux capture-pane -p -e -S -50
 
@@ -1314,8 +2180,8 @@ mod tests {
   That logic is in src/tmux/status_detection.rs:344.
 
   If those running signals are not present, it then checks
-  waiting signals like prompts, approvals, numbered choices,
-  or › .... If none match, it falls back to Idle.
+  waiting signals like approvals or numbered choices.
+  If none match, it falls back to Idle.
 
   So this is not OS process-state detection like “is the
   process using CPU.” It is mostly agent UI/state detection
@@ -1500,6 +2366,393 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
     }
 
     #[test]
+    fn test_detect_codex_status_running_after_stale_radio_prompt() {
+        let pane = r#"
+  Question 1/1 (1 unanswered)
+  Do you want apple, banana, orange, or something else?
+
+  › 1. Apple (Recommended)  Pick apple for the default simple choice.
+    2. Banana               Pick banana for a second common option.
+    3. Orange               Pick orange for a citrus option.
+    4. None of the above    Optionally, add details in notes (tab).
+
+  tab to add notes | enter to submit answer | esc to interrupt
+
+› Apple
+
+• Working (4s • esc to interrupt)
+"#;
+
+        assert_eq!(detect_codex_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_waiting_for_plan_radio_input() {
+        let pane = r#"
+│                                                    │
+│ model:     gpt-5.5 xhigh   fast   /model to change │
+│ directory: ~/appsSource/agent-of-empires           │
+╰────────────────────────────────────────────────────╯
+
+  Tip: See the Codex keymap documentation for supported actions and examples.
+
+
+› ask me something using codex radio button selection
+
+
+• I tried to open the Codex radio selector, but request_user_input is unavailable in Default mode.
+
+  To show actual radio buttons, switch this session to Plan mode and ask again.
+
+
+› okay i switched to plan mode
+
+
+
+  Question 1/1 (1 unanswered)
+  Do you want apple, banana, orange, or something else?
+
+  › 1. Apple (Recommended)  Pick apple for the default simple choice.
+    2. Banana               Pick banana for a second common option.
+    3. Orange               Pick orange for a citrus option.
+    4. None of the above    Optionally, add details in notes (tab).
+
+  tab to add notes | enter to submit answer | esc to interrupt
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_waiting_for_radio_only_input() {
+        let pane = "\
+  › 1. Yes
+    2. No
+    3. Maybe
+";
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_ignores_stale_radio_prompt_before_activity() {
+        let pane = r#"
+  Question 1/1 (1 unanswered)
+  Do you want apple, banana, orange, or something else?
+
+  › 1. Apple (Recommended)  Pick apple for the default simple choice.
+    2. Banana               Pick banana for a second common option.
+    3. Orange               Pick orange for a citrus option.
+    4. None of the above    Optionally, add details in notes (tab).
+
+  tab to add notes | enter to submit answer | esc to interrupt
+
+› Apple
+
+• Working (4s • esc to interrupt)
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_idle_after_cancelled_radio_prompt() {
+        let pane = r#"
+  Question 1/1 (1 unanswered)
+  Do you want apple, banana, orange, or something else?
+
+  › 1. Apple (Recommended)  Pick apple for the default simple choice.
+    2. Banana               Pick banana for a second common option.
+    3. Orange               Pick orange for a citrus option.
+    4. None of the above    Optionally, add details in notes (tab).
+
+  tab to add notes | enter to submit answer | esc to interrupt
+
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to
+report the issue.
+
+
+› Write tests for @filename
+
+  gpt-5.5 xhigh fast · ~/appsSource/agent-of-empires
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_idle_after_wrapped_esc_interruption() {
+        let pane = r#"
+› something
+
+
+■ Conversation interrupted - tell the model what to
+do differently. Something went wrong? Hit `/feedback` to
+report the issue.
+
+
+› Write tests for @filename
+
+  gpt-5.5 xhigh fast · ~/appsSource/agent-of-empires
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_idle_after_wrapped_interruption_without_glyph() {
+        let pane = r#"
+› something
+
+
+Conversation interrupted - tell the model what to
+do differently. Something went wrong? Hit `/feedback` to
+report the issue.
+
+
+› Write tests for @filename
+
+  gpt-5.5 xhigh fast · ~/appsSource/agent-of-empires
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_idle_after_esc_interruption() {
+        let pane = r#"
+╭────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.130.0)                         │
+│                                                    │
+│ model:     gpt-5.5 xhigh   fast   /model to change │
+│ directory: ~/appsSource/agent-of-empires           │
+╰────────────────────────────────────────────────────╯
+
+  Tip: Use /rename to rename your threads for easier thread resuming.
+
+
+› something
+
+
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to
+report the issue.
+
+
+› Write tests for @filename
+
+  gpt-5.5 xhigh fast · ~/appsSource/agent-of-empires
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_idle_after_completed_review() {
+        let pane = r#"
+>> Code review started: staged changes <<
+
+• Ran git diff --stat
+  └ 1 file changed, 3 insertions(+)
+
+• Explored
+  └ Read src/main.rs
+
+<< Code review finished >>
+
+──────────────────────────────────────────────────────────────
+
+• No discrete correctness issues were found in the provided command changes.
+
+─ Worked for 7m 40s ──────────────────────────────────────────
+
+› Implement the fix
+
+  gpt-5.5 xhigh fast · ~/project
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_idle_after_completed_review_without_worked_divider() {
+        let pane = r#"
+╭────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.133.0)                         │
+│                                                    │
+│ model:     gpt-5.5 xhigh   fast   /model to change │
+│ directory: ~/project                               │
+╰────────────────────────────────────────────────────╯
+
+  Tip: Use /rename to rename your threads for easier thread resuming.
+
+>> Code review started: src/main.rs <<
+
+<< Code review finished >>
+
+• No discrete correctness issues were found in the provided command changes.
+
+› Improve documentation in @filename
+
+  gpt-5.5 xhigh fast · ~/project
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_keeps_running_after_completed_turn_with_new_activity() {
+        let pane = r#"
+<< Code review finished >>
+
+─ Worked for 7m 40s ──────────────────────────────────────────
+
+› Implement the fix
+
+• Working (4s • esc to interrupt)
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_keeps_running_after_completed_turn_with_plain_new_output() {
+        let pane = r#"
+─ Worked for 7m 40s ──────────────────────────────────────────
+
+› Implement the fix
+
+I’ll inspect the status detection path first and then adjust the idle override.
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_keeps_running_after_completed_review_with_plain_new_output()
+    {
+        let pane = r#"
+>> Code review started: staged changes <<
+
+<< Code review finished >>
+
+› Implement the review comment
+
+I’ll inspect the status detection path first and then adjust the idle override.
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_does_not_use_generic_pane_states() {
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, "run this command? (y/n)"),
+            Status::Running
+        );
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, "› Write tests for @filename"),
+            Status::Running
+        );
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, "file saved"),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_only_overrides_running_hooks() {
+        let pane = "\
+  Question 1/1 (1 unanswered)
+  Pick one
+
+  › 1. Apple
+    2. Banana
+
+  tab to add notes | enter to submit answer | esc to interrupt
+";
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Waiting, pane),
+            Status::Waiting
+        );
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Idle, pane),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_ignores_stale_interruption_before_activity() {
+        let pane = r#"
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to
+report the issue.
+
+› Try again
+
+• Working (4s • esc to interrupt)
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_reconcile_codex_hook_status_ignores_stale_interruption_before_approval() {
+        let pane = r#"
+■ Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to
+report the issue.
+
+› Try again
+
+run this command? (y/n)
+"#;
+
+        assert_eq!(
+            reconcile_codex_hook_status(Status::Running, pane),
+            Status::Running
+        );
+    }
+
+    #[test]
     fn test_detect_gemini_status_running() {
         assert_eq!(
             detect_gemini_status("processing request\nesc to interrupt"),
@@ -1631,9 +2884,101 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
     }
 
     #[test]
-    fn test_detect_hermes_status_is_stub() {
-        // Hermes uses hook-based detection; the stub always returns Idle
+    fn test_detect_hermes_status_running_on_spinner() {
+        assert_eq!(
+            detect_hermes_status("◜ (｡•́︿•̀｡) pondering... (1.2s)"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_hermes_status("◠ (⊙_⊙) contemplating... (2.4s)"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_hermes_status("✧٩(ˊᗜˋ*)و✧ got it! (3.1s)"),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_hermes_status_running_on_tool_execution() {
+        assert_eq!(
+            detect_hermes_status("┊ 💻 terminal 'ls -la' (0.3s)"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_hermes_status("┊ 🔍 web_search (1.2s)"),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_hermes_status_running_on_thinking_verbs() {
+        assert_eq!(detect_hermes_status("reasoning…"), Status::Running);
+        assert_eq!(
+            detect_hermes_status("pondering the question"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_hermes_status("analyzing the codebase"),
+            Status::Running
+        );
+        assert_eq!(detect_hermes_status("computing result"), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_hermes_status_running_on_interrupt_hint() {
+        // While running, Hermes shows "❯ Ctrl+C to interrupt…" in the prompt
+        // area. Must detect as Running, not Waiting.
+        assert_eq!(
+            detect_hermes_status("┊ some response\n❯ Ctrl+C to interrupt…"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_hermes_status("─ (¬‿¬) reasoning…\n❯ Ctrl+C to interrupt…"),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_hermes_status_waiting_on_approval() {
+        assert_eq!(
+            detect_hermes_status(
+                "⚠️  DANGEROUS COMMAND: rm -rf /tmp\n[o]nce  |  [s]ession  |  [a]lways  |  [d]eny\nChoice [o/s/a/D]:"
+            ),
+            Status::Waiting
+        );
+        assert_eq!(
+            detect_hermes_status("dangerous command detected\nproceed?"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_hermes_status_idle_on_input_prompt() {
+        // The bare ❯/⚡ prompt means "ready for next message" — Idle in AoE
+        // semantics. Waiting is reserved for dangerous-command approval gates.
+        assert_eq!(detect_hermes_status("some output\n❯"), Status::Idle);
+        assert_eq!(detect_hermes_status("some output\n❯ "), Status::Idle);
+        assert_eq!(detect_hermes_status("some output\n⚡"), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_hermes_status_prompt_overrides_scrollback() {
+        // If the input prompt is visible, don't mis-detect Running from old scrollback.
+        assert_eq!(
+            detect_hermes_status("pondering the question\ntask complete\n❯"),
+            Status::Idle
+        );
+    }
+
+    #[test]
+    fn test_detect_hermes_status_idle_on_plain_text() {
         assert_eq!(detect_hermes_status("anything"), Status::Idle);
+        assert_eq!(detect_hermes_status(""), Status::Idle);
+        assert_eq!(
+            detect_hermes_status("task completed successfully"),
+            Status::Idle
+        );
     }
 
     #[test]
@@ -1689,6 +3034,122 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
     fn test_detect_qwen_status_idle() {
         assert_eq!(detect_qwen_status("file saved"), Status::Idle);
         assert_eq!(detect_qwen_status("random output text"), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_waiting_for_auth() {
+        let content = "\
+     ▄▀▀▄
+    ▀▀▀▀▀▀
+
+ Welcome to the Antigravity CLI. You are currently not signed in.
+
+ ⣻  Signing in...";
+        assert_eq!(detect_antigravity_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_waiting_for_workspace_trust() {
+        let content = "\
+Accessing workspace:
+
+/tmp/aoe-agy-smoke-proj
+
+Do you trust the contents of this project?
+
+Antigravity CLI requires permission to read, edit, and execute files here.
+
+> Yes, I trust this folder
+  No, exit
+
+  ↑/↓ Navigate · enter Confirm
+                                                         Gemini 3.5 Flash (High)";
+        assert_eq!(detect_antigravity_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_running() {
+        assert_eq!(
+            detect_antigravity_status("processing request\nesc to interrupt"),
+            Status::Running
+        );
+        assert_eq!(
+            detect_antigravity_status("⠋ Thinking about your request"),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_running_on_stop_hint() {
+        let content = "\
+  Applying patch to src/session/instance.rs
+
+  → Add a follow-up                                      ctrl+c to stop";
+        assert_eq!(detect_antigravity_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_running_on_live_activity_line() {
+        let content = "\
+  Generated summary for the previous step.
+
+  Editing src/session/instance.rs";
+        assert_eq!(detect_antigravity_status(content), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_idle_on_completed_activity_phrases() {
+        for content in [
+            "Running tests completed successfully.",
+            "Reading config.toml finished.",
+            "Editing src/session/instance.rs done.",
+            "Testing finished with success.",
+        ] {
+            assert_eq!(detect_antigravity_status(content), Status::Idle);
+        }
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_waiting_for_prompt() {
+        assert_eq!(
+            detect_antigravity_status("run command? (y/n)"),
+            Status::Waiting
+        );
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_waiting_for_tool_approval() {
+        // Real header rendered above Antigravity tool permission prompts.
+        // "approval" does not contain "approve", so the shared
+        // contains_approval_prompt helper misses this header; the detector
+        // matches "approval required" explicitly instead.
+        let content = "\
+read_file
+path: /workspace/secrets.env
+
+⚠ Approval Required
+
+> Yes, just this once
+  Yes, allow always
+  No, deny access";
+        assert_eq!(detect_antigravity_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_waiting_user_approval_status_line() {
+        // "awaiting user approval" is the status line shown while the agent
+        // is blocked on the user's tool-permission decision.
+        let content = "I'll read that file now.\n awaiting user approval.";
+        assert_eq!(detect_antigravity_status(content), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_antigravity_status_idle() {
+        assert_eq!(detect_antigravity_status("file saved"), Status::Idle);
+        assert_eq!(
+            detect_antigravity_status("random output text"),
+            Status::Idle
+        );
     }
 
     #[test]

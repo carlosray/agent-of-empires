@@ -1,3 +1,4 @@
+/* eslint-disable no-control-regex -- this file's whole job is to match ESC sequences */
 // ANSI SGR parser for Bash tool output.
 //
 // claude-agent-acp forwards `\x1b[...m` color escapes from commands
@@ -118,8 +119,22 @@ const BG: Record<number, string> = {
 function palette256(n: number): string {
   if (n < 16) {
     const ordered = [
-      FG[30], FG[31], FG[32], FG[33], FG[34], FG[35], FG[36], FG[37],
-      FG[90], FG[91], FG[92], FG[93], FG[94], FG[95], FG[96], FG[97],
+      FG[30],
+      FG[31],
+      FG[32],
+      FG[33],
+      FG[34],
+      FG[35],
+      FG[36],
+      FG[37],
+      FG[90],
+      FG[91],
+      FG[92],
+      FG[93],
+      FG[94],
+      FG[95],
+      FG[96],
+      FG[97],
     ];
     return ordered[n] ?? "#888888";
   }
@@ -195,8 +210,7 @@ function applySgr(style: AnsiStyle, params: number[]): AnsiStyle {
         next[target] = palette256(params[i + 2] ?? 0);
         i += 3;
       } else if (mode === 2) {
-        next[target] =
-          `rgb(${params[i + 2] ?? 0}, ${params[i + 3] ?? 0}, ${params[i + 4] ?? 0})`;
+        next[target] = `rgb(${params[i + 2] ?? 0}, ${params[i + 3] ?? 0}, ${params[i + 4] ?? 0})`;
         i += 5;
       } else {
         i++;

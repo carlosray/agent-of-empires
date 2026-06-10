@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CommentMarkdown } from "./CommentMarkdown";
-import { buildCommentsMarkdown, buildFullPrompt } from "./buildPrompt";
+import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
+import { reportTelemetrySeen } from "../../../lib/api";
 
 interface Props {
   sessionId: string;
   comments: DiffComment[];
   isMultiRepo: boolean;
   /** Same gate as the banner Send button. Reflects
-   *  `cockpit_mode && cockpit_worker_state === "running"`. False
+   *  `structured_view && acp_worker_state === "running"`. False
    *  disables the Send button so prompts don't sink when the worker
    *  isn't ready. */
   sendEnabled: boolean;
@@ -27,7 +28,7 @@ interface Props {
  *  preview of the assembled comments markdown, editable outro
  *  textarea. The final prompt is composed at send time so the user's
  *  intro/outro edits don't fall out of sync if comments change
- *  underneath. See history/plan-diff-comments.md. */
+ *  underneath. */
 export function SendCommentsDialog({
   sessionId,
   comments,
@@ -54,27 +55,21 @@ export function SendCommentsDialog({
     };
   }, []);
 
-  const preview = useMemo(
-    () => buildCommentsMarkdown(comments, { isMultiRepo }),
-    [comments, isMultiRepo],
-  );
+  const preview = useMemo(() => buildCommentsMarkdown(comments, { isMultiRepo }), [comments, isMultiRepo]);
 
   const send = useCallback(async () => {
     if (busy || comments.length === 0 || !sendEnabled) return;
     setBusy(true);
     setError(null);
-    const body = buildFullPrompt(comments, introDraft, outroDraft, {
+    const built = buildDiffCommentsPrompt(comments, introDraft, outroDraft, {
       isMultiRepo,
     });
     try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(sessionId)}/cockpit/prompt`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: body }),
-        },
-      );
+      const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/prompt/diff-comments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(built),
+      });
       if (!res.ok) {
         const text = (await res.text().catch(() => "")).slice(0, 500);
         if (mountedRef.current) {
@@ -82,6 +77,9 @@ export function SendCommentsDialog({
         }
         return;
       }
+      // Count each successful diff-comments send (a low-frequency action, so a
+      // count is more useful than a boolean). Only on a confirmed 2xx.
+      reportTelemetrySeen("diff_comments");
       onSent();
     } catch (e) {
       const message = e instanceof Error ? e.message : "Network error";
@@ -93,16 +91,7 @@ export function SendCommentsDialog({
         setBusy(false);
       }
     }
-  }, [
-    busy,
-    comments,
-    introDraft,
-    outroDraft,
-    isMultiRepo,
-    sendEnabled,
-    sessionId,
-    onSent,
-  ]);
+  }, [busy, comments, introDraft, outroDraft, isMultiRepo, sendEnabled, sessionId, onSent]);
 
   // Trap Esc/Cmd+Enter at the document level so editing in the textareas
   // doesn't intercept the dialog hotkeys. Esc is blocked while a send
@@ -131,9 +120,7 @@ export function SendCommentsDialog({
     >
       <div className="bg-surface-900 border border-surface-700 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] flex flex-col">
         <div className="px-4 py-3 border-b border-surface-700/60 flex items-center gap-2">
-          <h2 className="text-sm font-semibold text-text-primary">
-            Send diff comments
-          </h2>
+          <h2 className="text-sm font-semibold text-text-primary">Send diff comments</h2>
           <span className="text-[11px] text-text-dim">
             {comments.length} comment{comments.length === 1 ? "" : "s"}
           </span>
@@ -148,9 +135,7 @@ export function SendCommentsDialog({
         </div>
         <div className="flex-1 overflow-auto px-4 py-3 space-y-3">
           <section>
-            <label className="block text-[11px] text-text-dim mb-1">
-              Intro (optional)
-            </label>
+            <label className="block text-[11px] text-text-dim mb-1">Intro (optional)</label>
             <textarea
               value={introDraft}
               onChange={(e) => onChangeIntro(e.target.value)}
@@ -161,9 +146,7 @@ export function SendCommentsDialog({
           </section>
 
           <section>
-            <div className="text-[11px] text-text-dim mb-1">
-              Comments preview (auto-generated, read-only)
-            </div>
+            <div className="text-[11px] text-text-dim mb-1">Comments preview (auto-generated, read-only)</div>
             <div className="border border-surface-700/60 rounded p-3 bg-surface-950 max-h-72 overflow-auto text-[13px]">
               {preview ? (
                 <CommentMarkdown text={preview} />
@@ -174,9 +157,7 @@ export function SendCommentsDialog({
           </section>
 
           <section>
-            <label className="block text-[11px] text-text-dim mb-1">
-              Outro
-            </label>
+            <label className="block text-[11px] text-text-dim mb-1">Outro</label>
             <textarea
               value={outroDraft}
               onChange={(e) => onChangeOutro(e.target.value)}
@@ -186,11 +167,7 @@ export function SendCommentsDialog({
             />
           </section>
 
-          {error && (
-            <div className="text-[12px] text-status-error bg-status-error/10 rounded p-2">
-              {error}
-            </div>
-          )}
+          {error && <div className="text-[12px] text-status-error bg-status-error/10 rounded p-2">{error}</div>}
         </div>
         <div className="px-4 py-3 border-t border-surface-700/60 flex items-center gap-3">
           <label className="flex items-center gap-1.5 text-[11px] text-text-dim cursor-pointer">

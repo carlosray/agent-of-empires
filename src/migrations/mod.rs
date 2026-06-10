@@ -15,13 +15,19 @@ mod v004_unified_environment;
 mod v005_cockpit_defaults;
 mod v006_unlimited_cockpit_history;
 mod v007_serve_log_to_legacy;
+mod v008_lock_in_default_profile;
+mod v009_update_check_mode;
+mod v010_drop_legacy_live_send_exit_chord;
+mod v011_relocate_sandbox_image;
+mod v012_acp_rename;
+mod v013_strip_profile_theme;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 7;
+const CURRENT_VERSION: u32 = 13;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -53,7 +59,7 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 5,
-        name: "cockpit_defaults",
+        name: "acp_defaults",
         run: v005_cockpit_defaults::run,
     },
     Migration {
@@ -66,7 +72,45 @@ const MIGRATIONS: &[Migration] = &[
         name: "serve_log_to_legacy",
         run: v007_serve_log_to_legacy::run,
     },
+    Migration {
+        version: 8,
+        name: "lock_in_default_profile",
+        run: v008_lock_in_default_profile::run,
+    },
+    Migration {
+        version: 9,
+        name: "update_check_mode",
+        run: v009_update_check_mode::run,
+    },
+    Migration {
+        version: 10,
+        name: "drop_legacy_live_send_exit_chord",
+        run: v010_drop_legacy_live_send_exit_chord::run,
+    },
+    Migration {
+        version: 11,
+        name: "relocate_sandbox_image",
+        run: v011_relocate_sandbox_image::run,
+    },
+    Migration {
+        version: 12,
+        name: "acp_rename",
+        run: v012_acp_rename::run,
+    },
+    Migration {
+        version: 13,
+        name: "strip_profile_theme",
+        run: v013_strip_profile_theme::run,
+    },
 ];
+
+/// The data-schema version this build targets, i.e. the version every install
+/// converges to after a successful startup (migration failures abort boot, so a
+/// running install is always at this version). Surfaced in telemetry as a coarse
+/// version-health signal; see `crate::telemetry`.
+pub fn current_schema_version() -> u32 {
+    CURRENT_VERSION
+}
 
 /// Check whether there are any pending migrations to run.
 pub fn has_pending_migrations() -> bool {
@@ -132,13 +176,16 @@ fn set_version(version: u32) -> Result<()> {
 fn get_all_possible_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
 
+    // Home-dotfile location: the macOS default, the pre-XDG Linux location, and
+    // the only location on Windows.
     if let Some(home) = dirs::home_dir() {
         dirs.push(home.join(crate::session::APP_DIR_NAME_OTHER));
     }
 
-    #[cfg(target_os = "linux")]
-    if let Some(config_dir) = dirs::config_dir() {
-        dirs.push(config_dir.join(crate::session::APP_DIR_NAME_LINUX));
+    // XDG location: always current on Linux, and the opt-in layout on macOS.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Ok(base) = crate::session::xdg_config_base() {
+        dirs.push(base.join(crate::session::APP_DIR_NAME_XDG));
     }
 
     dirs

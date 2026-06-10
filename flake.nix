@@ -58,7 +58,7 @@
 
                 Supports Claude Code, OpenCode, Mistral Vibe, Codex CLI, and Gemini CLI.
               '';
-              homepage = "https://github.com/njbrake/agent-of-empires";
+              homepage = "https://github.com/agent-of-empires/agent-of-empires";
               license = licenses.mit;
               platforms = platforms.unix;
               mainProgram = "aoe";
@@ -75,7 +75,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-0+xtJDNAhujCV1qchCUkK8a+NVxE3pwvtddK8s5Bpuk=";
+            npmDepsHash = "sha256-//Lr+2JNhdD4MI0YMUdnK1GoncV7XJoFsK/o17mJ+Y8=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out
@@ -114,6 +114,14 @@
         {
           packages.default = aoe;
           packages.aoe-with-web = aoeWithWeb;
+          # Just the npm + vite build. Exposed so the PR-CI Nix Build
+          # Web job can validate npmDepsHash + frontend build in ~1-2
+          # min instead of rebuilding the full Rust workspace.
+          packages.aoe-web-frontend = webFrontend;
+          # Exposed so the nix-npm-hash bots and the local manual
+          # update procedure use the same nixpkgs revision as
+          # `buildNpmPackage` above.
+          packages.prefetch-npm-deps = pkgs.prefetch-npm-deps;
 
           checks = {
             # Build the packages as checks too

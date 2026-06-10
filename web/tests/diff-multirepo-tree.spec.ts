@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "./helpers/mockedTest";
+import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 
 // Multi-repo workspaces should let the user fold subfolders inside
@@ -8,56 +9,42 @@ import { clickSidebarSession } from "./helpers/sidebar";
 // isolation.
 
 async function setupMultiRepoSession(page: Page) {
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: [
-        {
-          id: "multi-repo",
-          title: "multi-repo",
-          project_path: "/tmp/multi",
-          group_path: "/tmp",
-          tool: "claude",
-          status: "Running",
-          yolo_mode: false,
-          created_at: new Date().toISOString(),
-          last_accessed_at: null,
-          last_error: null,
-          branch: null,
-          main_repo_path: null,
-          is_sandboxed: false,
-          has_terminal: true,
-          profile: "default",
-          workspace_repos: [
-            { name: "repo-a", source_path: "/tmp/multi/repo-a" },
-            { name: "repo-b", source_path: "/tmp/multi/repo-b" },
-          ],
-        },
-      ],
+      json: {
+        sessions: [
+          {
+            id: "multi-repo",
+            title: "multi-repo",
+            project_path: "/tmp/multi",
+            group_path: "/tmp",
+            tool: "claude",
+            status: "Running",
+            yolo_mode: false,
+            created_at: new Date().toISOString(),
+            last_accessed_at: null,
+            last_error: null,
+            branch: null,
+            main_repo_path: null,
+            is_sandboxed: false,
+            has_terminal: true,
+            profile: "default",
+            workspace_repos: [
+              { name: "repo-a", source_path: "/tmp/multi/repo-a" },
+              { name: "repo-b", source_path: "/tmp/multi/repo-b" },
+            ],
+          },
+        ],
+        workspace_ordering: [],
+      },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, () => {});
   await page.route("**/api/sessions/*/diff/files", (r) =>
@@ -121,15 +108,11 @@ test.describe("Diff multi-repo subfolder folding", () => {
     // Toggle title flips based on the current mode. Match either so the
     // assertion stays robust against the desktop default.
     await expect(
-      page.locator(
-        'button[title="Switch to tree view"], button[title="Switch to flat list"]',
-      ).first(),
+      page.locator('button[title="Switch to tree view"], button[title="Switch to flat list"]').first(),
     ).toBeVisible();
   });
 
-  test("tree mode renders foldable dir rows inside each repo group", async ({
-    page,
-  }) => {
+  test("tree mode renders foldable dir rows inside each repo group", async ({ page }) => {
     await setupMultiRepoSession(page);
     await page.goto("/");
     await clickSidebarSession(page, "multi-repo");

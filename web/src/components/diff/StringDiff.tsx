@@ -1,5 +1,5 @@
 // Embedded inline diff renderer for an `(old_string, new_string)`
-// pair. Used inside the cockpit Edit/Write card; reuses the same
+// pair. Used inside the structured view Edit/Write card; reuses the same
 // `DiffLine` row and `useHighlightedLines` token grid as the branch
 // diff viewer so the two surfaces look the same. See #1073.
 
@@ -19,25 +19,26 @@ interface Props {
 }
 
 export function StringDiff({ oldText, newText, filePath }: Props) {
-  const hunk: RichDiffHunk = useMemo(
-    () => diffPair(oldText, newText).hunk,
-    [oldText, newText],
-  );
+  const hunk: RichDiffHunk = useMemo(() => diffPair(oldText, newText).hunk, [oldText, newText]);
   const hunks = useMemo(() => [hunk], [hunk]);
-  const { tokens, loading } = useHighlightedLines(hunks, filePath);
+  const { tokens } = useHighlightedLines(hunks, filePath);
 
   if (hunk.lines.length === 0) return null;
 
   const lineTokens = tokens?.[0];
 
   return (
-    <div className="leading-[1.6]">
+    // `overflow-x-auto` gives long diff lines a horizontal scroll context.
+    // The embedding `CardChrome` clips with `overflow-hidden` and `DiffLine`
+    // content is `whitespace-pre`, so without this the right side of any line
+    // wider than the card is unreachable on a narrow viewport. Mirrors the
+    // full-size `DiffFileViewer` scroll wrapper. See #1568.
+    <div data-testid="string-diff" className="leading-[1.6] overflow-x-auto">
       {hunk.lines.map((line, i) => (
         <DiffLine
           key={`${line.old_line_num ?? "_"}-${line.new_line_num ?? "_"}-${i}`}
           line={line}
           tokens={lineTokens?.[i]}
-          highlightPending={loading}
           hideLineNumbers
         />
       ))}

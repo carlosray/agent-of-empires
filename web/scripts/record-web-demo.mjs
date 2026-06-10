@@ -28,18 +28,14 @@ const port = Number(args.port ?? 8181);
 const baseUrl = `http://127.0.0.1:${port}`;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(__dirname, "..", "..");
-const outGif =
-  args.out ??
-  join(repoRoot, "docs", "assets", `web-${viewport}.gif`);
+const outGif = args.out ?? join(repoRoot, "docs", "assets", `web-${viewport}.gif`);
 
 const recDir = join(repoRoot, "target", "web-demo-recording");
 rmSync(recDir, { recursive: true, force: true });
 mkdirSync(recDir, { recursive: true });
 
 const isMobile = viewport === "mobile";
-const sizeOpts = isMobile
-  ? devices["iPhone 13"]
-  : { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 };
+const sizeOpts = isMobile ? devices["iPhone 13"] : { viewport: { width: 1280, height: 800 }, deviceScaleFactor: 2 };
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -47,11 +43,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // Pre-start all sessions so the dashboard shows them as Idle, not Error.
   // The background status poller needs a few seconds to pick up the new state.
   const sessions = await fetch(`${baseUrl}/api/sessions`).then((r) => r.json());
-  await Promise.all(
-    sessions.map((s) =>
-      fetch(`${baseUrl}/api/sessions/${s.id}/ensure`, { method: "POST" }),
-    ),
-  );
+  await Promise.all(sessions.map((s) => fetch(`${baseUrl}/api/sessions/${s.id}/ensure`, { method: "POST" })));
   // Wait for opencode to fully boot and the status poller to see Idle.
   // opencode takes ~8s to render its TUI; the poller runs every 2s.
   await sleep(12000);
@@ -61,9 +53,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     ...sizeOpts,
     recordVideo: {
       dir: recDir,
-      size: isMobile
-        ? { width: 390, height: 844 }
-        : { width: 1280, height: 800 },
+      size: isMobile ? { width: 390, height: 844 } : { width: 1280, height: 800 },
     },
   });
   const page = await context.newPage();
@@ -92,11 +82,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const palette = join(recDir, "palette.png");
   const fps = 12;
   const filters = `fps=${fps},scale=${isMobile ? 360 : 960}:-1:flags=lanczos`;
-  spawnSync(
-    "ffmpeg",
-    ["-y", "-i", webmPath, "-vf", `${filters},palettegen`, palette],
-    { stdio: "inherit" },
-  );
+  spawnSync("ffmpeg", ["-y", "-i", webmPath, "-vf", `${filters},palettegen`, palette], { stdio: "inherit" });
   spawnSync(
     "ffmpeg",
     [
@@ -154,9 +140,7 @@ async function runDesktop(page) {
 
   // Brief help overlay so viewers see keyboard shortcuts exist.
   await page.evaluate(() => {
-    document.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "?", bubbles: true }),
-    );
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "?", bubbles: true }));
   });
   await sleep(2500);
   await page.keyboard.press("Escape");
@@ -173,9 +157,7 @@ function sidebarSession(page, label) {
 async function runMobile(page) {
   await sleep(1200);
   // Hamburger → sidebar → tap session.
-  await page
-    .getByRole("button", { name: "Toggle sidebar" })
-    .click();
+  await page.getByRole("button", { name: "Toggle sidebar" }).click();
   await sleep(900);
   await sidebarSession(page, "API Server").click();
   await page.waitForSelector(".xterm", { timeout: 15_000 });
@@ -191,8 +173,11 @@ async function runMobile(page) {
   await sleep(8000);
 
   // Show that scrolling works on mobile.
-  await page.locator(".xterm-viewport").first().evaluate((el) => {
-    el.scrollBy({ top: 200, behavior: "smooth" });
-  });
+  await page
+    .locator(".xterm-viewport")
+    .first()
+    .evaluate((el) => {
+      el.scrollBy({ top: 200, behavior: "smooth" });
+    });
   await sleep(1500);
 }

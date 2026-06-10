@@ -9,35 +9,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-jobs:
-  test:
-    name: Test
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-        with:
-          cache-bin: "false"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Install tmux
-        run: |
-          if [ "$RUNNER_OS" = "Linux" ]; then
-            sudo apt-get update && sudo apt-get install -y tmux
-          else
-            brew install tmux
-          fi
-      - run: cargo test
+permissions:
+  contents: read
 
+jobs:
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
@@ -47,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -55,27 +36,73 @@ jobs:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -- -D warnings
+      - name: file_watch consolidation guard
+        run: |
+          set -euo pipefail
+          hits="$(grep -rl 'notify::recommended_watcher' src/ || true)"
+          unexpected="$(printf '%s\n' "$hits" | grep -v '^src/file_watch.rs$' | grep . || true)"
+          if [ -n "$unexpected" ]; then
+            echo "::error::New notify::recommended_watcher found outside src/file_watch.rs:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+
+  web-fmt:
+    name: Format (web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Check formatting
+        working-directory: web
+        run: npm run format:check
+
+  eslint:
+    name: ESLint (web)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        working-directory: web
+        run: npm ci
+      - name: Run ESLint
+        working-directory: web
+        run: npm run lint
 
   deny:
     name: Supply Chain
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: EmbarkStudios/cargo-deny-action@91bf2b620e09e18d6eb78b92e7861937469acedb # v2.0.17
+      - uses: EmbarkStudios/cargo-deny-action@bb137d7af7e4fb67e5f82a49c4fce4fad40782fe # v2.0.20
 
   docs:
     name: Docs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check CLI docs are up-to-date
         run: |
-          cargo xtask gen-docs
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe docs placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo xtask gen-docs
           git diff --exit-code docs/cli/reference.md \
             || (echo "::error::CLI docs are out of date. Run 'cargo xtask gen-docs' and commit." && exit 1)
 
@@ -84,13 +111,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check skill file references valid CLI commands
         run: cargo xtask check-skill
+
+  build-cache-selftest:
+    name: Build Cache Self-Test
+    runs-on: ubuntu-latest
+    # Guards the zero-copy threshold checker that the kache verify script
+    # relies on (scripts/verify-shared-target.sh). No cargo, no kache, no
+    # toolchain: feeds a known reflinked report and a known all-copies report
+    # through the checker and asserts it accepts the first and rejects the
+    # second. Runs in seconds.
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - run: scripts/verify-shared-target.sh --self-test
 
   nix:
     name: Nix Eval
@@ -148,44 +189,59 @@ jobs:
           echo ""
           echo "=== All evaluations passed ==="
 
-  vitest:
-    name: Vitest
+  nix-build-web:
+    name: Nix Build Web
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Catches npmDepsHash desync at PR time even if the nix-npm-hash bot
+    # is offline. Path-gated so Rust-only PRs keep fast feedback.
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: '22'
-      - name: Install dependencies
-        working-directory: web
-        run: npm ci
-      - name: Run Vitest unit tests
-        working-directory: web
-        run: npm run test:unit
+          fetch-depth: 0
+          persist-credentials: false
 
-  playwright:
-    name: Playwright
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
-        with:
-          node-version: '22'
-      - name: Install dependencies and build
-        working-directory: web
-        run: npm ci && npm run build
-      - name: Install Playwright browsers
-        working-directory: web
-        run: npx playwright install --with-deps chromium
-      - name: Run Playwright tests
-        working-directory: web
-        run: npx playwright test
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: playwright-report
-          path: web/playwright-report/
-          retention-days: 14
+      - name: Detect relevant changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="origin/$BASE_REF"
+          else
+            # `github.event.before` is the SHA before the push, which
+            # covers multi-commit pushes correctly. Falls back to the
+            # empty tree on the initial-push edge case (`before` is all
+            # zeros, no `HEAD~1` exists yet) so the diff still resolves.
+            if [ -z "$EVENT_BEFORE" ] || [ "$EVENT_BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git hash-object -t tree /dev/null)
+            else
+              BASE="$EVENT_BEFORE"
+            fi
+          fi
+          if git diff --name-only "$BASE"...HEAD \
+            | grep -E '^(web/package-lock\.json|flake\.nix|flake\.lock)$' \
+            >/dev/null; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035 # v34
+        if: steps.changes.outputs.relevant == 'true'
+
+      - name: Build aoe-web-frontend
+        if: steps.changes.outputs.relevant == 'true'
+        # Builds only the npm + vite frontend (validates npmDepsHash
+        # as a side effect). Skips the full Rust crate so this job
+        # runs in 1-2 min instead of 20-30 min; Cargo Test + Nix Eval
+        # already cover the Rust side on every PR.
+        run: |
+          set -euo pipefail
+          nix build --no-link .#packages.x86_64-linux.aoe-web-frontend
 
   website:
     name: Website Build

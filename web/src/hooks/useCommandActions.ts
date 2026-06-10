@@ -1,8 +1,6 @@
 import { useMemo } from "react";
 
-const IS_MAC =
-  typeof navigator !== "undefined" &&
-  /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+const IS_MAC = typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 import type { SessionResponse } from "../lib/types";
 import type { CommandAction } from "../components/command-palette/types";
 
@@ -11,7 +9,9 @@ interface Args {
   activeSessionId: string | null;
   loginRequired: boolean;
   hasActiveSession: boolean;
+  readOnly: boolean;
   onNewSession: () => void;
+  onNewScratch: () => void;
   onSelectSession: (sessionId: string) => void;
   onToggleDiff: () => void;
   onOpenSettings: () => void;
@@ -28,7 +28,9 @@ export function useCommandActions({
   activeSessionId,
   loginRequired,
   hasActiveSession,
+  readOnly,
   onNewSession,
+  onNewScratch,
   onSelectSession,
   onToggleDiff,
   onOpenSettings,
@@ -42,14 +44,30 @@ export function useCommandActions({
   return useMemo(() => {
     const actions: CommandAction[] = [];
 
-    actions.push({
-      id: "action:new-session",
-      title: "New session",
-      group: "Actions",
-      keywords: ["create", "start", "agent", "worktree"],
-      shortcut: "n",
-      perform: onNewSession,
-    });
+    // Creation commands are mutation UI. In read-only mode the sidebar and
+    // dashboard already hide their "new session" buttons, so the palette must
+    // omit these too rather than offer a command that opens a wizard the
+    // server 403s on submit. The keyboard-shortcut path stays a guarded no-op
+    // (a key can't be hidden); these visible entries are dropped instead.
+    if (!readOnly) {
+      actions.push({
+        id: "action:new-session",
+        title: "New session",
+        group: "Actions",
+        keywords: ["create", "start", "agent", "worktree"],
+        shortcut: "n",
+        perform: onNewSession,
+      });
+
+      actions.push({
+        id: "action:new-scratch-session",
+        title: "New scratch session",
+        group: "Actions",
+        keywords: ["scratch", "temp", "temporary", "ephemeral", "throwaway", "create"],
+        shortcut: IS_MAC ? "⌘⇧N" : "Ctrl+Shift+N",
+        perform: onNewScratch,
+      });
+    }
 
     actions.push({
       id: "action:go-dashboard",
@@ -145,7 +163,9 @@ export function useCommandActions({
     activeSessionId,
     loginRequired,
     hasActiveSession,
+    readOnly,
     onNewSession,
+    onNewScratch,
     onSelectSession,
     onToggleDiff,
     onOpenSettings,

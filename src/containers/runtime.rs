@@ -69,6 +69,36 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         self.base.image_exists_locally(image)
     }
 
+    fn local_image_digest(&self, image: &str) -> Option<String> {
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                // `RepoDigests` holds `repo@sha256:...` entries for the pulled
+                // manifest. One subprocess, newline-joined so a multi-registry
+                // image still lets us pick the entry matching this reference.
+                let output = self
+                    .base
+                    .command()
+                    .args([
+                        "image",
+                        "inspect",
+                        "--format",
+                        "{{range .RepoDigests}}{{println .}}{{end}}",
+                        image,
+                    ])
+                    .output()
+                    .ok()?;
+                if !output.status.success() {
+                    return None;
+                }
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                super::image_update::pick_repo_digest(image, &stdout)
+            }
+            // Apple Container's `image inspect` doesn't expose a Docker-style
+            // repo digest; skip the staleness check there rather than guess.
+            RuntimeKind::AppleContainer => None,
+        }
+    }
+
     fn pull_image(&self, image: &str) -> Result<()> {
         self.base.pull_image(image)
     }
@@ -282,7 +312,11 @@ mod tests {
         }
     }
 
+    // Pulls `hello-world` from a live registry, so it flakes on a transient
+    // pull failure or network hang in CI. Per the Docker-test convention,
+    // gate it behind `#[ignore]` so it only runs when explicitly requested.
     #[test]
+    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
     fn test_image_exists_locally_with_common_image() {
         for rt in [
             docker_if_available(),
@@ -311,7 +345,10 @@ mod tests {
         }
     }
 
+    // Pulls `hello-world` from a live registry; same flake risk as
+    // `test_image_exists_locally_with_common_image`, so gate it the same way.
     #[test]
+    #[ignore = "pulls hello-world from a live registry; run with --ignored"]
     fn test_ensure_image_uses_local_image() {
         for rt in [
             docker_if_available(),
@@ -358,6 +395,7 @@ mod tests {
         let rt = ContainerRuntime::podman();
         assert!(rt.base.supports_read_only_volumes);
         assert!(rt.base.supports_remove_volumes);
+        assert!(rt.base.supports_named_volumes);
         assert_eq!(rt.base.remove_subcommand, "rm");
         assert_eq!(rt.base.pull_prefix, &["pull"]);
     }

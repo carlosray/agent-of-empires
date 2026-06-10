@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { getSessionDiffFiles } from "../lib/api";
+import { getSessionDiffFiles, reportTelemetrySeen } from "../lib/api";
 import type { RepoBase, RichDiffFile } from "../lib/types";
 
 const POLL_INTERVAL = 10_000;
@@ -17,20 +17,21 @@ interface UseDiffFilesResult {
   refresh: () => void;
 }
 
-export function useDiffFiles(
-  sessionId: string | null,
-  enabled: boolean,
-): UseDiffFilesResult {
+export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
-  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([
-    { base_branch: "main" },
-  ]);
+  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main" }]);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);
   const lastFingerprintRef = useRef("");
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const requestIdRef = useRef(0);
+  // Session the `diff_panel` usage signal last fired for, so opening the panel
+  // reports once per session rather than on every 10s poll tick or re-render.
+  const diffPanelSeenForRef = useRef<string | null>(null);
+  // Mirrors `enabled` so fetchFiles can read the current panel state without
+  // taking it as a dep (which would tear down and re-run the fetch effects).
+  const enabledRef = useRef(enabled);
 
   const fetchFiles = useCallback(async () => {
     if (!sessionId) return;
@@ -48,23 +49,45 @@ export function useDiffFiles(
         setWarning(resp.warning ?? null);
         setRevision((r) => r + 1);
       }
+      // The diff list loaded successfully: report diff_panel once per session.
+      // Gated on enabledRef so a background fetch fired on session change while
+      // the panel is closed does not count, and on the per-session ref so the
+      // 10s poll does not re-fire it.
+      if (enabledRef.current && diffPanelSeenForRef.current !== capturedSessionId) {
+        diffPanelSeenForRef.current = capturedSessionId;
+        reportTelemetrySeen("diff_panel");
+      }
     }
     setLoading(false);
   }, [sessionId]);
 
+  // Keep enabledRef in sync with the latest panel state.
+  useEffect(() => {
+    enabledRef.current = enabled;
+  }, [enabled]);
+
+  // Reset state when sessionId changes (render-time, avoids effect-based setState)
+  const [trackedSessionId, setTrackedSessionId] = useState(sessionId);
+  if (sessionId !== trackedSessionId) {
+    setTrackedSessionId(sessionId);
+    if (sessionId === null) {
+      setFiles([]);
+      setLoading(false);
+      setRevision(0);
+    } else {
+      setLoading(true);
+    }
+  }
+
   // Fetch on session change; invalidate any in-flight requests.
   useEffect(() => {
     requestIdRef.current += 1;
-    if (!sessionId) {
-      setFiles([]);
-      setLoading(false);
-      lastFingerprintRef.current = "";
-      setRevision(0);
-      return;
-    }
-    setLoading(true);
     lastFingerprintRef.current = "";
-    void fetchFiles();
+    if (!sessionId) return;
+    const timer = setTimeout(() => {
+      void fetchFiles();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [sessionId, fetchFiles]);
 
   // Poll when enabled

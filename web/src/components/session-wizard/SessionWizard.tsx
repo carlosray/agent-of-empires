@@ -1,7 +1,21 @@
-import { useCallback, useEffect, useMemo, useReducer } from "react";
-import type { AgentInfo, GroupInfo, ProfileInfo, CreateSessionRequest, SessionResponse } from "../../lib/types";
-import { fetchAgents, fetchGroups, fetchDockerStatus, fetchProfiles, fetchSettings, createSession } from "../../lib/api";
-import { ACP_CAPABLE_TOOLS } from "../../lib/acpCapableTools";
+import { useCallback, useEffect, useMemo, useReducer, useState } from "react";
+import type { CreateSessionRequest, SessionResponse } from "../../lib/types";
+import {
+  fetchAgents,
+  fetchGroups,
+  fetchDockerStatus,
+  fetchProfiles,
+  fetchSettings,
+  createSession,
+  fetchVolumeIgnoresPreview,
+  markVolumeIgnoresGlobsAcknowledged,
+  type VolumeIgnoresGlobPreview,
+  type HooksNeedTrust,
+} from "../../lib/api";
+import { VolumeIgnoresGlobDialog } from "./VolumeIgnoresGlobDialog";
+import { HooksTrustDialog } from "./HooksTrustDialog";
+import { ACP_CAPABLE_TOOLS, isAcpCapable } from "../../lib/acpCapableTools";
+import { safeGetItem, safeSetItem } from "../../lib/safeStorage";
 import { toastBus } from "../../lib/toastBus";
 import { StepIndicator } from "./StepIndicator";
 import type { StepDef, StepId } from "./StepIndicator";
@@ -9,126 +23,44 @@ import { ProjectStep } from "./steps/ProjectStep";
 import { SessionStep } from "./steps/SessionStep";
 import { AgentStep } from "./steps/AgentStep";
 import { ReviewStep } from "./steps/ReviewStep";
-import { applyBranchOverride, getSubmittedBranch, slugifyBranch } from "./sessionNames";
+import { getSubmittedBranch } from "./sessionNames";
+import { initialData, reducer, type WizardData } from "./wizardReducer";
+import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "./commandMaps";
 
-export interface WizardData {
-  path: string;
-  title: string;
-  worktreeBranch: string;
-  worktreeBranchDirty: boolean;
-  useWorktree: boolean;
-  /** When true, attach to an existing branch's worktree (`create_new_branch: false`
-   *  on the API). Mirrors the TUI new-session "Attach to existing branch"
-   *  toggle (`src/tui/dialogs/new_session/render.rs:851`). See #969. */
-  attachExisting: boolean;
-  /** Optional base branch for the new worktree branch. Empty string =
-   *  use the project's default branch. Lives under "Advanced" in the
-   *  session step. See #948. */
-  baseBranch: string;
-  group: string;
-  tool: string;
-  profile: string;
-  yoloMode: boolean;
-  sandboxEnabled: boolean;
-  sandboxImage: string;
-  extraEnv: string[];
-  /** Additional repo paths to include in the multi-repo workspace.
-   *  Free-text paths and registered project paths flow into the same list. */
-  extraRepoPaths: string[];
-  advancedEnabled: boolean;
-  customInstruction: string;
-  extraArgs: string;
-  commandOverride: string;
-  /** Tracks whether the user has manually edited fields after a profile selection */
-  profileDirty: boolean;
-  [key: string]: unknown;
-}
+/** localStorage key persisting the last tool the user picked in the
+ *  wizard. Per-browser, scoped by tool registry key. Validated against
+ *  ACP_CAPABLE_TOOLS on read so an outdated value (or one written by a
+ *  different aoe install with extra agents registered) doesn't crash
+ *  the wizard. See #1133 thread 7 / #1135. */
+const LAST_USED_TOOL_KEY = "aoe-acp-last-tool";
 
-interface WizardState {
-  currentStep: number;
-  data: WizardData;
-  isSubmitting: boolean;
-  error: string | null;
-  agents: AgentInfo[];
-  groups: GroupInfo[];
-  profiles: ProfileInfo[];
-  dockerAvailable: boolean;
-}
-
-type Action =
-  | { type: "SET_FIELD"; field: string; value: unknown }
-  | { type: "SET_STEP"; step: number }
-  | { type: "SUBMIT_START" }
-  | { type: "SUBMIT_ERROR"; error: string }
-  | { type: "SUBMIT_SUCCESS" }
-  | { type: "SET_AGENTS"; agents: AgentInfo[] }
-  | { type: "SET_GROUPS"; groups: GroupInfo[] }
-  | { type: "SET_PROFILES"; profiles: ProfileInfo[] }
-  | { type: "SET_DOCKER"; available: boolean }
-  | { type: "APPLY_PROFILE_DEFAULTS"; yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] };
-
-const initialData: WizardData = {
-  path: "", title: "", worktreeBranch: "", worktreeBranchDirty: false,
-  useWorktree: true, attachExisting: false, baseBranch: "",
-  group: "", tool: "claude", profile: "",
-  yoloMode: false, sandboxEnabled: false, sandboxImage: "", extraEnv: [],
-  extraRepoPaths: [],
-  advancedEnabled: false, profileDirty: false,
-  customInstruction: "", extraArgs: "", commandOverride: "",
-};
-
-function reducer(state: WizardState, action: Action): WizardState {
-  switch (action.type) {
-    case "SET_FIELD": {
-      const newData = { ...state.data, [action.field]: action.value };
-      if (action.field === "title" && !state.data.worktreeBranchDirty) {
-        newData.worktreeBranch = slugifyBranch(String(action.value));
-      }
-      if (action.field === "worktreeBranch") {
-        const override = applyBranchOverride(
-          String(newData.title),
-          String(action.value),
-        );
-        newData.worktreeBranch = override.worktreeBranch;
-        newData.worktreeBranchDirty = override.worktreeBranchDirty;
-      }
-      // Mark as dirty when user manually edits agent-step fields after a profile was chosen
-      if (state.data.profile && ["yoloMode", "sandboxEnabled", "tool", "extraEnv"].includes(action.field)) {
-        newData.profileDirty = true;
-      }
-      return { ...state, data: newData, error: null };
-    }
-    case "SET_STEP":
-      return { ...state, currentStep: action.step };
-    case "SUBMIT_START":
-      return { ...state, isSubmitting: true, error: null };
-    case "SUBMIT_ERROR":
-      return { ...state, isSubmitting: false, error: action.error };
-    case "SUBMIT_SUCCESS":
-      return { ...state, isSubmitting: false };
-    case "SET_AGENTS":
-      return { ...state, agents: action.agents };
-    case "SET_GROUPS":
-      return { ...state, groups: action.groups };
-    case "SET_PROFILES":
-      return { ...state, profiles: action.profiles };
-    case "SET_DOCKER":
-      return { ...state, dockerAvailable: action.available };
-    case "APPLY_PROFILE_DEFAULTS":
-      return {
-        ...state,
-        data: {
-          ...state.data,
-          yoloMode: action.yoloMode,
-          sandboxEnabled: action.sandboxEnabled,
-          tool: action.tool || state.data.tool,
-          extraEnv: action.extraEnv,
-          profileDirty: false,
-        },
-      };
-    default:
-      return state;
+function loadLastUsedTool(): string {
+  const stored = safeGetItem(LAST_USED_TOOL_KEY);
+  if (stored && ACP_CAPABLE_TOOLS.has(stored)) {
+    return stored;
   }
+  return "claude";
+}
+
+function saveLastUsedTool(tool: string): void {
+  if (!ACP_CAPABLE_TOOLS.has(tool)) return;
+  safeSetItem(LAST_USED_TOOL_KEY, tool);
+}
+
+/** Layer the last-used tool over the shared `initialData` template so
+ *  fresh wizard opens default to whatever the user picked last. The
+ *  prefill path overrides this when `prefill.tool` is set. */
+function buildInitialData(): WizardData {
+  return { ...initialData, tool: loadLastUsedTool() };
+}
+
+function acpDefaultsFor(session: Record<string, unknown> | undefined, tool: string): { model: string; effort: string } {
+  const defaults = session?.acp_defaults as Record<string, unknown> | undefined;
+  const entry = defaults?.[tool] as Record<string, unknown> | undefined;
+  return {
+    model: typeof entry?.model === "string" ? entry.model : "",
+    effort: typeof entry?.effort === "string" ? entry.effort : "",
+  };
 }
 
 // Wizard: project path → session (title + worktree) → agent → review
@@ -152,39 +84,78 @@ export interface WizardPrefill {
   skipToReview?: boolean;
   /** Which tab to show initially on the project step */
   initialTab?: "recent" | "browse" | "clone";
+  /** Open the wizard pre-configured for a scratch session: the
+   *  `scratch` flag is on, no path is required, worktree controls are
+   *  hidden. Pairs with `skipToReview` for the Cmd+Shift+N then
+   *  Cmd+Enter fast-create flow. */
+  scratch?: boolean;
 }
 
 interface Props {
   onClose: () => void;
   onCreated: (session?: SessionResponse) => void;
   prefill?: WizardPrefill;
-  /** Live value of the cockpit master switch (`config.cockpit.enabled`).
-   *  When true, ACP-capable tools create cockpit sessions automatically;
-   *  when false, every new session is tmux. */
-  cockpitMasterEnabled: boolean;
 }
 
-export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnabled }: Props) {
+export function SessionWizard({ onClose, onCreated, prefill }: Props) {
+  const baseInitial = buildInitialData();
   const prefillData: WizardData = prefill
     ? {
-        ...initialData,
-        path: prefill.path || "",
-        tool: prefill.tool || "claude",
+        ...baseInitial,
+        path: prefill.scratch ? "" : prefill.path || "",
+        tool: prefill.tool || baseInitial.tool,
         yoloMode: prefill.yoloMode ?? false,
         sandboxEnabled: prefill.sandboxEnabled ?? false,
         profile: prefill.profile || "",
         group: prefill.group || "",
+        scratch: prefill.scratch ?? false,
+        // Scratch mode clears worktree/extra-repos so the submit
+        // payload mirrors what the reducer's SET_FIELD arm would emit
+        // for a user-triggered scratch toggle. See wizardReducer.ts.
+        useWorktree: prefill.scratch ? false : baseInitial.useWorktree,
+        extraRepoPaths: prefill.scratch ? [] : baseInitial.extraRepoPaths,
       }
-    : initialData;
+    : baseInitial;
 
   const [state, dispatch] = useReducer(reducer, {
-    currentStep: prefill?.skipToReview ? 3 : (prefill?.path ? 1 : 0),
-    data: prefillData, isSubmitting: false, error: null,
-    agents: [], groups: [], profiles: [], dockerAvailable: false,
+    // Only `skipToReview` jumps directly to Review. The fast-create
+    // shortcut sets both `scratch: true` and `skipToReview: true`, so
+    // pairing them is still a single keystroke flow; gating on the
+    // scratch flag alone conflicted with WizardPrefill's documented
+    // contract (a wizard opened with `scratch: true` for "open at
+    // ProjectStep with scratch pre-enabled" would have skipped past
+    // the project step entirely).
+    currentStep: prefill?.skipToReview ? 3 : prefill?.path ? 1 : 0,
+    data: prefillData,
+    isSubmitting: false,
+    error: null,
+    agents: [],
+    groups: [],
+    profiles: [],
+    dockerAvailable: false,
   });
 
-  const steps = useMemo(() => computeSteps(state.data),
-    [state.data.sandboxEnabled, state.data.advancedEnabled]);
+  // Profile-resolved override/custom-agent maps for the launch-command
+  // preview. Sourced from the settings the wizard already fetches on open
+  // and on a profile switch, so the preview adds no extra request. See
+  // #1911.
+  const [commandMaps, setCommandMaps] = useState<CommandMaps>(EMPTY_COMMAND_MAPS);
+  // Pending sandbox create paused on the glob volume_ignores confirm modal
+  // (#2045). Holds the matched patterns to explain and the request to replay
+  // once the user proceeds.
+  const [globConfirm, setGlobConfirm] = useState<{
+    globs: VolumeIgnoresGlobPreview[];
+    body: CreateSessionRequest;
+  } | null>(null);
+  // Pending create paused on the hooks-trust confirm modal (#2066). Holds the
+  // commands to show and the request to replay with `trust_hooks: true`.
+  const [hooksTrust, setHooksTrust] = useState<{
+    info: HooksNeedTrust;
+    body: CreateSessionRequest;
+    tool: string;
+  } | null>(null);
+
+  const steps = useMemo(() => computeSteps(state.data), [state.data]);
 
   const currentStepDef = steps[state.currentStep];
   const isFirst = state.currentStep === 0;
@@ -193,66 +164,188 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
   useEffect(() => {
     fetchAgents().then((a) => dispatch({ type: "SET_AGENTS", agents: a }));
     fetchGroups().then((g) => dispatch({ type: "SET_GROUPS", groups: g }));
-    fetchProfiles().then((p) => dispatch({ type: "SET_PROFILES", profiles: p }));
     fetchDockerStatus().then((d) => dispatch({ type: "SET_DOCKER", available: d.available }));
-    fetchSettings().then((s) => {
-      if (s) {
+
+    // Seed the wizard with the resolved (global + active profile) defaults so
+    // single-profile users get yolo_mode_default and friends without ever
+    // touching the profile picker. The picker is hidden when
+    // profiles.length <= 1 (`AgentStep.tsx`), so its onChange-driven
+    // `APPLY_PROFILE_DEFAULTS` path never fires and the wizard would
+    // otherwise fall back to default permissions, ignoring the profile.
+    // See #1142.
+    fetchProfiles().then((p) => {
+      dispatch({ type: "SET_PROFILES", profiles: p });
+      // Prefer an explicit prefill profile; otherwise use the server's active
+      // profile (`is_default: true`). If neither resolves, pass undefined so
+      // `fetchSettings` loads the unresolved global config.
+      const effectiveProfile = prefill?.profile || p.find((x) => x.is_default)?.name || "";
+      fetchSettings(effectiveProfile || undefined).then((s) => {
+        if (!s) return;
+        setCommandMaps(commandMapsFromSettings(s));
         const sandbox = s.sandbox as Record<string, unknown> | undefined;
+        const session = s.session as Record<string, unknown> | undefined;
         const img = (sandbox?.default_image as string) || "";
         if (img) dispatch({ type: "SET_FIELD", field: "sandboxImage", value: img });
-      }
+        const env = Array.isArray(sandbox?.environment)
+          ? (sandbox?.environment as unknown[]).filter((v): v is string => typeof v === "string")
+          : [];
+        const defaultTool = prefill?.tool || (session?.default_tool as string) || "";
+        const acpDefaults = acpDefaultsFor(session, defaultTool || state.data.tool);
+        // Honor explicit prefill values so a caller that sets yoloMode/
+        // sandboxEnabled/tool isn't silently overridden by profile defaults.
+        // Mirrors the per-field guards `AgentStep.handleProfileChange` skips
+        // by going through the user-driven onChange path.
+        dispatch({
+          type: "APPLY_PROFILE_DEFAULTS",
+          yoloMode: prefill?.yoloMode ?? (session?.yolo_mode_default as boolean) ?? false,
+          sandboxEnabled: prefill?.sandboxEnabled ?? (sandbox?.enabled_by_default as boolean) ?? false,
+          tool: defaultTool,
+          extraEnv: env,
+          agentModel: acpDefaults.model,
+          agentEffort: acpDefaults.effort,
+          skipIfDirty: true,
+        });
+      });
     });
+    // prefill is captured at first render; we don't want to re-seed defaults
+    // (and stomp on user edits) if the parent re-renders with a new object
+    // identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleChange = useCallback((field: string, value: unknown) => {
     dispatch({ type: "SET_FIELD", field, value });
   }, []);
 
-  const handleApplyProfileDefaults = useCallback((defaults: { yoloMode: boolean; sandboxEnabled: boolean; tool: string; extraEnv: string[] }) => {
-    dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...defaults });
-  }, []);
+  const handleApplyProfileDefaults = useCallback(
+    (defaults: {
+      yoloMode: boolean;
+      sandboxEnabled: boolean;
+      tool: string;
+      extraEnv: string[];
+      agentModel?: string;
+      agentEffort?: string;
+      commandMaps?: CommandMaps;
+    }) => {
+      const { commandMaps: maps, ...rest } = defaults;
+      if (maps) setCommandMaps(maps);
+      dispatch({ type: "APPLY_PROFILE_DEFAULTS", ...rest });
+    },
+    [],
+  );
 
-  const goNext = () => { if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 }); };
-  const goBack = () => { if (state.currentStep > 0) dispatch({ type: "SET_STEP", step: state.currentStep - 1 }); };
-  const jumpTo = (stepId: StepId) => { const idx = steps.findIndex((s) => s.id === stepId); if (idx >= 0) dispatch({ type: "SET_STEP", step: idx }); };
+  const goNext = () => {
+    if (state.currentStep < steps.length - 1) dispatch({ type: "SET_STEP", step: state.currentStep + 1 });
+  };
+  const goBack = () => {
+    if (state.currentStep > 0) dispatch({ type: "SET_STEP", step: state.currentStep - 1 });
+  };
+  const jumpTo = (stepId: StepId) => {
+    const idx = steps.findIndex((s) => s.id === stepId);
+    if (idx >= 0) dispatch({ type: "SET_STEP", step: idx });
+  };
 
   const handleSubmit = async () => {
     dispatch({ type: "SUBMIT_START" });
     const d = state.data;
+    const selectedAgentAcpCapable = isAcpCapable(d.tool, state.agents.find((a) => a.name === d.tool)?.acp_capable);
+    // Scratch sessions: server provisions the working directory and
+    // ignores `path`. Force-omit every worktree-related field so a
+    // stale reducer state cannot make the server return 400 on the
+    // `scratch + worktree_branch` mutex.
     const body: CreateSessionRequest = {
-      path: d.path, tool: d.tool,
-      title: d.title || undefined, group: d.group || undefined,
+      path: d.scratch ? "" : d.path,
+      tool: d.tool,
+      title: d.title || undefined,
+      group: d.group || undefined,
       yolo_mode: d.yoloMode,
-      worktree_branch: d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
-      create_new_branch: d.useWorktree && !d.attachExisting,
+      worktree_branch: !d.scratch && d.useWorktree ? getSubmittedBranch(d.title, d.worktreeBranch) : undefined,
+      create_new_branch: !d.scratch && d.useWorktree && !d.attachExisting,
       base_branch:
-        d.useWorktree && !d.attachExisting && d.baseBranch.trim()
-          ? d.baseBranch.trim()
-          : undefined,
+        !d.scratch && d.useWorktree && !d.attachExisting && d.baseBranch.trim() ? d.baseBranch.trim() : undefined,
       sandbox: d.sandboxEnabled,
       sandbox_image: d.sandboxEnabled ? d.sandboxImage : undefined,
       extra_env: d.sandboxEnabled && d.extraEnv.length > 0 ? d.extraEnv.filter(Boolean) : undefined,
-      extra_repo_paths: d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
+      extra_repo_paths: !d.scratch && d.extraRepoPaths.length > 0 ? d.extraRepoPaths : undefined,
       extra_args: d.extraArgs || undefined,
       command_override: d.commandOverride || undefined,
       custom_instruction: d.customInstruction || undefined,
       profile: d.profile || undefined,
-      // Cockpit is auto-on for ACP-capable tools when the master
-      // switch is on; non-ACP tools and a disabled master switch
-      // both fall back to tmux. The server re-applies the master
-      // switch (see src/server/api/sessions.rs), so a tampered
-      // client request can't escalate cockpit on.
-      cockpit_mode: cockpitMasterEnabled && ACP_CAPABLE_TOOLS.has(d.tool),
+      // Structured view runs when the agent is ACP-capable and the user
+      // kept the per-session toggle on (default). Capability comes from
+      // the server's per-agent
+      // `acp_capable` flag (including custom agents with an
+      // `agent_acp_cmd`) with hardcoded fallback while loading. The
+      // server re-resolves capability (see src/server/api/sessions.rs),
+      // so a tampered request can't escalate structured view on for a
+      // non-capable agent.
+      view: selectedAgentAcpCapable && d.useStructuredView ? "structured" : "terminal",
+      agent_model: selectedAgentAcpCapable && d.useStructuredView && d.agentModel ? d.agentModel : undefined,
+      agent_effort: selectedAgentAcpCapable && d.useStructuredView && d.agentEffort ? d.agentEffort : undefined,
+      scratch: d.scratch || undefined,
     };
+
+    // Sandbox sessions whose resolved config has glob volume_ignores get a
+    // one-time snapshot-expansion confirmation before we create (#2045). Skip
+    // for scratch (no project path to expand against) and treat any preview
+    // failure as "nothing to confirm" so it never blocks creation.
+    if (d.sandboxEnabled && !d.scratch && d.path) {
+      const preview = await fetchVolumeIgnoresPreview(d.path, d.profile || undefined);
+      if (preview && !preview.acknowledged && preview.globs.length > 0) {
+        setGlobConfirm({ globs: preview.globs, body });
+        return;
+      }
+    }
+
+    await runCreate(body, d.tool);
+  };
+
+  const runCreate = async (body: CreateSessionRequest, tool: string) => {
     const result = await createSession(body);
     if (result.ok) {
       dispatch({ type: "SUBMIT_SUCCESS" });
+      saveLastUsedTool(tool);
       const warnings = result.session?.warnings;
       if (warnings && warnings.length > 0) {
         for (const w of warnings) toastBus.handler?.error(w);
       }
       onCreated(result.session);
-    } else dispatch({ type: "SUBMIT_ERROR", error: result.error || "Unknown error" });
+    } else if (result.hooksNeedTrust && !body.trust_hooks) {
+      // The repo's hooks need approval (#2066). Pause and show the trust
+      // dialog; on confirm we replay with `trust_hooks: true`. The
+      // `!body.trust_hooks` guard avoids looping if the server still refuses
+      // after we already opted in.
+      setHooksTrust({ info: result.hooksNeedTrust, body, tool });
+    } else
+      dispatch({
+        type: "SUBMIT_ERROR",
+        error: result.error || "Unknown error",
+      });
+  };
+
+  const handleGlobConfirm = async (dontShowAgain: boolean) => {
+    const pending = globConfirm;
+    if (!pending) return;
+    if (dontShowAgain) await markVolumeIgnoresGlobsAcknowledged();
+    setGlobConfirm(null);
+    await runCreate(pending.body, state.data.tool);
+  };
+
+  const handleGlobCancel = () => {
+    setGlobConfirm(null);
+    dispatch({ type: "SUBMIT_CANCEL" });
+  };
+
+  const handleHooksTrustConfirm = async () => {
+    const pending = hooksTrust;
+    if (!pending) return;
+    setHooksTrust(null);
+    await runCreate({ ...pending.body, trust_hooks: true }, pending.tool);
+  };
+
+  const handleHooksTrustCancel = () => {
+    setHooksTrust(null);
+    dispatch({ type: "SUBMIT_CANCEL" });
   };
 
   useEffect(() => {
@@ -274,17 +367,32 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
             profiles={state.profiles}
             dockerAvailable={state.dockerAvailable}
             onApplyProfileDefaults={handleApplyProfileDefaults}
-            cockpitMasterEnabled={cockpitMasterEnabled}
+            commandMaps={commandMaps}
           />
         );
       case "review":
-        return <ReviewStep data={state.data} onChange={handleChange} isSubmitting={state.isSubmitting} error={state.error} onSubmit={handleSubmit} onJumpTo={jumpTo} steps={steps} />;
+        return (
+          <ReviewStep
+            data={state.data}
+            onChange={handleChange}
+            agents={state.agents}
+            isSubmitting={state.isSubmitting}
+            error={state.error}
+            onSubmit={handleSubmit}
+            onJumpTo={jumpTo}
+            steps={steps}
+            commandMaps={commandMaps}
+          />
+        );
       default:
         return null;
     }
   };
 
-  const nextDisabled = currentStepDef?.id === "project" && !state.data.path;
+  // Scratch selection satisfies the project-step "need a project" gate
+  // without a path: the server provisions the working directory on
+  // submit. Otherwise require a path as before.
+  const nextDisabled = currentStepDef?.id === "project" && !state.data.scratch && !state.data.path;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
@@ -292,7 +400,13 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
       <div className="relative w-full max-w-lg bg-surface-800 border border-surface-700/30 rounded-xl flex flex-col max-h-[min(720px,90vh)]">
         <div className="flex items-center justify-between px-5 py-4 border-b border-surface-700/20">
           <h1 className="text-sm font-medium text-text-secondary">New session</h1>
-          <button onClick={onClose} className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors" aria-label="Close">&times;</button>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 flex items-center justify-center text-text-dim hover:text-text-secondary cursor-pointer rounded-md hover:bg-surface-700/50 transition-colors"
+            aria-label="Close"
+          >
+            &times;
+          </button>
         </div>
         <div className="flex-1 overflow-y-auto px-5 py-5">
           <StepIndicator steps={steps} currentIndex={state.currentStep} />
@@ -300,21 +414,39 @@ export function SessionWizard({ onClose, onCreated, prefill, cockpitMasterEnable
         </div>
         {!isLast && (
           <div className="flex justify-between px-5 py-4 border-t border-surface-700/20">
-            <button onClick={isFirst ? onClose : goBack}
-              className="px-5 py-2.5 text-sm rounded-lg border border-surface-700 text-text-secondary hover:bg-surface-800 active:bg-surface-700 cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600">
+            <button
+              onClick={isFirst ? onClose : goBack}
+              className="px-5 py-2.5 text-sm rounded-lg border border-surface-700 text-text-secondary hover:bg-surface-800 active:bg-surface-700 cursor-pointer transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600"
+            >
               {isFirst ? "Cancel" : "Back"}
             </button>
-            <button onClick={goNext} disabled={nextDisabled}
+            <button
+              onClick={goNext}
+              disabled={nextDisabled}
               className={`px-5 py-2.5 text-sm rounded-lg font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 ${
                 nextDisabled
                   ? "bg-brand-600/50 text-surface-900/50 cursor-not-allowed"
                   : "bg-brand-600 hover:bg-brand-700 active:bg-brand-800 text-surface-900 cursor-pointer"
-              }`}>
+              }`}
+            >
               Next
             </button>
           </div>
         )}
       </div>
+      {globConfirm && (
+        <VolumeIgnoresGlobDialog globs={globConfirm.globs} onConfirm={handleGlobConfirm} onCancel={handleGlobCancel} />
+      )}
+      {hooksTrust && (
+        <HooksTrustDialog
+          onCreate={hooksTrust.info.onCreate}
+          onLaunch={hooksTrust.info.onLaunch}
+          onDestroy={hooksTrust.info.onDestroy}
+          needsMcpTrust={hooksTrust.info.needsMcpTrust}
+          onConfirm={handleHooksTrustConfirm}
+          onCancel={handleHooksTrustCancel}
+        />
+      )}
     </div>
   );
 }

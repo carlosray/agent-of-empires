@@ -29,10 +29,7 @@ interface InternalDir {
   fileCount: number;
 }
 
-function getOrCreateDir(
-  root: InternalDir,
-  segments: string[],
-): InternalDir {
+function getOrCreateDir(root: InternalDir, segments: string[]): InternalDir {
   let current = root;
   for (let i = 0; i < segments.length; i++) {
     const seg = segments[i]!;
@@ -77,7 +74,11 @@ function buildInternalTree(files: RichDiffFile[]): InternalDir {
   }
 
   // Propagate aggregated stats
-  function propagate(dir: InternalDir): { additions: number; deletions: number; fileCount: number } {
+  function propagate(dir: InternalDir): {
+    additions: number;
+    deletions: number;
+    fileCount: number;
+  } {
     let additions = 0;
     let deletions = 0;
     let fileCount = dir.files.length;
@@ -102,18 +103,13 @@ function buildInternalTree(files: RichDiffFile[]): InternalDir {
 }
 
 /** Flatten the tree into a list of visible nodes, respecting collapsed state. */
-export function buildDiffTree(
-  files: RichDiffFile[],
-  collapsedDirs: Set<string>,
-): DiffTreeNode[] {
+export function buildDiffTree(files: RichDiffFile[], collapsedDirs: Set<string>): DiffTreeNode[] {
   const root = buildInternalTree(files);
   const result: DiffTreeNode[] = [];
 
   function walk(dir: InternalDir, depth: number, isRoot: boolean) {
     // Sort: directories first (alphabetical), then files (alphabetical)
-    const sortedDirs = [...dir.children.values()].sort((a, b) =>
-      a.name.localeCompare(b.name),
-    );
+    const sortedDirs = [...dir.children.values()].sort((a, b) => a.name.localeCompare(b.name));
     const sortedFiles = [...dir.files].sort((a, b) => {
       const aName = a.path.split("/").pop()!;
       const bName = b.path.split("/").pop()!;

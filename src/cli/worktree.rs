@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Result};
 use clap::Subcommand;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::git::GitWorktree;
@@ -27,6 +28,7 @@ pub enum WorktreeCommands {
     },
 }
 
+#[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: WorktreeCommands) -> Result<()> {
     match command {
         WorktreeCommands::List => list_worktrees().await,
@@ -77,7 +79,7 @@ async fn list_worktrees() -> Result<()> {
 }
 
 async fn show_info(profile: &str, identifier: &str) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (instances, _) = storage.load_with_groups()?;
 
     let session = super::resolve_session(identifier, &instances)?;
@@ -152,8 +154,8 @@ async fn show_info(profile: &str, identifier: &str) -> Result<()> {
 }
 
 async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
-    let storage = Storage::new(profile)?;
-    let (instances, groups) = storage.load_with_groups()?;
+    let storage = Storage::new_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
 
     let mut orphaned_sessions = Vec::new();
     let mut orphaned_worktrees = Vec::new();
@@ -258,11 +260,11 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
 
     // Remove orphaned sessions
     if !orphaned_sessions.is_empty() {
-        let mut new_instances = instances.clone();
-        new_instances.retain(|inst| !orphaned_sessions.iter().any(|orphan| orphan.id == inst.id));
-
-        let group_tree = crate::session::GroupTree::new_with_groups(&new_instances, &groups);
-        storage.save_with_groups(&new_instances, &group_tree)?;
+        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
+        storage.update(|all_instances, _groups| {
+            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
+            Ok(())
+        })?;
 
         removed_count += orphaned_sessions.len();
         println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());

@@ -14,7 +14,7 @@ Run the install script:
 
 ```bash
 curl -fsSL \
-  https://raw.githubusercontent.com/njbrake/agent-of-empires/main/scripts/install.sh \
+  https://raw.githubusercontent.com/agent-of-empires/agent-of-empires/main/scripts/install.sh \
   | bash
 ```
 
@@ -27,7 +27,7 @@ brew install aoe
 ### Build from Source
 
 ```bash
-git clone https://github.com/njbrake/agent-of-empires
+git clone https://github.com/agent-of-empires/agent-of-empires
 cd agent-of-empires
 cargo build --release
 ```
@@ -58,12 +58,12 @@ The `aoe update` command detects how aoe was installed (Homebrew, the curl insta
 
 Inside the TUI, press `u` when the update bar is visible to run the same flow without leaving the app. Press `Ctrl+x` to dismiss the bar for the current session.
 
-## Uninstall
+If you installed shell completions as a static file, regenerate it after an update so it picks up new commands and flags. See [Shell Completions](guides/shell-completions.md) for both the static and the always-fresh eval-on-startup setup.
 
-To remove Agent of Empires:
+## Uninstall
 
 ```bash
 aoe uninstall
 ```
 
-This will guide you through removing the binary, configuration, and tmux settings.
+Prompts to remove the binary, configuration (the app data dir), and tmux settings.

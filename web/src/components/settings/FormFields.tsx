@@ -17,6 +17,8 @@ export function CollapsibleSection({
   return (
     <div className="border border-surface-700/40 rounded-lg overflow-hidden">
       <button
+        type="button"
+        aria-expanded={open}
         onClick={() => setOpen(!open)}
         className="flex items-center justify-between w-full px-4 py-3 bg-surface-850 hover:bg-surface-800 cursor-pointer transition-colors text-left"
       >
@@ -33,27 +35,15 @@ export function CollapsibleSection({
             <path d="M4.5 2l4.5 4-4.5 4" />
           </svg>
           <div>
-            <span className="text-sm font-medium text-text-primary">
-              {title}
-            </span>
-            {subtitle && (
-              <div className="text-[11px] text-text-dim mt-0.5">
-                {subtitle}
-              </div>
-            )}
+            <span className="text-sm font-medium text-text-primary">{title}</span>
+            {subtitle && <div className="text-[11px] text-text-dim mt-0.5">{subtitle}</div>}
           </div>
           {badge && (
-            <span className="text-[10px] font-mono text-text-dim bg-surface-700 px-1.5 py-0.5 rounded">
-              {badge}
-            </span>
+            <span className="text-[10px] font-mono text-text-dim bg-surface-700 px-1.5 py-0.5 rounded">{badge}</span>
           )}
         </div>
       </button>
-      {open && (
-        <div className="px-4 py-4 space-y-4 border-t border-surface-700/20">
-          {children}
-        </div>
-      )}
+      {open && <div className="px-4 py-4 space-y-4 border-t border-surface-700/20">{children}</div>}
     </div>
   );
 }
@@ -73,9 +63,7 @@ export function ToggleField({
     <div className="flex items-center justify-between gap-3">
       <div>
         <div className="text-sm text-text-primary">{label}</div>
-        {description && (
-          <div className="text-xs text-text-dim mt-0.5">{description}</div>
-        )}
+        {description && <div className="text-xs text-text-dim mt-0.5">{description}</div>}
       </div>
       <button
         type="button"
@@ -124,16 +112,19 @@ export function TextField({
   return (
     <div>
       <label className="block text-sm text-text-bright mb-1">{label}</label>
-      {description && (
-        <div className="text-xs text-text-dim mb-1">{description}</div>
-      )}
+      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
       {multiline ? (
         <textarea
           value={local}
           onChange={(e) => setLocal(e.target.value)}
           onFocus={() => setFocused(true)}
           onBlur={commit}
-          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); commit(); } }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              commit();
+            }
+          }}
           placeholder={placeholder}
           rows={3}
           className={cls + " resize-y"}
@@ -145,7 +136,9 @@ export function TextField({
           onChange={(e) => setLocal(e.target.value)}
           onFocus={() => setFocused(true)}
           onBlur={commit}
-          onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+          }}
           placeholder={placeholder}
           className={cls}
         />
@@ -174,18 +167,8 @@ export function SelectField({
 }) {
   return (
     <div>
-      {label && (
-        <label
-          className={
-            labelClassName ?? "block text-sm text-text-bright mb-1"
-          }
-        >
-          {label}
-        </label>
-      )}
-      {description && (
-        <div className="text-xs text-text-dim mb-1">{description}</div>
-      )}
+      {label && <label className={labelClassName ?? "block text-sm text-text-bright mb-1"}>{label}</label>}
+      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -230,16 +213,16 @@ export function NumberField({
   return (
     <div>
       <label className="block text-sm text-text-bright mb-1">{label}</label>
-      {description && (
-        <div className="text-xs text-text-dim mb-1">{description}</div>
-      )}
+      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
       <input
         type="number"
         value={local}
         onChange={(e) => setLocal(e.target.value)}
         onFocus={() => setFocused(true)}
         onBlur={commit}
-        onKeyDown={(e) => { if (e.key === "Enter") commit(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
         min={min}
         max={max}
         className="w-full bg-surface-900 border border-surface-700 rounded-md px-3 py-2 text-sm text-text-primary focus:border-brand-600 focus:outline-none"
@@ -271,13 +254,9 @@ export function SliderField({
     <div>
       <div className="flex items-center justify-between mb-1">
         <label className="text-sm text-text-bright">{label}</label>
-        <span className="text-sm font-mono text-text-primary">
-          {formatValue ? formatValue(value) : value}
-        </span>
+        <span className="text-sm font-mono text-text-primary">{formatValue ? formatValue(value) : value}</span>
       </div>
-      {description && (
-        <div className="text-xs text-text-dim mb-1">{description}</div>
-      )}
+      {description && <div className="text-xs text-text-dim mb-1">{description}</div>}
       <input
         type="range"
         min={min}
@@ -343,33 +322,18 @@ export function ListField({
           </button>
         )}
       </div>
-      {description && (
-        <div className="text-xs text-text-dim mb-2">{description}</div>
-      )}
-      {items.length === 0 && !adding && (
-        <div className="text-xs text-text-dim italic py-2">
-          No items configured
-        </div>
-      )}
+      {description && <div className="text-xs text-text-dim mb-2">{description}</div>}
+      {items.length === 0 && !adding && <div className="text-xs text-text-dim italic py-2">No items configured</div>}
       <div className="space-y-1 max-h-[320px] overflow-y-auto">
         {items.map((item, i) => (
-          <div
-            key={i}
-            className="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-900 rounded group"
-          >
-            <span className="text-sm font-mono text-text-primary truncate">
-              {item}
-            </span>
+          <div key={i} className="flex items-center justify-between gap-2 px-2 py-1.5 bg-surface-900 rounded group">
+            <span className="text-sm font-mono text-text-primary truncate">{item}</span>
             <button
               onClick={() => remove(i)}
               className="text-text-dim hover:text-red-400 opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer shrink-0"
               title="Remove"
             >
-              <svg
-                className="w-3.5 h-3.5"
-                viewBox="0 0 16 16"
-                fill="currentColor"
-              >
+              <svg className="w-3.5 h-3.5" viewBox="0 0 16 16" fill="currentColor">
                 <path d="M5.5 5.5A.5.5 0 0 1 6 6v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m2.5 0a.5.5 0 0 1 .5.5v6a.5.5 0 0 1-1 0V6a.5.5 0 0 1 .5-.5m3 .5a.5.5 0 0 0-1 0v6a.5.5 0 0 0 1 0z" />
                 <path d="M14.5 3a1 1 0 0 1-1 1H13v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V4h-.5a1 1 0 0 1 0-2H6a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1h3.5a1 1 0 0 1 1 1M4.118 4 4 4.059V13a1 1 0 0 0 1 1h6a1 1 0 0 0 1-1V4.059L11.882 4z" />
               </svg>
@@ -416,9 +380,7 @@ export function ListField({
               Cancel
             </button>
           </div>
-          {error && (
-            <div className="text-xs text-red-400 mt-1">{error}</div>
-          )}
+          {error && <div className="text-xs text-red-400 mt-1">{error}</div>}
         </div>
       )}
     </div>

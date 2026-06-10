@@ -2,6 +2,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::containers::{self, ContainerRuntimeInterface};
@@ -11,13 +12,19 @@ use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
 
 #[derive(Args)]
 pub struct AddArgs {
-    /// Project directory (defaults to current directory)
-    #[arg(default_value = ".")]
-    path: PathBuf,
+    /// Project directory (defaults to current directory). Omit when
+    /// using `--scratch`.
+    path: Option<PathBuf>,
 
     /// Session title (defaults to folder name)
     #[arg(short = 't', long)]
     title: Option<String>,
+
+    /// Prompt for the session name, mirroring the TUI `n` flow. Shows the
+    /// generated default; press Enter to accept it. Ignored when --title
+    /// is given. Requires an interactive terminal.
+    #[arg(short = 'i', long)]
+    interactive: bool,
 
     /// Group path (defaults to parent folder)
     #[arg(short = 'g', long)]
@@ -26,6 +33,10 @@ pub struct AddArgs {
     /// Command to run (e.g., 'claude' or any other supported agent)
     #[arg(short = 'c', long = "cmd")]
     command: Option<String>,
+
+    /// Named built-in or configured custom agent to run
+    #[arg(long = "tool", conflicts_with = "command")]
+    tool: Option<String>,
 
     /// Parent session (creates sub-session, inherits group)
     #[arg(short = 'P', long)]
@@ -78,32 +89,30 @@ pub struct AddArgs {
     #[arg(short = 'y', long)]
     yolo: bool,
 
-    /// Automatically trust repository hooks without prompting
+    /// Automatically trust this repository's hooks and project-local MCP
+    /// servers without prompting
     #[arg(long = "trust-hooks")]
     trust_hooks: bool,
 
     /// Extra arguments to append after the agent binary
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     extra_args: Option<String>,
 
     /// Override the agent binary command
     #[arg(long)]
     cmd_override: Option<String>,
 
-    /// Use cockpit mode (ACP-based native rendering) for this session.
-    /// Overrides the default-for-claude setting in cockpit config.
+    /// Render this session in the structured view (ACP-based native
+    /// rendering) instead of the default terminal view. `aoe add` defaults
+    /// to the terminal (raw tmux/PTY) so the CLI matches the TUI; pass this
+    /// (or `--agent`) to opt into the structured rendering. Ignored for
+    /// tools with no ACP adapter.
     #[cfg(feature = "serve")]
-    #[arg(long, conflicts_with = "no_cockpit")]
-    cockpit: bool,
+    #[arg(long = "structured-view")]
+    structured_view: bool,
 
-    /// Force terminal/PTY mode for this session, overriding the
-    /// default-for-claude cockpit setting.
-    #[cfg(feature = "serve")]
-    #[arg(long = "no-cockpit", conflicts_with = "cockpit")]
-    no_cockpit: bool,
-
-    /// Pick a specific cockpit agent (e.g., aoe-agent, claude-code).
-    /// Implies --cockpit.
+    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
+    /// claude-code).
     #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
@@ -113,21 +122,62 @@ pub struct AddArgs {
     #[cfg(feature = "serve")]
     #[arg(long = "model")]
     model: Option<String>,
+
+    /// Create the session in a fresh scratch directory under
+    /// `<app_dir>/scratch/<id>/` instead of a project path. The directory is
+    /// removed when the session is deleted (unless `aoe rm` is given
+    /// `--keep-scratch`). Mutually exclusive with worktree-related flags.
+    #[arg(
+        long = "scratch",
+        conflicts_with_all = [
+            "worktree_branch",
+            "create_branch",
+            "base_branch",
+            "extra_repos",
+            "projects",
+            "no_submodules",
+        ]
+    )]
+    scratch: bool,
 }
 
+#[tracing::instrument(target = "cli.add", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
-    let mut path = if args.path.as_os_str() == "." {
-        std::env::current_dir()?
+    // Fail fast before any filesystem side effects: --interactive must
+    // have a real terminal to read the name from, otherwise the prompt
+    // would block on EOF or a PTY harness would hang.
+    if args.interactive && !std::io::stdin().is_terminal() {
+        bail!("--interactive requires a terminal; pass --title for non-interactive naming");
+    }
+
+    // Scratch sessions have no project path; the scratch directory is
+    // provisioned below once we know the instance id. Reject an
+    // explicitly-passed path loudly so `aoe add /some/repo --scratch` does
+    // not silently drop the path arg.
+    if args.scratch && args.path.is_some() {
+        bail!(
+            "Cannot specify a project path with --scratch\nTip: drop the path argument, the session runs in a fresh scratch directory"
+        );
+    }
+
+    let mut path = if args.scratch {
+        // Placeholder; the real path is set after `Instance::new` runs and
+        // `scratch::provision_scratch_dir` returns a fresh scratch dir.
+        PathBuf::new()
     } else {
-        if !args.path.exists() {
-            bail!("Path does not exist: {}", args.path.display());
+        let raw = args.path.clone().unwrap_or_else(|| PathBuf::from("."));
+        if raw.as_os_str() == "." {
+            std::env::current_dir()?
+        } else {
+            if !raw.exists() {
+                bail!("Path does not exist: {}", raw.display());
+            }
+            raw.canonicalize()
+                .with_context(|| format!("Failed to resolve path: {}", raw.display()))?
         }
-        args.path
-            .canonicalize()
-            .with_context(|| format!("Failed to resolve path: {}", args.path.display()))?
     };
 
-    if !path.is_dir() {
+    if !args.scratch && !path.is_dir() {
         bail!("Path is not a directory: {}", path.display());
     }
 
@@ -148,7 +198,17 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     all_extra_repos.extend(args.extra_repos.iter().cloned());
     all_extra_repos.extend(resolved_project_paths);
 
-    let config = repo_config::resolve_config_with_repo_or_warn(profile, &path);
+    // Scratch sessions have no project repo, so repo-scoped config
+    // overrides have nothing to anchor on. Resolving the repo-aware
+    // variant against the launch directory would silently pick up
+    // `.agent-of-empires/config.toml` from whatever folder the user
+    // happened to run `aoe add --scratch` in, which breaks the
+    // project-less contract. Fall back to the profile-only resolver.
+    let config = if args.scratch {
+        crate::session::profile_config::resolve_config_or_warn(profile)
+    } else {
+        repo_config::resolve_config_with_repo_or_warn(profile, &path)
+    };
 
     // Preserve the original project path for hook trust checking.
     // `path` gets reassigned to the worktree/workspace directory below,
@@ -157,6 +217,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
     let mut worktree_info_opt = None;
     let mut workspace_info_opt = None;
+
+    // Phase 1 (unlocked): pre-flight read of the current persisted state to
+    // resolve `--parent`, generate a non-colliding title, and make best-effort
+    // duplicate / parent decisions before any side effects. Final duplicate
+    // enforcement happens under the flock in phase 3.
+    //
+    // The title is resolved here, before worktree creation, so a tied worktree
+    // session (`session.tie_workdir_to_name`) can seed its directory leaf from
+    // the title and start out aligned (#1927). The path-dependent duplicate
+    // check still runs later, once `path` points at the worktree.
+    let storage = Storage::new_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let final_title = resolve_session_title(&args, &instances)?;
 
     if let Some(branch_raw) = &args.worktree_branch {
         use crate::git::GitWorktree;
@@ -167,12 +240,37 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let init_submodules = config.worktree.init_submodules && !args.no_submodules;
 
         if !all_extra_repos.is_empty() {
+            let session_base = args.base_branch.as_deref();
+            let global_default = config.worktree.default_base_branch.as_deref();
+            let project_bases = builder::project_base_branches(profile);
+            let resolve_extra = |path: &std::path::Path| {
+                let project = project_bases
+                    .get(&crate::session::projects::canonical_key(
+                        &path.to_string_lossy(),
+                    ))
+                    .map(String::as_str);
+                builder::resolve_base_branch(session_base, project, global_default)
+            };
+
+            // The launch repo never consults the per-project layer: explicit
+            // session base, then the global/profile default.
+            let primary = builder::WorkspaceRepoSpec {
+                base_branch: builder::resolve_base_branch(session_base, None, global_default),
+                path: path.clone(),
+            };
+            let extra_repos: Vec<builder::WorkspaceRepoSpec> = all_extra_repos
+                .iter()
+                .map(|p| builder::WorkspaceRepoSpec {
+                    base_branch: resolve_extra(p),
+                    path: p.clone(),
+                })
+                .collect();
+
             let ws_result = builder::create_workspace(
-                &path,
-                &all_extra_repos,
+                &primary,
+                &extra_repos,
                 branch,
                 args.create_branch,
-                args.base_branch.as_deref(),
                 &config.worktree.workspace_path_template,
                 init_submodules,
             )?;
@@ -240,7 +338,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 } else {
                     &config.worktree.path_template
                 };
-                let worktree_path = git_wt.compute_path(branch, template, session_id_short)?;
+                // Tied sessions name the directory after the title, not the
+                // branch, so the two cannot drift. The branch still creates the
+                // worktree below; only the path leaf changes. (#1927)
+                let leaf_seed_owned;
+                let leaf_seed = if config.session.tie_workdir_to_name {
+                    leaf_seed_owned =
+                        crate::session::worktree_edit::worktree_leaf_from_title(&final_title);
+                    leaf_seed_owned.as_str()
+                } else {
+                    branch
+                };
+                let worktree_path = git_wt.compute_path(leaf_seed, template, session_id_short)?;
 
                 if worktree_path.exists() {
                     bail!(
@@ -251,13 +360,23 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 println!("Creating worktree at: {}", worktree_path.display());
+                // Single-repo sessions only have the launch repo, so fall back
+                // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
-                    args.base_branch.as_deref()
+                    builder::resolve_base_branch(
+                        args.base_branch.as_deref(),
+                        None,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
                 } else {
                     None
                 };
-                let warnings =
-                    git_wt.create_worktree(branch, &worktree_path, args.create_branch, base)?;
+                let warnings = git_wt.create_worktree(
+                    branch,
+                    &worktree_path,
+                    args.create_branch,
+                    base.as_deref(),
+                )?;
 
                 path = worktree_path;
 
@@ -266,7 +385,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     main_repo_path: main_repo_path.to_string_lossy().to_string(),
                     managed_by_aoe: true,
                     created_at: Utc::now(),
-                    base_branch: base.map(|s| s.to_string()),
+                    base_branch: base,
                 });
 
                 for w in &warnings {
@@ -277,9 +396,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             }
         }
     }
-
-    let storage = Storage::new(profile)?;
-    let (mut instances, groups) = storage.load_with_groups()?;
 
     // Resolve parent session if specified
     let mut group_path = args.group.clone();
@@ -294,34 +410,36 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         None
     };
 
-    // Generate title: use provided title, or branch name for worktree sessions, or random civ
-    let final_title = if let Some(title) = &args.title {
-        let trimmed_title = title.trim();
-        if is_duplicate_session(&instances, trimmed_title, path.to_str().unwrap_or("")) {
-            println!(
-                "Session already exists with same title and path: {}",
-                trimmed_title
-            );
-            return Ok(());
-        }
-        trimmed_title.to_string()
-    } else if let Some(ref branch) = args.worktree_branch {
-        let branch_title = branch.trim().to_string();
-        if is_duplicate_session(&instances, &branch_title, path.to_str().unwrap_or("")) {
-            println!(
-                "Session already exists with same title and path: {}",
-                branch_title
-            );
-            return Ok(());
-        }
-        branch_title
-    } else {
-        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
-        civilizations::generate_random_title(&existing_titles)
-    };
+    // The title was resolved before worktree creation (so a tied session could
+    // seed its directory leaf from it); run the path-dependent duplicate check
+    // now that `path` points at the final worktree/workspace directory.
+    if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or("")) {
+        println!(
+            "Session already exists with same title and path: {}",
+            final_title
+        );
+        cleanup_partial_session(
+            &path,
+            worktree_info_opt.as_ref(),
+            workspace_info_opt.as_ref(),
+            args.create_branch,
+            None,
+        );
+        return Ok(());
+    }
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
     instance.source_profile = profile.to_string();
+
+    // Scratch sessions: provision a fresh scratch directory keyed on the
+    // freshly-generated instance id. The session layer owns the location
+    // (`<app_dir>/scratch/<id>/`) and the deletion guard.
+    if args.scratch {
+        let dir = crate::session::scratch::provision_scratch_dir(&instance.id)?;
+        path = dir;
+        instance.project_path = path.to_string_lossy().to_string();
+        instance.scratch = true;
+    }
 
     if let Some(group) = &group_path {
         instance.group_path = group.trim().to_string();
@@ -331,18 +449,46 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         instance.parent_session_id = Some(parent);
     }
 
-    if let Some(cmd) = &args.command {
+    if let Some(tool) = &args.tool {
+        let selection = resolve_named_tool(tool, &config)?;
+        if selection.is_custom() && args.cmd_override.is_some() {
+            bail!("--cmd-override cannot be used with configured custom agent --tool selections");
+        }
+        instance.tool = selection.name().to_string();
+    } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
-        // Verify the agent binary is actually on PATH before creating the session
-        if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
-            if !crate::tmux::is_agent_available(agent_def) {
-                bail!(
-                    "'{}' is not installed or not on $PATH.\n\
-                     Install with: {}\n\
-                     See all supported agents: aoe agents",
-                    agent_def.binary,
-                    agent_def.install_hint
-                );
+        // Verify the binary that will actually launch is on PATH before
+        // creating the session. A configured session.agent_command_override
+        // (or custom_agents) entry replaces the built-in binary, so check the
+        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // falsely bails when only the override binary (e.g.
+        // opencode-plannotator) is installed. See #1910.
+        match override_launch_binary(&tool_name, &config.session) {
+            Some(bin) => {
+                // Use the same detection as tmux (login-shell PATH fallback
+                // included) so an override binary visible only after shell
+                // init isn't rejected here while the non-override path accepts
+                // it. See #1910.
+                if !crate::tmux::is_binary_on_path(&bin) {
+                    bail!(
+                        "'{}' (from session.agent_command_override) is not installed or not on $PATH.\n\
+                         See all supported agents: aoe agents",
+                        bin
+                    );
+                }
+            }
+            None => {
+                if let Some(agent_def) = crate::agents::get_agent(&tool_name) {
+                    if !crate::tmux::is_agent_available(agent_def) {
+                        bail!(
+                            "'{}' is not installed or not on $PATH.\n\
+                             Install with: {}\n\
+                             See all supported agents: aoe agents",
+                            agent_def.binary,
+                            agent_def.install_hint
+                        );
+                    }
+                }
             }
         }
         instance.tool = tool_name;
@@ -418,70 +564,127 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         }
     }
 
-    // Cockpit mode: explicit --cockpit overrides config; --no-cockpit
-    // forces terminal mode; otherwise honor the config default for
-    // claude on supported platforms.
-    //
-    // `cockpit.enabled = false` in config.toml is the master switch
-    // that gates `--cockpit`. The toggle lives in the web settings.
+    // View selection. The terminal view (raw tmux/PTY) is the default so the
+    // CLI matches the TUI; the web wizard is the surface that defaults to
+    // structured. `--structured-view` (or `--agent`, which names a specific
+    // ACP agent) opts into the structured rendering; a non-ACP tool always
+    // runs in the terminal view.
     #[cfg(feature = "serve")]
     {
-        let user_picked_cockpit = args.cockpit || args.agent.is_some();
-        let user_forced_terminal = args.no_cockpit;
-        if user_picked_cockpit && !config.cockpit.enabled {
+        // `--agent` is an explicit structured-view choice: the user named a
+        // specific ACP agent, so a missing adapter is a hard error rather
+        // than a silent downgrade.
+        let user_picked_agent = args.agent.is_some();
+        let user_wants_structured = args.structured_view || user_picked_agent;
+        instance.agent_name = args.agent.clone();
+        instance.agent_model = args.model.clone();
+
+        let registry = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        let agent_name = pick_acp_agent_name(
+            &registry,
+            &config.session,
+            &instance.tool,
+            instance.agent_name.as_deref(),
+        );
+        // Capability is judged against the explicit `--agent` (or, with none,
+        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
+        // otherwise every tool would look ACP-capable via the bundled default
+        // and `--structured-view` could never be rejected for a non-ACP tool
+        // (it would silently substitute aoe-agent). Mirrors the server create
+        // path in `src/server/api/sessions.rs`.
+        let capability_key = instance
+            .agent_name
+            .as_deref()
+            .unwrap_or(instance.tool.as_str());
+        let acp_capable = registry.get(capability_key).is_some()
+            || config.session.agent_acp_cmd.contains_key(capability_key)
+            || config.session.agent_acp_cmd.contains_key(&instance.tool);
+
+        if user_picked_agent && !acp_capable {
             bail!(
-                "Cockpit is disabled by config (`cockpit.enabled = false` in config.toml). \
-                 Toggle it on (e.g. via the web settings) and try again, or omit --cockpit \
-                 for a tmux session."
+                "agent `{agent_name}` is not ACP-capable: it has no registry entry and no \
+                 `[session.agent_acp_cmd]` command.\n\
+                 Run `aoe acp doctor` to see configured agents, or omit --agent for a \
+                 terminal-view session."
             );
         }
-        instance.cockpit_mode = if user_forced_terminal {
-            false
-        } else if user_picked_cockpit {
-            true
-        } else {
-            config.cockpit.enabled && config.cockpit.default_for_claude && instance.tool == "claude"
-        };
-        instance.cockpit_agent = args.agent.clone();
-        instance.cockpit_model = args.model.clone();
 
-        // Precondition: cockpit sessions are only usable if the resolved
-        // ACP adapter binary is on PATH. Persisting a session whose
-        // adapter is missing produces a silent failure mode where the
-        // dashboard shows the session, the supervisor's reconciler
-        // tries to spawn, AcpClient::spawn fails with "No such file
-        // or directory", and the user sees a 404 on their first
-        // prompt. Bail at add-time with the install hint instead.
-        // `--no-cockpit` and the implicit-default branch don't trip
-        // this — only sessions the user explicitly opted into cockpit
-        // for, where missing tooling is a hard error rather than a
-        // silent fallback to tmux.
-        if instance.cockpit_mode && user_picked_cockpit {
-            let registry = crate::cockpit::agent_registry::AgentRegistry::with_defaults();
-            let agent_name = pick_cockpit_agent_name(
-                &registry,
-                &instance.tool,
-                instance.cockpit_agent.as_deref(),
+        if args.structured_view && !acp_capable {
+            bail!(
+                "tool `{}` is not ACP-capable, so --structured-view has no effect.\n\
+                 Run `aoe acp doctor` to see configured agents, or drop --structured-view \
+                 for a terminal-view session.",
+                instance.tool
             );
-            if let Some(spec) = registry.get(&agent_name) {
-                if !crate::cli::cockpit::command_present(&spec.command) {
-                    let hint = crate::cli::cockpit::install_hint_for(&spec.command)
-                        .unwrap_or("install via your package manager and re-run");
+        }
+
+        instance.view = if user_wants_structured && acp_capable {
+            crate::session::View::Structured
+        } else {
+            crate::session::View::Terminal
+        };
+
+        // Precondition: the structured view needs the resolved ACP adapter
+        // binary on PATH. A missing adapter would otherwise surface as a
+        // silent 404 on the first prompt. When the user explicitly named
+        // an agent (--agent) we bail; otherwise (the default path) we fall
+        // back to the terminal view with a warning so `aoe add` still
+        // succeeds on a machine without the adapter installed.
+        if instance.is_structured() {
+            let (mut spec, spec_from_registry) = match registry.get(&agent_name) {
+                Some(spec) => (spec.clone(), true),
+                None => match config.session.agent_acp_cmd.get(&agent_name) {
+                    Some(cmd) => (
+                        crate::acp::AgentSpec::from_acp_cmd(&agent_name, cmd)
+                            .map_err(|e| anyhow::anyhow!(e))?,
+                        false,
+                    ),
+                    None => match config.session.agent_acp_cmd.get(&instance.tool) {
+                        Some(cmd) => (
+                            crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd)
+                                .map_err(|e| anyhow::anyhow!(e))?,
+                            false,
+                        ),
+                        None => unreachable!("acp_capable implies a resolvable spec"),
+                    },
+                },
+            };
+            // Overlay session.agent_command_override the same way the agent
+            // spawn path does, so the precondition checks the binary that
+            // will actually launch (e.g. opencode-plannotator), not the
+            // bare registry binary. See #1910.
+            if let Some(ovr) = crate::server::acp_reconciler::command_override_for_spawn(
+                &instance.tool,
+                &instance.command,
+            ) {
+                crate::acp::supervisor::apply_agent_command_override(
+                    &agent_name,
+                    spec_from_registry,
+                    &ovr,
+                    &mut spec,
+                )?;
+            }
+            if !crate::cli::acp::command_present(&spec.command) {
+                let hint = crate::acp::install_hints::install_hint_for(&spec.command)
+                    .unwrap_or("install via your package manager and re-run");
+                if user_picked_agent {
                     bail!(
-                        "cockpit ACP adapter `{}` is not installed or not on $PATH.\n\
+                        "ACP adapter `{}` is not installed or not on $PATH.\n\
                          Install: {}\n\
-                         Or run: aoe cockpit doctor --fix\n\
+                         Or run: aoe acp doctor --fix\n\
                          Or use the bundled fallback: rerun with `--agent aoe-agent`\n\
-                         Or skip cockpit: rerun with `--no-cockpit` for a tmux-backed session.",
+                         Or use the terminal view: drop --agent / --structured-view.",
                         spec.command,
                         hint
                     );
                 }
-            } else {
-                bail!(
-                    "cockpit agent `{agent_name}` is not in the registry.\n\
-                     Run `aoe cockpit doctor` to see configured agents."
+                eprintln!(
+                    "warning: ACP adapter `{}` is not installed; this session will use the \
+                     terminal view. Install it ({}) or run `aoe acp doctor --fix`, then \
+                     switch the session to the structured view.",
+                    spec.command, hint
                 );
+                instance.view = crate::session::View::Terminal;
             }
         }
     }
@@ -500,12 +703,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 );
             }
         } else {
+            // Surface env-resolution warnings before container creation so
+            // typos and missing host vars don't silently produce empty
+            // values inside the sandbox. Same source the TUI path uses.
+            for w in crate::session::validate_env_entries(&config.sandbox.environment) {
+                eprintln!("⚠ {}", w);
+            }
+
             let container_name = containers::DockerContainer::generate_name(&instance.id);
-            let image = args
-                .sandbox_image
-                .as_ref()
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|| runtime.effective_default_image());
+            let image = resolve_sandbox_image(
+                args.sandbox_image.as_deref(),
+                &config.sandbox.default_image,
+                runtime.default_sandbox_image(),
+            );
             instance.sandbox_info = Some(SandboxInfo {
                 enabled: true,
                 container_id: None,
@@ -521,26 +731,65 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Use the original project path for trust checking (not the worktree/workspace
     // path, which won't contain `.agent-of-empires/config.toml`).
     let hook_result: Result<()> = (|| {
-        let resolved_hooks: Option<crate::session::HooksConfig> =
-            match repo_config::check_hook_trust(&original_project_path) {
-                Ok(repo_config::HookTrustStatus::NeedsTrust { hooks, hooks_hash }) => {
-                    let should_trust = if args.trust_hooks {
+        let resolved_hooks: Option<crate::session::HooksConfig> = if args.scratch {
+            // Scratch sessions never have a `.agent-of-empires/config.toml`
+            // anchored on `original_project_path` (the path is either
+            // empty or the scratch dir itself). Skip the repo hook
+            // trust prompt entirely and fall back to profile-level
+            // hooks so the project-less contract stays intact.
+            repo_config::resolve_global_profile_hooks(profile)
+        } else {
+            // Repo trust now covers two surfaces: lifecycle hooks and project
+            // MCP servers (#1985). Hooks run here at create time; project MCP is
+            // forwarded later by the daemon, but its trust is recorded through
+            // the same single approval so an untrusted repo's `.mcp.json` is
+            // never forwarded. Hooks are resolved independently of MCP so an
+            // unapproved (or absent) MCP file never suppresses trusted hooks.
+            use repo_config::TrustSurface;
+            match repo_config::check_repo_trust(&original_project_path) {
+                Ok(trust) => {
+                    let repo_hooks: Option<crate::session::HooksConfig> = match &trust.hooks {
+                        TrustSurface::Trusted(h) => Some(h.clone()),
+                        TrustSurface::NeedsTrust { config, .. } => Some(config.clone()),
+                        TrustSurface::Absent => None,
+                    };
+                    let hooks_hash_write = match &trust.hooks {
+                        TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+                        _ => None,
+                    };
+                    let mcp_hash_write = match &trust.mcp {
+                        TrustSurface::NeedsTrust { hash, .. } => Some(hash.clone()),
+                        _ => None,
+                    };
+                    let mcp_servers = match &trust.mcp {
+                        TrustSurface::Trusted(s) | TrustSurface::NeedsTrust { config: s, .. } => {
+                            Some(s.clone())
+                        }
+                        TrustSurface::Absent => None,
+                    };
+
+                    let approved = if !trust.needs_prompt() || args.trust_hooks {
                         true
                     } else {
-                        println!("\nRepository hooks detected in .agent-of-empires/config.toml:");
-                        if !hooks.on_create.is_empty() {
-                            println!("  on_create:");
-                            for cmd in &hooks.on_create {
-                                println!("    {}", cmd);
+                        if let Some(ref hooks) = repo_hooks {
+                            println!(
+                                "\nHooks for this session (repo overrides global config per type):"
+                            );
+                            let merged = repo_config::merge_hooks_for_display(profile, hooks);
+                            for group in repo_config::hook_display_groups(&merged, hooks, true) {
+                                println!("  {}:{}", group.name, group.source_label());
+                                for cmd in &group.commands {
+                                    println!("    {}", cmd);
+                                }
                             }
                         }
-                        if !hooks.on_launch.is_empty() {
-                            println!("  on_launch:");
-                            for cmd in &hooks.on_launch {
-                                println!("    {}", cmd);
+                        if let Some(ref servers) = mcp_servers {
+                            println!("\nProject MCP servers from .mcp.json (values redacted):");
+                            for server in servers {
+                                println!("  {}", server.redacted_summary());
                             }
                         }
-                        print!("\nTrust and run these hooks? [y/N] ");
+                        print!("\nTrust this repo (hooks and project MCP shown above)? [y/N] ");
                         use std::io::Write;
                         std::io::stdout().flush()?;
                         let mut input = String::new();
@@ -548,31 +797,72 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         input.trim().eq_ignore_ascii_case("y")
                     };
 
-                    if should_trust {
-                        repo_config::trust_repo(&original_project_path, &hooks_hash)?;
-                        println!("✓ Repository hooks trusted");
-                        repo_config::merge_hooks_with_config(profile, hooks)
+                    if approved {
+                        if hooks_hash_write.is_some() || mcp_hash_write.is_some() {
+                            repo_config::trust_repo(
+                                &original_project_path,
+                                hooks_hash_write.as_deref(),
+                                mcp_hash_write.as_deref(),
+                            )?;
+                            if hooks_hash_write.is_some() {
+                                println!("✓ Repository hooks trusted");
+                            }
+                            if mcp_hash_write.is_some() {
+                                println!("✓ Project MCP servers trusted");
+                            }
+                        }
+                        match repo_hooks {
+                            Some(h) => repo_config::merge_hooks_with_config(profile, h),
+                            None => repo_config::resolve_global_profile_hooks(profile),
+                        }
                     } else {
-                        println!("Hooks skipped (session created without running hooks)");
-                        None
+                        println!(
+                            "Skipped (session created without trusting repo hooks or project MCP)"
+                        );
+                        // Already-trusted hooks still run; only newly-prompted
+                        // surfaces are declined.
+                        match &trust.hooks {
+                            TrustSurface::Trusted(h) => {
+                                repo_config::merge_hooks_with_config(profile, h.clone())
+                            }
+                            TrustSurface::NeedsTrust { .. } => None,
+                            TrustSurface::Absent => {
+                                repo_config::resolve_global_profile_hooks(profile)
+                            }
+                        }
                     }
                 }
-                Ok(repo_config::HookTrustStatus::Trusted(repo_hooks)) => {
-                    repo_config::merge_hooks_with_config(profile, repo_hooks)
-                }
-                Ok(repo_config::HookTrustStatus::NoHooks) => {
-                    repo_config::resolve_global_profile_hooks(profile)
-                }
                 Err(e) => {
-                    tracing::warn!("Failed to check repo hooks: {}", e);
+                    tracing::warn!(target: "cli.add", "Failed to check repo trust: {}", e);
                     repo_config::resolve_global_profile_hooks(profile)
                 }
-            };
+            }
+        };
 
         if let Some(hooks) = resolved_hooks {
             if !hooks.on_create.is_empty() {
-                println!("Running on_create hooks...");
-                repo_config::execute_hooks(&hooks.on_create, &path)?;
+                // Show the final merged hook list (repo hooks override global/profile
+                // per type) so the user can see exactly what runs, especially when
+                // `--trust-hooks` skipped the interactive approval prompt (#596).
+                println!("Running on_create hooks:");
+                for cmd in &hooks.on_create {
+                    println!("  {}", cmd);
+                }
+                let hook_env = repo_config::lifecycle_env_vars(&instance);
+                if instance.sandbox_info.is_some() {
+                    instance.get_container_for_instance()?;
+                    let workdir = instance.container_workdir();
+                    if let Some(ref sandbox) = instance.sandbox_info {
+                        repo_config::execute_hooks_in_container(
+                            &hooks.on_create,
+                            &sandbox.container_name,
+                            &workdir,
+                            &hook_env,
+                        )?;
+                    }
+                } else {
+                    repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
+                }
                 println!("✓ on_create hooks completed");
             }
         }
@@ -580,41 +870,71 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     })();
 
     if let Err(e) = hook_result {
-        // Clean up worktree if we created one
-        if let Some(ref wt_info) = instance.worktree_info {
-            if wt_info.managed_by_aoe {
-                if let Ok(git_wt) =
-                    crate::git::GitWorktree::new(std::path::PathBuf::from(&wt_info.main_repo_path))
-                {
-                    let _ = git_wt.remove_worktree(&path, false);
-                }
-            }
-        }
-        // Clean up workspace worktrees if we created them
-        if let Some(ref ws_info) = instance.workspace_info {
-            for repo in &ws_info.repos {
-                if repo.managed_by_aoe {
-                    let wt_path = PathBuf::from(&repo.worktree_path);
-                    let main_repo = PathBuf::from(&repo.main_repo_path);
-                    if let Ok(git_wt) = crate::git::GitWorktree::new(main_repo) {
-                        let _ = git_wt.remove_worktree(&wt_path, false);
-                    }
-                }
-            }
-            let _ = std::fs::remove_dir_all(&ws_info.workspace_dir);
-        }
+        cleanup_partial_session(
+            &path,
+            instance.worktree_info.as_ref(),
+            instance.workspace_info.as_ref(),
+            args.create_branch,
+            if instance.scratch {
+                Some(std::path::Path::new(&instance.project_path))
+            } else {
+                None
+            },
+        );
         return Err(e);
     }
 
-    instances.push(instance.clone());
-
-    // Rebuild group tree
-    let mut group_tree = GroupTree::new_with_groups(&instances, &groups);
-    if !instance.group_path.is_empty() {
-        group_tree.create_group(&instance.group_path);
+    let persist_result = storage.update(|all_instances, groups| {
+        if is_duplicate_session(
+            all_instances,
+            &instance.title,
+            instance.project_path.as_str(),
+        ) {
+            return Ok(false);
+        }
+        all_instances.push(instance.clone());
+        if !instance.group_path.is_empty() {
+            let mut group_tree = GroupTree::new_with_groups(all_instances, groups);
+            group_tree.create_group(&instance.group_path);
+            *groups = group_tree.get_all_groups();
+        }
+        Ok(true)
+    });
+    match persist_result {
+        Ok(true) => {}
+        Ok(false) => {
+            println!(
+                "Session already exists with same title and path: {}",
+                instance.title
+            );
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            cleanup_partial_session(
+                &path,
+                instance.worktree_info.as_ref(),
+                instance.workspace_info.as_ref(),
+                args.create_branch,
+                if instance.scratch {
+                    Some(std::path::Path::new(&instance.project_path))
+                } else {
+                    None
+                },
+            );
+            return Err(e);
+        }
     }
-
-    storage.save_with_groups(&instances, &group_tree)?;
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -630,6 +950,9 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     if instance.sandbox_info.is_some() {
         println!("  Sandbox: enabled");
     }
+    if instance.scratch {
+        println!("  Scratch:  yes");
+    }
     if instance.yolo_mode {
         println!("  YOLO:    enabled");
     }
@@ -641,12 +964,12 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     #[cfg(feature = "serve")]
-    let is_cockpit = instance.cockpit_mode;
+    let is_acp = instance.is_structured();
     #[cfg(not(feature = "serve"))]
-    let is_cockpit = false;
+    let is_acp = false;
 
-    if is_cockpit {
-        // Cockpit sessions aren't backed by tmux: their ACP worker is
+    if is_acp {
+        // Acp sessions aren't backed by tmux: their ACP worker is
         // owned by `aoe serve`'s supervisor, which the
         // status_poll_loop reconciler auto-spawns within ~2s of the
         // session appearing on disk. `--launch` and the
@@ -659,45 +982,60 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         if args.launch {
             println!();
             println!(
-                "(--launch is a no-op for cockpit sessions; \
+                "(--launch is a no-op for structured view sessions; \
                  lifecycle is managed by `aoe serve`.)"
             );
         }
     } else if args.launch {
-        let idx = instances
-            .iter()
-            .position(|i| i.id == instance.id)
-            .expect("just added instance");
-        instances[idx].source_profile = profile.to_string();
-        instances[idx].start_with_size(crate::terminal::get_size())?;
-        storage.save_with_groups(&instances, &group_tree)?;
+        // Persist Status::Error + last_error on launch failure rather than
+        // cleanup_partial_session: row is committed; surface as broken.
+        let id = instance.id.clone();
+        match instance.start_with_size(crate::terminal::get_size()) {
+            Ok(()) => {
+                let landed = storage.update(|all_instances, _groups| {
+                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
+                        stored.merge_post_start(&instance);
+                        Ok(true)
+                    } else {
+                        tracing::warn!(
+                            target: "session.cli",
+                            session_id = %id,
+                            "session row removed by peer between insert and launch-merge; tmux session is now orphan"
+                        );
+                        Ok(false)
+                    }
+                })?;
+                if !landed {
+                    anyhow::bail!(
+                        "Session {} was removed by another process before launch could land; tmux session is now orphan",
+                        instance.title
+                    );
+                }
 
-        let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-        let tmux_config = crate::terminal::resolved_tmux_config(
-            profile,
-            std::path::Path::new(&instances[idx].project_path),
-        );
-        if let Some(title) = crate::terminal::session_attach_title(&tmux_config, &instance.title) {
-            if let Err(e) = crate::terminal::set_title(&title) {
-                tracing::warn!(
-                    "Failed to update terminal title before CLI launch attach: {}",
-                    e
+                let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
+                tmux_session.attach()?;
+            }
+            Err(e) => {
+                if let Err(rollback_err) = storage.update(|all_instances, _groups| {
+                    if let Some(stored) = all_instances.iter_mut().find(|i| i.id == id) {
+                        stored.status = crate::session::Status::Error;
+                    }
+                    Ok(())
+                }) {
+                    tracing::error!(
+                        target: "session.store",
+                        "Failed to persist Status::Error rollback for {}: {}; row may show stale Starting status",
+                        id,
+                        rollback_err
+                    );
+                }
+                eprintln!(
+                    "Warning: launch failed: {}. Retry with: aoe session start {}",
+                    e, final_title
                 );
+                return Err(e);
             }
         }
-
-        let attach_result = tmux_session.attach();
-
-        if let Some(title) = crate::terminal::dashboard_title(&tmux_config) {
-            if let Err(e) = crate::terminal::set_title(&title) {
-                tracing::warn!(
-                    "Failed to restore terminal title after CLI launch attach: {}",
-                    e
-                );
-            }
-        }
-
-        attach_result?;
     } else {
         println!();
         println!("Next steps:");
@@ -706,6 +1044,94 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prompt for a session title on stderr, mirroring the TUI `n` flow's
+/// "auto-generates if empty" field. Empty input or EOF keeps
+/// `default_title`; a non-empty line is trimmed and used. Only reached in
+/// `--interactive` mode, which already verified stdin is a terminal.
+/// Resolve the session title string (no path-dependent duplicate check).
+///
+/// `--title` wins; otherwise the default is the worktree branch name, or a
+/// random civilization name for non-worktree sessions. `--interactive` prompts
+/// with that default prefilled. Resolved before worktree creation so a tied
+/// session can derive its directory leaf from the title (#1927); the duplicate
+/// check runs later once the worktree path is known.
+fn resolve_session_title(args: &AddArgs, instances: &[Instance]) -> Result<String> {
+    if let Some(title) = &args.title {
+        return Ok(title.trim().to_string());
+    }
+    let default_title = if let Some(ref branch) = args.worktree_branch {
+        branch.trim().to_string()
+    } else {
+        let existing_titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
+        civilizations::generate_random_title(&existing_titles)
+    };
+    if args.interactive {
+        prompt_session_title(&default_title)
+    } else {
+        Ok(default_title)
+    }
+}
+
+fn prompt_session_title(default_title: &str) -> Result<String> {
+    use std::io::Write;
+
+    eprint!("Session name [{}]: ", default_title);
+    std::io::stderr().flush()?;
+
+    let mut input = String::new();
+    let read = std::io::stdin().read_line(&mut input)?;
+    if read == 0 {
+        return Ok(default_title.to_string());
+    }
+
+    let trimmed = input.trim();
+    Ok(if trimmed.is_empty() {
+        default_title.to_string()
+    } else {
+        trimmed.to_string()
+    })
+}
+
+fn cleanup_partial_session(
+    path: &std::path::Path,
+    worktree_info: Option<&crate::session::WorktreeInfo>,
+    workspace_info: Option<&crate::session::WorkspaceInfo>,
+    created_branch: bool,
+    scratch_dir: Option<&std::path::Path>,
+) {
+    if let Some(wt) = worktree_info {
+        if wt.managed_by_aoe {
+            if let Ok(git_wt) = crate::git::GitWorktree::new(PathBuf::from(&wt.main_repo_path)) {
+                let _ = git_wt.remove_worktree(path, false);
+                if created_branch {
+                    let _ = git_wt.delete_branch(&wt.branch);
+                }
+            }
+        }
+    }
+    if let Some(ws) = workspace_info {
+        for repo in &ws.repos {
+            if repo.managed_by_aoe {
+                if let Ok(git_wt) =
+                    crate::git::GitWorktree::new(PathBuf::from(&repo.main_repo_path))
+                {
+                    let _ =
+                        git_wt.remove_worktree(std::path::Path::new(&repo.worktree_path), false);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&ws.workspace_dir);
+    }
+    // Remove the scratch directory provisioned earlier in this run.
+    // Guarded by `is_scratch_path` (same check the deletion path uses),
+    // so a tampered or unexpected `project_path` is a no-op.
+    if let Some(scratch) = scratch_dir {
+        if crate::session::scratch::is_scratch_path(scratch) {
+            let _ = std::fs::remove_dir_all(scratch);
+        }
+    }
 }
 
 pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
@@ -719,10 +1145,12 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → legacy (`claude` → `claude`, else `aoe-agent`).
+/// registry entry → custom agent with `agent_acp_cmd` → legacy
+/// (`claude` → `claude`, else `aoe-agent`).
 #[cfg(feature = "serve")]
-fn pick_cockpit_agent_name(
-    registry: &crate::cockpit::agent_registry::AgentRegistry,
+fn pick_acp_agent_name(
+    registry: &crate::acp::agent_registry::AgentRegistry,
+    session: &crate::session::config::SessionConfig,
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
@@ -732,6 +1160,9 @@ fn pick_cockpit_agent_name(
         }
     }
     if registry.get(tool).is_some() {
+        return tool.to_string();
+    }
+    if session.agent_acp_cmd.contains_key(tool) {
         return tool.to_string();
     }
     if tool == "claude" {
@@ -753,4 +1184,204 @@ fn detect_tool(cmd: &str) -> Result<String> {
                 crate::agents::agent_names().join(", ")
             )
         })
+}
+
+/// The binary `aoe add` must verify is on PATH for a `--cmd <tool>`
+/// selection when `session.agent_command_override` (or `custom_agents`)
+/// remaps the built-in to a different command. Returns the resolved
+/// command's first word, or `None` when no override applies (the caller
+/// then falls back to the built-in agent's own detection). See #1910.
+///
+/// Parsed with `shell_words` so a quoted path (e.g.
+/// `"/opt/My Wrapper/opencode" --mode plan`) yields the real binary, matching
+/// how `apply_agent_command_override` splits the command at spawn time.
+fn override_launch_binary(
+    tool: &str,
+    session: &crate::session::config::SessionConfig,
+) -> Option<String> {
+    let command = session.resolve_tool_command(tool);
+    shell_words::split(&command).ok()?.into_iter().next()
+}
+
+enum NamedToolSelection {
+    Custom(String),
+    BuiltIn(String),
+}
+
+impl NamedToolSelection {
+    fn name(&self) -> &str {
+        match self {
+            Self::Custom(name) | Self::BuiltIn(name) => name,
+        }
+    }
+
+    fn is_custom(&self) -> bool {
+        matches!(self, Self::Custom(_))
+    }
+}
+
+fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<NamedToolSelection> {
+    let name = tool.trim();
+    if name.is_empty() {
+        bail!("--tool requires a non-empty agent name");
+    }
+
+    if let Some(command) = config.session.custom_agents.get(name) {
+        if command.trim().is_empty() {
+            bail!("custom agent '{name}' has an empty configured command");
+        }
+        if let Some(detect_as) = config
+            .session
+            .agent_detect_as
+            .get(name)
+            .map(|target| target.trim())
+            .filter(|target| !target.is_empty())
+        {
+            if crate::agents::get_agent(detect_as).is_none() {
+                bail!(
+                    "custom agent '{name}' maps agent_detect_as to unknown agent '{detect_as}'. Known agents: {}",
+                    crate::agents::agent_names().join(", ")
+                );
+            }
+        }
+        return Ok(NamedToolSelection::Custom(name.to_string()));
+    }
+
+    if let Some(tool_name) = crate::agents::resolve_tool_name(name) {
+        if let Some(agent_def) = crate::agents::get_agent(tool_name) {
+            if !crate::tmux::is_agent_available(agent_def) {
+                bail!(
+                    "'{}' is not installed or not on $PATH.\n\
+                     Install with: {}\n\
+                     See all supported agents: aoe agents",
+                    agent_def.binary,
+                    agent_def.install_hint
+                );
+            }
+        }
+        return Ok(NamedToolSelection::BuiltIn(tool_name.to_string()));
+    }
+
+    let mut safe_names: Vec<String> = crate::agents::agent_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    safe_names.extend(
+        config
+            .session
+            .custom_agents
+            .keys()
+            .filter(|name| !name.is_empty())
+            .cloned(),
+    );
+    safe_names.sort();
+    safe_names.dedup();
+
+    bail!(
+        "Unknown tool: {name}\nSupported built-in and configured custom agents: {}",
+        safe_names.join(", ")
+    )
+}
+
+/// Resolve the sandbox image for a new session.
+///
+/// Precedence: the explicit `--sandbox-image` flag, then the merged
+/// `[sandbox] default_image` from `config` (which `resolve_config_with_repo_or_warn`
+/// already layers repo over profile/global, see #1651), then the runtime's
+/// hardcoded default. The merged value already carries the global config, so
+/// there is no need to reload it from disk for the empty-fallback case.
+fn resolve_sandbox_image(
+    flag: Option<&str>,
+    merged_default: &str,
+    hardcoded_default: &str,
+) -> String {
+    if let Some(flag) = flag {
+        return flag.trim().to_string();
+    }
+    let merged = merged_default.trim();
+    if merged.is_empty() {
+        hardcoded_default.to_string()
+    } else {
+        merged.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{override_launch_binary, resolve_sandbox_image};
+    use crate::session::config::SessionConfig;
+
+    const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
+
+    #[test]
+    fn override_launch_binary_uses_command_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "opencode-plannotator".to_string());
+        // The gate must verify the override binary, not the built-in
+        // `opencode`, so `--cmd opencode` works when only the wrapper is
+        // installed. See #1910.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("opencode-plannotator")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_takes_first_word_of_multiword_override() {
+        let mut session = SessionConfig::default();
+        session
+            .agent_command_override
+            .insert("opencode".to_string(), "ocp run sp".to_string());
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("ocp")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_honors_quoted_path() {
+        let mut session = SessionConfig::default();
+        session.agent_command_override.insert(
+            "opencode".to_string(),
+            "\"/opt/My Wrapper/opencode\" --mode plan".to_string(),
+        );
+        // shell_words keeps the quoted path intact instead of splitting on
+        // the space, so preflight checks the real binary.
+        assert_eq!(
+            override_launch_binary("opencode", &session).as_deref(),
+            Some("/opt/My Wrapper/opencode")
+        );
+    }
+
+    #[test]
+    fn override_launch_binary_none_without_override() {
+        let session = SessionConfig::default();
+        assert_eq!(override_launch_binary("opencode", &session), None);
+    }
+
+    #[test]
+    fn flag_overrides_everything() {
+        let image = resolve_sandbox_image(Some(" custom:flag "), "repo:merged", HARDCODED);
+        assert_eq!(image, "custom:flag");
+    }
+
+    #[test]
+    fn merged_default_used_when_no_flag() {
+        let image = resolve_sandbox_image(None, "ghcr.io/example/custom:latest", HARDCODED);
+        assert_eq!(image, "ghcr.io/example/custom:latest");
+    }
+
+    #[test]
+    fn whitespace_merged_falls_back_to_hardcoded() {
+        let image = resolve_sandbox_image(None, "   ", HARDCODED);
+        assert_eq!(image, HARDCODED);
+    }
+
+    #[test]
+    fn empty_merged_falls_back_to_hardcoded() {
+        let image = resolve_sandbox_image(None, "", HARDCODED);
+        assert_eq!(image, HARDCODED);
+    }
 }

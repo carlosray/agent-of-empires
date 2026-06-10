@@ -21,6 +21,7 @@ pub enum SoundsCommands {
     },
 }
 
+#[tracing::instrument(target = "cli.session", skip_all)]
 pub async fn run(command: SoundsCommands) -> Result<()> {
     match command {
         SoundsCommands::Install => install_bundled().await,
@@ -65,7 +66,9 @@ async fn install_bundled() -> Result<()> {
             eprintln!("  • Check your internet connection");
             eprintln!("  • Try again later if GitHub is unavailable");
             eprintln!("  • You can manually download sounds from:");
-            eprintln!("    https://github.com/njbrake/agent-of-empires/tree/main/bundled_sounds");
+            eprintln!(
+                "    https://github.com/agent-of-empires/agent-of-empires/tree/main/bundled_sounds"
+            );
             Err(e)
         }
     }

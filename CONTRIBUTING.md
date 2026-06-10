@@ -16,6 +16,7 @@ Thanks for your interest in contributing to aoe (Agent of Empires)! This documen
 - **tmux**: Required for running the application (`brew install tmux` on macOS, `apt install tmux` on Ubuntu)
 - **Git**: For version control
 - **Node.js + npm** (optional): Only needed for the web dashboard feature (`cargo build --features serve`). Not required for TUI-only development.
+- **[kache](https://github.com/kunobi-ninja/kache)** (optional): An opt-in rustc wrapper that shares dependency builds across worktrees to cut compile time and disk. Not required to build. If you keep several worktrees in flight, see [Faster rebuilds across worktrees](docs/development.md#faster-rebuilds-across-worktrees-kache).
 
 ### Quick Start
 
@@ -80,6 +81,29 @@ Use conventional commit prefixes:
 
 Example: `feat: add session export command`
 
+### Changelog visibility
+
+`CHANGELOG.md` and the GitHub Release body are generated from conventional commit messages on `main` by [git-cliff](https://git-cliff.org/) (config in [`cliff.toml`](cliff.toml)). Squash-merged PR titles are what gets parsed, so PR titles matter.
+
+User-visible prefixes appear in release notes:
+
+- `feat:` new user-visible behavior
+- `fix:` bug fixes that affect users
+- `perf:` performance improvements
+- `security:` security fixes
+- `revert:` reverts of previously released changes
+
+Routine maintenance is intentionally hidden:
+
+- `chore:`, `chore(deps):`, `chore: update Nix npmDepsHash`
+- `build:`, `ci:`
+- `docs:`, `style:`
+- `refactor:`, `test:`
+
+For web-dashboard changes, scope visibility via the prefix: `feat(web): ...` / `fix(web): ...` show up; `refactor(web):` / `chore(web):` / `test(web):` stay out. Same pattern for `acp`, `serve`, `tui`.
+
+A non-conventional PR title no longer disappears silently from the changelog: `cliff.toml`'s catch-all parser routes anything without a recognized prefix into a generic "Other" group, and the release workflow fails if git-cliff still flags a parse-error skip. Even so, the **PR Title Check** workflow runs on every PR and refuses to pass until the title parses as `<type>(<scope>)?: <subject>` with a lowercase subject, so "Other" should only ever catch direct pushes to `main`. Reword titles like "Fix stuff" to `fix: <thing>` before merging.
+
 ## Testing
 
 - Run `cargo test` before submitting PRs
@@ -100,6 +124,10 @@ Example: `feat: add session export command`
 - How you tested the changes
 - Screenshots/recordings for UI changes
 - Link to related issues
+
+## Releases
+
+`agent-of-empires` releases at least weekly via an automated staging PR (Wednesday 09:00 UTC) that the maintainer reviews and merges. See [`docs/development/releases.md`](docs/development/releases.md) for the full cadence, the post-merge tagger flow, and how emergency releases work.
 
 ## Your First Contribution
 

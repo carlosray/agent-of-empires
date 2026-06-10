@@ -1,7 +1,7 @@
 import type { Page } from "@playwright/test";
 
 // Shared mocks so a running `aoe serve` + tmux aren't required. We stub the
-// REST API and route the PTY WebSocket so the wterm terminal mounts and the
+// REST API and route the PTY WebSocket so the xterm.js terminal mounts and the
 // gesture handlers in useTerminal.ts are exercised against the real frontend.
 
 export interface MockHandle {
@@ -11,56 +11,42 @@ export interface MockHandle {
 
 export async function mockTerminalApis(page: Page): Promise<MockHandle> {
   const handle: MockHandle = { wsMessages: [] };
-  await page.route("**/api/login/status", (r) =>
-    r.fulfill({ json: { required: false, authenticated: true } }),
-  );
+  await page.route("**/api/login/status", (r) => r.fulfill({ json: { required: false, authenticated: true } }));
   await page.route("**/api/sessions", (r) => {
     if (r.request().method() === "POST") return r.fulfill({ status: 400 });
     return r.fulfill({
-      json: [
-        {
-          id: "pinch-test",
-          title: "pinch-test",
-          project_path: "/tmp/pinch-test",
-          group_path: "/tmp",
-          tool: "claude",
-          status: "Running",
-          yolo_mode: false,
-          created_at: new Date().toISOString(),
-          last_accessed_at: null,
-          last_error: null,
-          branch: null,
-          main_repo_path: null,
-          is_sandboxed: false,
-          has_terminal: true,
-          profile: "default",
-          workspace_repos: [],
-        },
-      ],
+      json: {
+        sessions: [
+          {
+            id: "pinch-test",
+            title: "pinch-test",
+            project_path: "/tmp/pinch-test",
+            group_path: "/tmp",
+            tool: "claude",
+            status: "Running",
+            yolo_mode: false,
+            created_at: new Date().toISOString(),
+            last_accessed_at: null,
+            last_error: null,
+            branch: null,
+            main_repo_path: null,
+            is_sandboxed: false,
+            has_terminal: true,
+            profile: "default",
+            workspace_repos: [],
+          },
+        ],
+        workspace_ordering: [],
+      },
     });
   });
-  await page.route("**/api/sessions/*/ensure", (r) =>
-    r.fulfill({ json: { ok: true } }),
-  );
-  await page.route("**/api/sessions/*/terminal", (r) =>
-    r.fulfill({ status: 200, body: "" }),
-  );
+  await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+  await page.route("**/api/sessions/*/terminal", (r) => r.fulfill({ status: 200, body: "" }));
   await page.route("**/api/sessions/*/diff/files", (r) =>
     r.fulfill({ json: { files: [], per_repo_bases: [], warning: null } }),
   );
-  for (const path of [
-    "settings",
-    "themes",
-    "agents",
-    "profiles",
-    "groups",
-    "devices",
-    "docker/status",
-    "about",
-  ]) {
-    await page.route(`**/api/${path}`, (r) =>
-      r.fulfill({ json: path === "docker/status" ? {} : [] }),
-    );
+  for (const path of ["settings", "themes", "agents", "profiles", "groups", "devices", "docker/status", "about"]) {
+    await page.route(`**/api/${path}`, (r) => r.fulfill({ json: path === "docker/status" ? {} : [] }));
   }
   await page.routeWebSocket(/\/sessions\/.*\/(ws|container-ws)$/, (ws) => {
     ws.onMessage((msg) => {
@@ -98,9 +84,7 @@ export async function installTerminalSpies(page: Page) {
     (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__ = [];
     const origSetItem = Storage.prototype.setItem;
     Storage.prototype.setItem = function (key: string, value: string) {
-      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.push(
-        `${key}=${value}`,
-      );
+      (window as unknown as { __LS_WRITES__: string[] }).__LS_WRITES__.push(`${key}=${value}`);
       return origSetItem.call(this, key, value);
     };
   });
@@ -115,10 +99,7 @@ export function readFontSize(page: Page, which: "mobile" | "desktop") {
   }, which);
 }
 
-export async function seedSettings(
-  page: Page,
-  settings: { mobileFontSize?: number; desktopFontSize?: number },
-) {
+export async function seedSettings(page: Page, settings: { mobileFontSize?: number; desktopFontSize?: number }) {
   await page.evaluate((settings) => {
     localStorage.setItem(
       "aoe-web-settings",
@@ -132,7 +113,7 @@ export async function seedSettings(
   }, settings);
 }
 
-// Synthesize a multi-touch TouchEvent on the .wterm element.
+// Synthesize a multi-touch TouchEvent on the .xterm element.
 // Playwright's page.touchscreen is single-finger only; building raw Touch
 // objects is the only cross-browser way to dispatch two-finger gestures.
 export async function fireTouches(
@@ -142,8 +123,8 @@ export async function fireTouches(
 ) {
   await page.evaluate(
     ({ type, points }) => {
-      const target = document.querySelector<HTMLElement>(".wterm");
-      if (!target) throw new Error(".wterm not mounted");
+      const target = document.querySelector<HTMLElement>(".xterm");
+      if (!target) throw new Error(".xterm not mounted");
       const rect = target.getBoundingClientRect();
       const touches = points.map((p, i) => {
         const clientX = rect.left + p.x;

@@ -8,14 +8,18 @@ use std::time::{Duration, Instant};
 use rattles::presets::prelude as spinners;
 
 use super::{
-    get_indent, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING, ICON_ERROR,
-    ICON_EXPANDED, ICON_IDLE, ICON_STOPPED, ICON_UNKNOWN,
+    get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
 };
-use crate::session::config::GroupByMode;
+use crate::containers::image_update::ImageUpdate;
+use crate::session::config::{GroupByMode, SortOrder};
 use crate::session::{Item, Status};
-use crate::tui::components::{HelpOverlay, Preview};
+use crate::tui::components::preview::{self, CachedPreview};
+use crate::tui::components::{
+    format_scroll_indicator, set_prefixed_input_cursor_position, HelpOverlay, Preview,
+};
 use crate::tui::responsive;
-use crate::tui::styles::Theme;
+use crate::tui::styles::{has_min_contrast, Theme};
 use crate::update::UpdateInfo;
 
 /// Derive a frame offset from a session's creation timestamp so that
@@ -24,11 +28,101 @@ fn session_offset(created_at: &DateTime<Utc>) -> usize {
     created_at.timestamp_millis() as usize
 }
 
+/// Build the list-pane title.
+///
+/// `prefix` is the leading label ("aoe", "Terminals", "Tool: <name>").
+/// `profile` is `Some(name)` only when a real filter is active; when `None`,
+/// the `[<profile>]` segment is omitted so the default all-profiles state
+/// stays uncluttered.
+/// Group and sort state hang off the prefix as `· project` / `· <sort label>`
+/// segments, each dropped when it matches the default.
+fn compose_list_title(
+    prefix: &str,
+    profile: Option<&str>,
+    group_by: GroupByMode,
+    sort_order: SortOrder,
+) -> String {
+    let mut suffix = String::new();
+    if group_by == GroupByMode::Project {
+        suffix.push_str(" · project");
+    }
+    if sort_order != SortOrder::default() {
+        suffix.push_str(" · ");
+        suffix.push_str(sort_order.label());
+    }
+    let profile_tag = match profile {
+        Some(name) => format!(" [{}]", name),
+        None => String::new(),
+    };
+    format!(" {}{}{} ", prefix, profile_tag, suffix)
+}
+
 /// Extra rows captured beyond the visible window so moderate scrolls don't
 /// force a fresh capture on every wheel tick. Cache invalidation uses the same
 /// reserve to decide when the captured window can no longer cover the
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
+
+/// Trim `text` to fit within `max_width` display cells, appending '…'
+/// if anything was dropped. Used by the live-send banners so a long
+/// session title never pushes the exit-chord hint off-screen on a
+/// narrow terminal. Returns "" when max_width is 0 (the title gets
+/// sacrificed entirely so the fixed chord text wins).
+fn truncate_to_width(text: &str, max_width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if max_width == 0 {
+        return String::new();
+    }
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_string();
+    }
+    // Reserve one cell for the ellipsis.
+    let budget = max_width.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0;
+    for c in text.chars() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Map a tmux pane cursor onto the preview's output rect for live-send.
+///
+/// `output` is the rect the captured pane text paints into; `visible_rows` is
+/// its height in rows; `cursor` carries the pane's `(x, y)` (counted from the
+/// top of the visible screen) plus `pane_height`. Assumes the preview is at
+/// the live tail, where the bottom captured line pins to the bottom of
+/// `output`, so a screen row maps to `output.y + (visible_rows - pane_height)
+/// + cursor.y`. When the pane is sized to the output area (the live-send
+/// resize) the delta is zero and this is just `output.y + cursor.y`; the delta
+/// only bites for the frame or two after a resize. A hidden cursor, or one
+/// that maps outside `output` (e.g. a pane taller than the output area clips
+/// its top rows), yields `None` so nothing is painted.
+fn map_live_preview_cursor(
+    output: Rect,
+    visible_rows: usize,
+    cursor: crate::tmux::PaneCursor,
+) -> Option<Position> {
+    if !cursor.visible {
+        return None;
+    }
+    let row = output.y as i32 + (visible_rows as i32 - cursor.pane_height as i32) + cursor.y as i32;
+    let col = output.x as i32 + cursor.x as i32;
+    if row < output.y as i32
+        || row >= output.y as i32 + output.height as i32
+        || col < output.x as i32
+        || col >= output.x as i32 + output.width as i32
+    {
+        return None;
+    }
+    Some(Position::new(col as u16, row as u16))
+}
 
 /// Number of pane lines to capture for the preview, accounting for the user's
 /// scrollback offset. A small buffer is added so moderate scrolls don't force a
@@ -53,9 +147,19 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
 /// can actually render. Prevents the offset from drifting into "phantom"
 /// territory (M3 from the multi-AI review) when tmux history is shorter than
 /// `MAX_PREVIEW_SCROLL`.
-fn clamp_scroll_to_capture(scroll_offset: u16, captured_lines: usize, area_height: u16) -> u16 {
-    let visible = area_height.saturating_sub(1) as usize;
-    let real_max = captured_lines.saturating_sub(visible) as u16;
+///
+/// `visible_height` is the rendered output-body height the caller already
+/// computed (`PreviewLayout::compute(..).output.height`, shared via
+/// `preview_visible_rows`), NOT the raw pane height. Re-deriving it here with a
+/// fixed `- 1` would over-count the max offset by a row whenever the inner
+/// banner is hidden, leaving a phantom offset that stalls live-follow one row
+/// early.
+fn clamp_scroll_to_capture(
+    scroll_offset: u16,
+    captured_lines: usize,
+    visible_height: usize,
+) -> u16 {
+    let real_max = captured_lines.saturating_sub(visible_height) as u16;
     scroll_offset.min(real_max)
 }
 
@@ -97,6 +201,153 @@ fn spinner_idle_fresh(
         .current_frame()
 }
 
+/// Pick the structured view row icon for a session instance. Centralizes the
+/// archive/snooze override that kills the live spinner for sunk rows so the
+/// list reads as parked instead of "still alive." Exposed at crate visibility
+/// so tests can pin the override behavior without going through the full
+/// render pipeline.
+pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
+    let icon = match inst.status {
+        Status::Running => spinner_running(&inst.created_at),
+        Status::Waiting => spinner_waiting(&inst.created_at),
+        Status::Idle => ICON_IDLE,
+        Status::Unknown => ICON_UNKNOWN,
+        Status::Stopped => ICON_STOPPED,
+        Status::Error => ICON_ERROR,
+        Status::Starting => spinner_starting(&inst.created_at),
+        Status::Deleting => ICON_DELETING,
+        Status::Creating => spinner_starting(&inst.created_at),
+    };
+    if inst.is_archived() || inst.is_snoozed() {
+        ICON_STOPPED
+    } else {
+        icon
+    }
+}
+
+/// Compact display code for a profile name, used by the per-row profile tag
+/// in all-profiles view where the full name is too wide.
+///
+/// Hyphen/underscore-delimited names collapse to their segment initials
+/// (`forit-backup` becomes `fb`); single-segment names take their first three
+/// chars (`default` becomes `def`). Always lowercased, capped at four chars.
+/// The mapping is per-name and deterministic, so two profiles that collapse to
+/// the same code render identically; the full name still shows in a filtered
+/// view's list title and in the New/Restart dialogs.
+/// Per-row tag content plus the mode's max content width. The renderer
+/// right-pads `content` to `max_width` so the bracket span is fixed-width
+/// across rows (`[fb  ]` vs `[def ]`), keeping the activity column from
+/// reflowing as tag widths vary. `compute_row_tag` truncates each variant
+/// to the same cap it carries here, so `rendered()` never truncates.
+pub(crate) struct RowTag {
+    pub content: String,
+    pub max_width: usize,
+}
+
+impl RowTag {
+    pub fn rendered(&self) -> String {
+        format!("[{:<width$}]", self.content, width = self.max_width)
+    }
+}
+
+/// Compute the per-row tag for a given instance + mode, or `None` when the
+/// row should not render a tag in this context.
+///
+/// `Auto` only renders in all-profiles view (no `active_profile`). Other
+/// modes always render when their content is available (e.g. `Branch`
+/// returns `None` for sessions without a worktree).
+pub(crate) fn compute_row_tag(
+    inst: &crate::session::Instance,
+    mode: crate::session::config::RowTagMode,
+    in_all_profiles_view: bool,
+) -> Option<RowTag> {
+    use crate::session::config::RowTagMode;
+    match mode {
+        RowTagMode::None => None,
+        RowTagMode::Auto => {
+            if !in_all_profiles_view {
+                return None;
+            }
+            let code = profile_short_code(&inst.source_profile);
+            if code.is_empty() {
+                None
+            } else {
+                Some(RowTag {
+                    content: code,
+                    max_width: 4,
+                })
+            }
+        }
+        RowTagMode::Profile => {
+            let code = profile_short_code(&inst.source_profile);
+            if code.is_empty() {
+                None
+            } else {
+                Some(RowTag {
+                    content: code,
+                    max_width: 4,
+                })
+            }
+        }
+        RowTagMode::Sandbox => {
+            if inst.is_sandboxed() {
+                Some(RowTag {
+                    content: "sb".to_string(),
+                    max_width: 2,
+                })
+            } else {
+                None
+            }
+        }
+        RowTagMode::Branch => inst.worktree_info.as_ref().and_then(|w| {
+            // Complement the existing branch-on-divergence display
+            // (rendered in `theme.branch` color earlier in the row) rather
+            // than duplicate it. When `branch != title` the divergence
+            // display already shows the branch, so the tag would just be
+            // redundant. When `branch == title` the divergence display
+            // stays quiet and the tag fills in.
+            //
+            // Workspace sessions (multi-repo, rendered as
+            // `<branch> [N repos]`) are handled by a separate display
+            // path and have no `worktree_info`, so they fall through to
+            // `None` here naturally.
+            if w.branch != inst.title {
+                return None;
+            }
+            // Show the last `/`-segment of the branch (most informative
+            // for `feature/foo` style names), truncated to 8 chars so the
+            // tag stays narrow.
+            let last = w.branch.rsplit('/').next().unwrap_or("");
+            let trimmed: String = last.chars().take(8).collect();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(RowTag {
+                    content: trimmed,
+                    max_width: 8,
+                })
+            }
+        }),
+    }
+}
+
+pub(crate) fn profile_short_code(profile: &str) -> String {
+    let segments: Vec<&str> = profile
+        .split(['-', '_'])
+        .filter(|s| !s.is_empty())
+        .collect();
+    let code: String = match segments.as_slice() {
+        [] => String::new(),
+        [single] => single.chars().take(3).collect(),
+        many => many
+            .iter()
+            .filter_map(|s| s.chars().next())
+            .take(4)
+            .collect(),
+    };
+    code.to_lowercase()
+}
+
 /// Format a timestamp as a compact relative age (e.g. `3m`, `2h`, `4d`, `2mo`).
 /// Returns an empty string for `None` so callers can unconditionally substitute
 /// the result without guarding for absence.
@@ -128,8 +379,38 @@ fn format_relative_age(ts: Option<DateTime<Utc>>) -> String {
     format!("{}mo", months)
 }
 
-/// Width of the last-activity label slot itself: 5 chars for the value
-/// (e.g. `"<1m"`, `"30mo"`) + 1 char of left padding inside the slot.
+/// Format a remaining snooze duration as a compact countdown string that
+/// fits in the `LAST_ACTIVITY_SLOT` (e.g. `23m`, `1h`, `5d`). Falls back
+/// to `<1m` for sub-minute remainders so the user sees "about to wake"
+/// rather than an empty slot. Picker tops out at 1 week; validator cap
+/// is 30 days, so the day branch handles up to ~30d.
+fn format_snooze_remaining(delta: chrono::Duration) -> String {
+    let secs = delta.num_seconds();
+    if secs < 60 {
+        return "<1m".to_string();
+    }
+    let mins = secs / 60;
+    if mins < 60 {
+        return format!("{}m", mins);
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{}h", hours);
+    }
+    let days = hours / 24;
+    format!("{}d", days)
+}
+
+/// Minimum column width required to render the last-activity column.
+/// When the session list is narrower than this, the column is hidden entirely.
+/// Compared against `inner.width` (list pane minus 2-char border), so this is
+/// effectively `home_list_width - 2`. Keeping it at 30 lets the column appear
+/// for users who set `home_list_width` in the 35–45 range (the common narrow-
+/// pane setting) and for mobile clients with tight pane widths; the 6-char
+/// age slot plus ~24 chars for title/branch still fits comfortably.
+///
+/// Width reserved for the right-aligned last-activity column:
+/// 5 chars for the label (e.g. `"<1m"`, `"30mo"`) + 1 char left padding.
 const LAST_ACTIVITY_SLOT: usize = 6;
 
 /// Trailing gap between the activity slot (or terminal-mode badge) and the
@@ -137,6 +418,19 @@ const LAST_ACTIVITY_SLOT: usize = 6;
 /// other ratatui widgets leave around the rounded border without burning
 /// horizontal budget on narrow panes.
 const LAST_ACTIVITY_RIGHT_MARGIN: usize = 1;
+
+const SELECTED_ROW_CONTRAST_RATIO: f32 = 3.0;
+
+fn selected_row_style(style: Style, theme: &Theme) -> Style {
+    let Some(fg) = style.fg else {
+        return style.fg(theme.text).bold();
+    };
+    if has_min_contrast(fg, theme.session_selection, SELECTED_ROW_CONTRAST_RATIO) {
+        style.bold()
+    } else {
+        style.fg(theme.text).bold()
+    }
+}
 
 /// Decide where the right-aligned activity column lives on a session row.
 ///
@@ -172,13 +466,16 @@ impl HomeView {
         theme: &Theme,
         update_info: Option<&UpdateInfo>,
         update_status: Option<&str>,
+        image_update: Option<&ImageUpdate>,
     ) {
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
             settings.render(frame, area, theme);
             // Render unsaved changes confirmation dialog over settings
             if self.settings_close_confirm {
-                if let Some(dialog) = &self.confirm_dialog {
+                if let Some(dialog) = &mut self.confirm_dialog {
                     dialog.render(frame, area, theme);
                 }
             }
@@ -188,11 +485,19 @@ impl HomeView {
         // Diff view takes over the whole screen
         if self.diff_view.is_some() {
             self.preview_area = Rect::default();
+            self.preview_pane_area = Rect::default();
+            self.preview_outer_area = Rect::default();
             self.diff_area = self.active_diff_area(area);
         }
         if let Some(ref mut diff) = self.diff_view {
             // Compute diff for selected file if not cached
             let _ = diff.get_current_diff();
+
+            // No list/preview divider exists while the diff takeover owns
+            // the screen; clear it so a stale value from the previous frame
+            // can't hit-test as draggable.
+            self.divider_col = None;
+            self.main_area_width = 0;
 
             diff.render(frame, area, theme);
             return;
@@ -201,6 +506,8 @@ impl HomeView {
         // Serve view takes over the whole screen
         #[cfg(feature = "serve")]
         if let Some(ref serve) = self.serve_view {
+            self.divider_col = None;
+            self.main_area_width = 0;
             serve.render(frame, area, theme);
             return;
         }
@@ -210,7 +517,8 @@ impl HomeView {
         // (update_info) and transient toasts (update_status); we need a row
         // for it whenever either is present, otherwise toasts fired without
         // a pending update would never reach the screen.
-        let has_update_bar = update_info.is_some() || update_status.is_some();
+        let has_update_bar =
+            update_info.is_some() || update_status.is_some() || image_update.is_some();
         let constraints = if has_update_bar {
             vec![
                 Constraint::Min(0),
@@ -230,7 +538,22 @@ impl HomeView {
         // ~45 cols (with default list_width 35), too cramped for output;
         // stacking gives the preview the full width.
         let available_width = main_chunks[0].width;
-        if available_width < responsive::STACKED_BREAKPOINT {
+        self.main_area_width = available_width;
+        // Collapsed sidebar (live mode only): hand the whole main area to
+        // the preview so the agent pane fills the terminal. The live-send
+        // resize loop then reflows the agent to the wider geometry. Reset
+        // on live-send exit, so the list always returns in the home view.
+        if self.live_send.is_some() && self.sidebar_collapsed {
+            self.divider_col = None;
+            // render_list is skipped, so its hit-test rects would otherwise
+            // keep last frame's values and a click in the now-preview area
+            // could resolve to an invisible list row (and switch the live
+            // target). Zero them so mouse hit-testing can't target the
+            // hidden sidebar.
+            self.list_area = Rect::default();
+            self.list_inner_area = Rect::default();
+            self.render_preview(frame, main_chunks[0], theme);
+        } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = main_chunks[0].height;
             let list_height = responsive::stacked_list_height(main_height);
             let chunks = Layout::default()
@@ -240,6 +563,10 @@ impl HomeView {
                     Constraint::Min(responsive::STACKED_PREVIEW_MIN),
                 ])
                 .split(main_chunks[0]);
+
+            // Stacked layout has no vertical divider; only the side-by-side
+            // path exposes the resize-by-drag affordance.
+            self.divider_col = None;
 
             self.render_list(frame, chunks[0], theme);
             self.render_preview(frame, chunks[1], theme);
@@ -258,18 +585,43 @@ impl HomeView {
                 ])
                 .split(main_chunks[0]);
 
+            // Layout chunks are contiguous, so chunks[1].x is the first
+            // column of the preview block, i.e. the visible left border
+            // that the user perceives as the divider. Hit-test uses the
+            // list's y-range (matches preview's y-range in side-by-side).
+            self.divider_col = Some(chunks[1].x);
+
             self.render_list(frame, chunks[0], theme);
             self.render_preview(frame, chunks[1], theme);
         }
         self.render_status_bar(frame, main_chunks[1], theme);
 
         if has_update_bar {
-            self.render_update_bar(frame, main_chunks[2], theme, update_info, update_status);
+            self.render_update_bar(
+                frame,
+                main_chunks[2],
+                theme,
+                update_info,
+                update_status,
+                image_update,
+            );
         }
 
         // Render dialogs on top
         if self.show_help {
-            HelpOverlay::render(frame, area, theme, self.sort_order, self.strict_hotkeys);
+            let live_on_enter = self.help_live_on_enter().unwrap_or(matches!(
+                self.profile_default_attach_mode,
+                crate::session::NewSessionAttachMode::LiveSend
+            ));
+            HelpOverlay::render(
+                frame,
+                area,
+                theme,
+                self.sort_order,
+                self.strict_hotkeys,
+                live_on_enter,
+                &mut self.help_scroll,
+            );
         }
 
         // Each Option<Dialog> field on HomeView gets the same render dispatch:
@@ -277,10 +629,15 @@ impl HomeView {
         // the list of active dialog types in one place — adding a new dialog
         // means adding one line here, not stamping out another five-line
         // if-let block.
+        // `&mut self.$field` so dialogs whose `render` captures screen
+        // rects on the struct (currently `unified_delete_dialog` for
+        // clickable Yes/No buttons) can mutate self. Dialogs with
+        // `&self` render methods still work; Rust auto-derefs the
+        // mutable borrow.
         macro_rules! render_dialogs {
             ($($field:ident),* $(,)?) => {
                 $(
-                    if let Some(dialog) = &self.$field {
+                    if let Some(dialog) = &mut self.$field {
                         dialog.render(frame, area, theme);
                     }
                 )*
@@ -293,17 +650,30 @@ impl HomeView {
             unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
+            worktree_name_dialog,
+            restart_dialog,
             hooks_install_dialog,
-            hook_trust_dialog,
-            welcome_dialog,
+            volume_ignores_glob_dialog,
+            repo_trust_dialog,
+            intro_dialog,
             no_agents_dialog,
             changelog_dialog,
+            telemetry_consent_dialog,
             info_dialog,
+            snooze_duration_dialog,
             profile_picker_dialog,
+            group_picker_dialog,
+            sort_picker_dialog,
+            project_session_picker_dialog,
             projects_dialog,
             command_palette,
+            tool_picker_dialog,
             send_message_dialog,
             update_confirm_dialog,
+            // context_menu renders last so its small popup sits on top of
+            // any underlying dialog (e.g. an info dialog opened by a
+            // gated rename/delete attempt).
+            context_menu,
         );
     }
 
@@ -336,38 +706,53 @@ impl HomeView {
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let group_suffix = if self.group_by == GroupByMode::Project {
-            " (by project)"
-        } else {
-            ""
-        };
-        let title = match self.view_mode {
-            ViewMode::Agent => format!(" aoe [{}]{} ", self.active_profile_display(), group_suffix),
-            ViewMode::Terminal => format!(
-                " Terminals [{}]{} ",
-                self.active_profile_display(),
-                group_suffix
+        self.list_area = area;
+        let profile = self.active_profile_display();
+        let title = match &self.view_mode {
+            ViewMode::Structured => {
+                compose_list_title("aoe", profile, self.group_by, self.sort_order)
+            }
+            ViewMode::Terminal => {
+                compose_list_title("Terminals", profile, self.group_by, self.sort_order)
+            }
+            ViewMode::Tool(name) => compose_list_title(
+                &format!("Tool: {}", name),
+                profile,
+                self.group_by,
+                self.sort_order,
             ),
-            ViewMode::Archive => format!(
-                " Archive [{}]{} ",
-                self.active_profile_display(),
-                group_suffix
-            ),
+            ViewMode::Archive => {
+                compose_list_title("Archive", profile, self.group_by, self.sort_order)
+            }
         };
         let (border_color, title_color) = match self.view_mode {
-            ViewMode::Agent => (theme.border, theme.title),
-            ViewMode::Terminal => (theme.terminal_border, theme.terminal_border),
+            ViewMode::Structured => (theme.border, theme.title),
+            ViewMode::Terminal | ViewMode::Tool(_) => {
+                (theme.terminal_border, theme.terminal_border)
+            }
             ViewMode::Archive => (theme.border, theme.dimmed),
         };
+        // Current sort indicator on the bottom-right of the list block. Uses
+        // ratatui's `title_bottom` so it renders on the existing border and
+        // never intersects row content.
+        let sort_indicator = format!(" sort: {} ", self.sort_order.label());
         let block = Block::default()
             .borders(Borders::TOP | Borders::LEFT | Borders::BOTTOM)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color))
             .title(title)
             .title_style(Style::default().fg(title_color).bold())
+            .title_bottom(
+                Line::from(Span::styled(
+                    sort_indicator,
+                    Style::default().fg(theme.dimmed),
+                ))
+                .right_aligned(),
+            )
             .padding(Padding::horizontal(1));
 
         let inner = block.inner(area);
+        self.list_inner_area = inner;
         frame.render_widget(block, area);
 
         let visible_count = if self.view_mode == ViewMode::Archive {
@@ -417,6 +802,7 @@ impl HomeView {
             )));
         }
 
+        let hover_idx = self.hovered_index();
         for (i, item) in self
             .flat_items
             .iter()
@@ -426,16 +812,24 @@ impl HomeView {
         {
             let abs_idx = i + scroll.scroll_offset;
             let is_selected = abs_idx == self.cursor;
+            let is_hovered = !is_selected && Some(abs_idx) == hover_idx;
             let is_match =
                 !self.search_matches.is_empty() && self.search_matches.contains(&abs_idx);
             let mut line = self.render_item_line(item, is_selected, is_match, theme, inner.width);
-            if is_selected {
-                // Pad to full width so the selection background fills the entire row
+            // Selection wins over hover: when the mouse is over the
+            // already-selected row, keep the brighter selected bg rather
+            // than the dimmer hover bg.
+            if is_selected || is_hovered {
                 let pad = (inner.width as usize).saturating_sub(line.width());
                 if pad > 0 {
                     line.spans.push(Span::raw(" ".repeat(pad)));
                 }
-                line = line.style(Style::default().bg(theme.session_selection));
+                let bg = if is_selected {
+                    theme.session_selection
+                } else {
+                    theme.selection
+                };
+                line = line.style(Style::default().bg(bg));
             }
             lines.push(line);
         }
@@ -460,7 +854,7 @@ impl HomeView {
             };
 
             let value = self.search_query.value();
-            let cursor_pos = self.search_query.visual_cursor();
+            let cursor_pos = self.search_query.cursor();
             let cursor_style = Style::default().fg(theme.background).bg(theme.search);
             let text_style = Style::default().fg(theme.search);
 
@@ -494,10 +888,45 @@ impl HomeView {
             }
 
             frame.render_widget(Paragraph::new(Line::from(spans)), search_area);
+            if !self.has_overlay_above_search() {
+                set_prefixed_input_cursor_position(frame, search_area, "/", &self.search_query);
+            }
         }
     }
 
-    fn render_item_line(
+    fn has_overlay_above_search(&self) -> bool {
+        #[cfg(feature = "serve")]
+        let serve_open = self.serve_view.is_some();
+        #[cfg(not(feature = "serve"))]
+        let serve_open = false;
+
+        self.show_help
+            || self.new_dialog.is_some()
+            || self.confirm_dialog.is_some()
+            || self.unified_delete_dialog.is_some()
+            || self.group_delete_options_dialog.is_some()
+            || self.rename_dialog.is_some()
+            || self.worktree_name_dialog.is_some()
+            || self.repo_trust_dialog.is_some()
+            || self.hooks_install_dialog.is_some()
+            || self.volume_ignores_glob_dialog.is_some()
+            || self.intro_dialog.is_some()
+            || self.no_agents_dialog.is_some()
+            || self.changelog_dialog.is_some()
+            || self.telemetry_consent_dialog.is_some()
+            || self.info_dialog.is_some()
+            || self.profile_picker_dialog.is_some()
+            || self.group_picker_dialog.is_some()
+            || self.sort_picker_dialog.is_some()
+            || self.project_session_picker_dialog.is_some()
+            || self.projects_dialog.is_some()
+            || self.command_palette.is_some()
+            || self.send_message_dialog.is_some()
+            || self.update_confirm_dialog.is_some()
+            || serve_open
+    }
+
+    pub(super) fn render_item_line(
         &self,
         item: &Item,
         is_selected: bool,
@@ -507,13 +936,24 @@ impl HomeView {
     ) -> Line<'static> {
         let indent = get_indent(item.depth());
 
+        // Attention-mode-gated visuals. Favorite, snooze (decoration), and
+        // urgent only render when the user is in Attention sort, so the
+        // sidebar stays clean for users who don't run a high-volume
+        // triage workflow. Archive stays universal because it's a
+        // lifecycle action (the pane is killed), and its rows live in
+        // the dedicated bottom-pinned "Archived" section regardless of
+        // sort mode.
+        let in_attention = self.sort_order == SortOrder::Attention;
+
         use std::borrow::Cow;
 
         let (icon, text, style): (&str, Cow<str>, Style) = match item {
             Item::Group {
+                path,
                 name,
                 collapsed,
                 session_count,
+                archived_at,
                 ..
             } => {
                 let icon = if *collapsed {
@@ -521,14 +961,46 @@ impl HomeView {
                 } else {
                     ICON_EXPANDED
                 };
-                let text = Cow::Owned(format!("{} ({})", name, session_count));
-                let style = Style::default().fg(theme.group).bold();
+                // Mark pinned project headers with a trailing pin glyph so an
+                // empty (sessionless) pinned project still reads as deliberate
+                // rather than stale. Project view only; the registry lookup is
+                // keyed by the header label.
+                let pinned = self.group_by == GroupByMode::Project
+                    && !crate::session::is_within_archived_section(path)
+                    && self.is_project_label_pinned(name);
+                let text = if pinned {
+                    Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
+                } else {
+                    Cow::Owned(format!("{} ({})", name, session_count))
+                };
+                let mut style = Style::default().fg(theme.group).bold();
+                if crate::session::is_within_archived_section(path) {
+                    // Synthetic Archived section header (and any
+                    // project sub-folder rendered under it in Project
+                    // mode): muted + italic + dim so it reads as a
+                    // divider rather than a user-created group. The
+                    // contained rows aren't decorated individually;
+                    // the section header is the sole visual signal
+                    // that those sessions are shelved. Matches the
+                    // modifier set used for archived user groups so
+                    // terminals with weak dimmed-fg rendering still
+                    // surface the parked affordance.
+                    style = Style::default()
+                        .fg(theme.dimmed)
+                        .add_modifier(ratatui::style::Modifier::ITALIC)
+                        .add_modifier(ratatui::style::Modifier::DIM);
+                } else if archived_at.is_some() {
+                    // Archived user groups: italic + dim, still visible.
+                    style = style
+                        .add_modifier(ratatui::style::Modifier::ITALIC)
+                        .add_modifier(ratatui::style::Modifier::DIM);
+                }
                 (icon, text, style)
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_display_instance(id) {
                     match self.view_mode {
-                        ViewMode::Agent => {
+                        ViewMode::Structured => {
                             // For Idle sessions, decay color from `fresh_idle`
                             // toward `idle` over `idle_decay_window`. A slow
                             // `breathe` rattle replaces the static braille
@@ -537,10 +1009,15 @@ impl HomeView {
                             // attention-worthy states (Running, Waiting,
                             // Starting). Also serves as a redundant cue for
                             // colorblind users / monochrome terminals.
+                            //
+                            // Archive/snooze then overrides the live spinner.
+                            // A shelved session's underlying status is noise;
+                            // an animated row reads as "still alive" and pulls
+                            // the eye away from real attention items.
                             let idle_age = inst.idle_age();
                             let is_fresh_idle =
                                 matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                            let icon = match inst.status {
+                            let mut icon = match inst.status {
                                 Status::Running => spinner_running(&inst.created_at),
                                 Status::Waiting => spinner_waiting(&inst.created_at),
                                 Status::Idle if is_fresh_idle => {
@@ -567,8 +1044,64 @@ impl HomeView {
                                 Status::Deleting => theme.waiting,
                                 Status::Creating => theme.accent,
                             };
-                            let style = Style::default().fg(color);
-                            (icon, Cow::Owned(inst.title.clone()), style)
+                            let mut style = Style::default().fg(color);
+                            if inst.is_archived() {
+                                // Archived rows render with one uniform
+                                // muted glyph regardless of underlying
+                                // status. The pane is dead, so painting
+                                // the persisted Running/Waiting status
+                                // would be misleading. The Archived
+                                // section header is the sole textual
+                                // cue, so no italic/dim modifier is
+                                // applied here; just a dim color.
+                                icon = agent_row_icon(inst);
+                                style = Style::default().fg(theme.dimmed);
+                            } else if in_attention && inst.is_snoozed() {
+                                // Snooze decoration is Attention-only.
+                                // Outside Attention the row paints its
+                                // real status (the timer keeps running;
+                                // the visual treatment just doesn't
+                                // surface).
+                                icon = agent_row_icon(inst);
+                                style = Style::default()
+                                    .fg(theme.dimmed)
+                                    .add_modifier(ratatui::style::Modifier::ITALIC)
+                                    .add_modifier(ratatui::style::Modifier::DIM);
+                            } else if in_attention && inst.is_urgent() {
+                                // Urgent decoration is Attention-only.
+                                // The flag still persists in non-
+                                // Attention modes, but the cross-tier
+                                // promoter visual only makes sense when
+                                // tier ordering is in effect.
+                                style = Style::default()
+                                    .fg(theme.error)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
+                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
+                            } else if in_attention && inst.is_favorited() {
+                                // Favorite decoration is Attention-only,
+                                // since favorites are within-tier pins.
+                                style = style
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
+                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
+                            }
+                            // Prefix priority: archive (no prefix) wins
+                            // over snooze (`z `) wins over urgent (`! `)
+                            // wins over favorite (`* `). All three
+                            // prefixes are Attention-mode-only so users
+                            // in Newest / AZ / etc. don't see decoration
+                            // for state they didn't opt into managing.
+                            let title_text = if inst.is_archived() {
+                                Cow::Owned(inst.title.clone())
+                            } else if in_attention && inst.is_snoozed() {
+                                Cow::Owned(format!("z {}", inst.title))
+                            } else if in_attention && inst.is_urgent() {
+                                Cow::Owned(format!("! {}", inst.title))
+                            } else if in_attention && inst.is_favorited() {
+                                Cow::Owned(format!("* {}", inst.title))
+                            } else {
+                                Cow::Owned(inst.title.clone())
+                            };
+                            (icon, title_text, style)
                         }
                         ViewMode::Terminal => {
                             // For sandboxed sessions, check the appropriate terminal based on mode
@@ -587,7 +1120,54 @@ impl HomeView {
                                     .map(|s| s.exists())
                                     .unwrap_or(false),
                             };
-                            let (icon, color) = if terminal_running {
+                            let (mut icon, color) = if terminal_running {
+                                (spinner_running(&inst.created_at), theme.terminal_active)
+                            } else {
+                                (ICON_IDLE, theme.dimmed)
+                            };
+                            let mut style = Style::default().fg(color);
+                            if inst.is_archived() {
+                                // Archive lifecycle override mirrors the
+                                // Agent-view path: dim color, stopped
+                                // icon, no italic/dim modifier; the
+                                // Archived section header is the cue.
+                                icon = ICON_STOPPED;
+                                style = Style::default().fg(theme.dimmed);
+                            } else if in_attention && inst.is_snoozed() {
+                                icon = ICON_STOPPED;
+                                style = Style::default()
+                                    .fg(theme.dimmed)
+                                    .add_modifier(ratatui::style::Modifier::ITALIC)
+                                    .add_modifier(ratatui::style::Modifier::DIM);
+                            } else if in_attention && inst.is_urgent() {
+                                style = Style::default()
+                                    .fg(theme.error)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
+                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
+                            } else if in_attention && inst.is_favorited() {
+                                style = style
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
+                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
+                            }
+                            let title_text = if inst.is_archived() {
+                                Cow::Owned(inst.title.clone())
+                            } else if in_attention && inst.is_snoozed() {
+                                Cow::Owned(format!("z {}", inst.title))
+                            } else if in_attention && inst.is_urgent() {
+                                Cow::Owned(format!("! {}", inst.title))
+                            } else if in_attention && inst.is_favorited() {
+                                Cow::Owned(format!("* {}", inst.title))
+                            } else {
+                                Cow::Owned(inst.title.clone())
+                            };
+                            (icon, title_text, style)
+                        }
+                        ViewMode::Tool(ref tool_name) => {
+                            let tool_session =
+                                crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
+                            let tool_running =
+                                tool_session.exists() && !tool_session.is_pane_dead();
+                            let (icon, color) = if tool_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
@@ -620,42 +1200,65 @@ impl HomeView {
         line_spans.push(Span::styled(format!("{} ", icon), icon_style));
         line_spans.push(Span::styled(
             text.into_owned(),
-            if is_selected { style.bold() } else { style },
+            if is_selected {
+                selected_row_style(style, theme)
+            } else {
+                style
+            },
         ));
 
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_display_instance(id) {
                 if let Some(ws_info) = &inst.workspace_info {
-                    let suffix = if self.show_branch_in_tui {
-                        inst.display_branch
-                            .as_ref()
-                            .map(|branch| format!("  {} [{} repos]", branch, ws_info.repos.len()))
-                            .unwrap_or_else(|| format!("  [{} repos]", ws_info.repos.len()))
-                    } else {
-                        format!("  [{} repos]", ws_info.repos.len())
-                    };
-                    let suffix_color = if self.show_branch_in_tui && inst.display_branch.is_some() {
-                        theme.branch
-                    } else {
-                        theme.dimmed
-                    };
-                    line_spans.push(Span::styled(suffix, Style::default().fg(suffix_color)));
-                } else if self.show_branch_in_tui {
-                    if let Some(branch) = &inst.display_branch {
+                    let branch_style = Style::default().fg(theme.branch);
+                    line_spans.push(Span::styled(
+                        format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
+                        if is_selected {
+                            selected_row_style(branch_style, theme)
+                        } else {
+                            branch_style
+                        },
+                    ));
+                } else if let Some(wt_info) = &inst.worktree_info {
+                    if wt_info.branch != inst.title {
+                        let branch_style = Style::default().fg(theme.branch);
                         line_spans.push(Span::styled(
-                            format!("  {}", branch),
-                            Style::default().fg(theme.branch),
+                            format!("  {}", wt_info.branch),
+                            if is_selected {
+                                selected_row_style(branch_style, theme)
+                            } else {
+                                branch_style
+                            },
                         ));
                     }
                 }
 
+                // Per-row tag. The mode is config-driven (see
+                // `SessionConfig.row_tag` and the Settings UI "Row Tag"
+                // field). Default is `None` so existing users see no
+                // tag; power users opt in for `Auto` (profile in all-
+                // profiles view), `Profile`, `Sandbox`, or `Branch`.
+                // Counted into `used_width` below so the activity
+                // column still right-aligns past the tag.
+                if let Some(tag) =
+                    compute_row_tag(inst, self.row_tag_mode, self.active_profile.is_none())
+                {
+                    let tag_style = Style::default().fg(theme.dimmed);
+                    line_spans.push(Span::styled(
+                        format!("  {}", tag.rendered()),
+                        if is_selected {
+                            selected_row_style(tag_style, theme)
+                        } else {
+                            tag_style
+                        },
+                    ));
+                }
+
                 // Right edge of the row: optional terminal-mode badge, and
                 // an activity column (last-accessed for non-Idle rows,
-                // time-since-stop for Idle rows). Both pin to the pane's
-                // right edge so the column lines up vertically across the
-                // session list — without right-alignment each row would
-                // place its column at a different x depending on title
-                // length, which reads as visually noisy.
+                // time-since-stop for Idle rows, snooze remainder for
+                // snoozed rows). Both pin to the pane's right edge so the
+                // column lines up vertically across the session list.
                 //
                 // Decision is per-row: show the column only if the prefix
                 // (indent + icon + title + branch info) plus the column
@@ -669,31 +1272,29 @@ impl HomeView {
                 // `last_accessed_at`. The latter is bumped by user
                 // interaction (attach, send-keys), which would lie about
                 // how long it's actually been since the agent stopped.
-                // Color tracks the fresh/decayed binary used by the icon so
-                // the readout fades in step.
-                // Cockpit-mode sessions are web-only (the TUI has no
+                //
+                // Acp-mode sessions are web-only (the TUI has no
                 // structured rendering surface). Surface this with a
                 // [web] badge so the user knows pressing Enter will
                 // open an info dialog instead of attaching to a tmux
                 // pane that doesn't exist. Takes precedence over the
-                // existing container/host badge in Agent view; the
+                // existing container/host badge in Structured view; the
                 // Terminal view keeps its existing badging because
                 // the host terminal still works against the worktree.
-                let badge_text: Option<&'static str> = if self.view_mode == ViewMode::Archive {
-                    Some(" [archived]")
-                } else if inst.is_cockpit_mode() && self.view_mode != ViewMode::Terminal {
-                    // Renamed from `[web]` now that the TUI renders
-                    // cockpit sessions natively; `[cockpit]` better
-                    // describes the substrate the badge marks.
-                    Some(" [cockpit]")
-                } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
-                    Some(match self.get_terminal_mode(id) {
-                        TerminalMode::Container => " [container]",
-                        TerminalMode::Host => " [host]",
-                    })
-                } else {
-                    None
-                };
+                let badge_text: Option<&'static str> =
+                    if inst.is_structured() && self.view_mode != ViewMode::Terminal {
+                        // Renamed from `[web]` now that the TUI renders
+                        // structured-view sessions natively; `[structured]`
+                        // better describes the view the badge marks.
+                        Some(" [structured]")
+                    } else if self.view_mode == ViewMode::Terminal && inst.is_sandboxed() {
+                        Some(match self.get_terminal_mode(id) {
+                            TerminalMode::Container => " [container]",
+                            TerminalMode::Host => " [host]",
+                        })
+                    } else {
+                        None
+                    };
                 let badge_width = badge_text.map_or(0, |s| s.len());
 
                 let used_width: usize = line_spans.iter().map(|s| s.width()).sum();
@@ -703,36 +1304,57 @@ impl HomeView {
                     if pad_len > 0 {
                         line_spans.push(Span::raw(" ".repeat(pad_len)));
                     }
+                    // In Attention mode, snoozed rows show remaining sleep
+                    // time ("23m" / "1h"). Outside Attention mode, snooze
+                    // is invisible (the timer still ticks; we just don't
+                    // surface it) so the column falls through to the
+                    // normal age path.
                     // Idle rows show time-since-stop (`idle_entered_at`)
                     // since `last_accessed_at` would lie after attach/send.
                     // Fall back to `last_accessed_at` when `idle_entered_at`
-                    // is missing — sessions that were Idle before this
-                    // field existed (or that haven't transitioned since
-                    // upgrade) shouldn't render a blank column. The
-                    // fallback timestamp is approximate but better than no
-                    // signal at all. Color stays `theme.dimmed` for every
-                    // status — the icon already carries the urgency
-                    // signal, so a colored timestamp would just add noise.
-                    let age_ts = if inst.status == Status::Idle {
-                        inst.idle_entered_at.or(inst.last_accessed_at)
+                    // is missing.
+                    let snooze_remaining = if in_attention {
+                        inst.snooze_remaining()
                     } else {
-                        inst.last_accessed_at
+                        None
                     };
-                    let age = format_relative_age(age_ts);
+                    let age = if let Some(remaining) = snooze_remaining {
+                        format_snooze_remaining(remaining)
+                    } else {
+                        let age_ts = if inst.status == Status::Idle {
+                            inst.idle_entered_at.or(inst.last_accessed_at)
+                        } else {
+                            inst.last_accessed_at
+                        };
+                        format_relative_age(age_ts)
+                    };
                     let padded = format!("{:>width$}", age, width = LAST_ACTIVITY_SLOT);
-                    line_spans.push(Span::styled(padded, Style::default().fg(theme.dimmed)));
+                    let activity_style = Style::default().fg(theme.dimmed);
+                    line_spans.push(Span::styled(
+                        padded,
+                        if is_selected {
+                            selected_row_style(activity_style, theme)
+                        } else {
+                            activity_style
+                        },
+                    ));
                 }
 
                 if let Some(badge) = badge_text {
-                    let badge_color = if self.view_mode == ViewMode::Archive {
-                        theme.dimmed
-                    } else {
-                        theme.sandbox
-                    };
-                    line_spans.push(Span::styled(badge, Style::default().fg(badge_color)));
+                    let badge_style = Style::default().fg(theme.sandbox);
+                    line_spans.push(Span::styled(
+                        badge,
+                        if is_selected {
+                            selected_row_style(badge_style, theme)
+                        } else {
+                            badge_style
+                        },
+                    ));
                 }
                 if column_fits {
-                    line_spans.push(Span::raw(" ".repeat(LAST_ACTIVITY_RIGHT_MARGIN)));
+                    let trailing_margin: String =
+                        std::iter::repeat_n(' ', LAST_ACTIVITY_RIGHT_MARGIN).collect();
+                    line_spans.push(Span::raw(trailing_margin));
                 }
             }
         }
@@ -741,148 +1363,468 @@ impl HomeView {
     }
 
     /// Refresh preview cache if needed (session changed, dimensions changed, or timer expired)
-    fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        const PREVIEW_REFRESH_MS: u128 = 250; // Refresh preview 4x/second max
-
-        let scroll_offset = self.preview_scroll_offset;
-        let session_changed = match &self.selected_session {
-            Some(id) => self.preview_cache.session_id.as_ref() != Some(id),
-            None => false,
-        };
-        let dims_changed = self.preview_cache.dimensions != (width, height);
-        let timer_expired =
-            self.preview_cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS;
-        // Only re-capture for scroll when the cached window can no longer
-        // cover the requested offset. Wheel ticks inside the BUFFER headroom
-        // re-render from the existing content without forking tmux.
-        let scroll_exceeds =
-            scroll_exceeds_cache(self.preview_cache.captured_lines, height, scroll_offset);
-
-        let needs_refresh = self.selected_session.is_some()
-            && (session_changed || dims_changed || timer_expired || scroll_exceeds);
-
-        if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let content = inst
-                        .capture_output_with_size(capture_lines, width, height)
-                        .unwrap_or_default();
-                    self.preview_cache.captured_lines = content.lines().count();
-                    self.preview_cache.content = content;
-                    self.preview_cache.session_id = Some(id.clone());
-                    self.preview_cache.dimensions = (width, height);
-                    self.preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.preview_cache.captured_lines,
-                        height,
-                    );
-                }
+    // pub(super) so unit tests in `super::tests` can exercise the
+    // cache-preservation behavior added with the kill-switch fix
+    // without standing up a full render pipeline.
+    /// Keep the live-send tmux pane sized to the preview's visible output area.
+    ///
+    /// No-op unless live-send is currently targeting `target`: without that gate,
+    /// viewing the Agent pane while live-on-Terminal would resize the *terminal*
+    /// pane (the worker is bound to it) to Agent-view dimensions, mis-fitting the
+    /// shell the user is typing into. Deduped against `live_send_last_resize`
+    /// (shared, since only one target is live at a time) so we only fire when the
+    /// user enters live mode or the preview pane is resized (terminal resize,
+    /// divider drag, layout flip). Each `refresh_*_cache_if_needed` calls this
+    /// with its own target so the three copies stay in lockstep.
+    fn resize_live_pane_if_target(
+        &mut self,
+        target: live_send::LiveSendTarget,
+        width: u16,
+        height: u16,
+    ) {
+        let targets_this_pane = self.live_send.as_ref().is_some_and(|s| s.target == target);
+        if !targets_this_pane || width == 0 || height == 0 {
+            return;
+        }
+        let next = (width, height);
+        if self.live_send_last_resize != Some(next) {
+            if let Some(worker) = &self.live_send_worker {
+                worker.resize(width, height);
             }
+            self.live_send_last_resize = Some(next);
         }
     }
 
-    /// Refresh terminal preview cache if needed (for host terminals)
-    fn refresh_terminal_preview_cache_if_needed(&mut self, width: u16, height: u16) {
+    /// Shared core for the four `refresh_*_preview_cache_if_needed` methods.
+    /// They all run the same needs-refresh gate (session id / dimensions /
+    /// scroll-exceeds / 250ms timer) and the same capture, cache-update, and
+    /// scroll-clamp body; they differ only in which cache field they target,
+    /// where the capture comes from, and whether live-send forces a refresh.
+    ///
+    /// `select` is called twice: once for the gate, once to write the result.
+    /// `capture` runs between those two borrows so it can take a shared `&self`
+    /// to reach `get_instance`. It returns `None` to leave the cache untouched:
+    /// the agent uses that for its live-send preserve-last-good kill switch
+    /// (#1501); the terminal/tool wrappers use it when the instance has gone
+    /// away, matching the original "only write inside `if let Some(inst)`".
+    ///
+    /// `force` bypasses the idle throttle; the agent passes `in_live` here so
+    /// every render refreshes the preview in live-send mode (see the throttle
+    /// note in `refresh_preview_cache_if_needed`), the others pass `false`.
+    fn refresh_preview_cache_core(
+        &mut self,
+        width: u16,
+        height: u16,
+        force: bool,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+        capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
+    ) {
         const PREVIEW_REFRESH_MS: u128 = 250;
-
+        let Some(id) = self.selected_session.clone() else {
+            return;
+        };
         let scroll_offset = self.preview_scroll_offset;
-        let needs_refresh = match &self.selected_session {
-            Some(id) => {
-                self.terminal_preview_cache.session_id.as_ref() != Some(id)
-                    || self.terminal_preview_cache.dimensions != (width, height)
-                    || scroll_exceeds_cache(
-                        self.terminal_preview_cache.captured_lines,
-                        height,
-                        scroll_offset,
-                    )
-                    || self
-                        .terminal_preview_cache
-                        .last_refresh
-                        .elapsed()
-                        .as_millis()
-                        > PREVIEW_REFRESH_MS
-            }
-            None => false,
+
+        let cache = select(self);
+        let needs_refresh = force
+            || cache.session_id.as_ref() != Some(&id)
+            || cache.dimensions != (width, height)
+            || scroll_exceeds_cache(cache.captured_lines, height, scroll_offset)
+            || cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS;
+        if !needs_refresh {
+            return;
+        }
+
+        let capture_lines = capture_lines_for(height, scroll_offset);
+        let Some(content) = capture(self, id.as_str(), capture_lines) else {
+            return;
         };
 
-        if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let content = inst
-                        .terminal_tmux_session()
-                        .and_then(|s| s.capture_pane(capture_lines))
-                        .unwrap_or_default();
-                    self.terminal_preview_cache.captured_lines = content.lines().count();
-                    self.terminal_preview_cache.content = content;
-                    self.terminal_preview_cache.session_id = Some(id.clone());
-                    self.terminal_preview_cache.dimensions = (width, height);
-                    self.terminal_preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.terminal_preview_cache.captured_lines,
-                        height,
-                    );
+        let captured_lines = select(self).store_capture(content, id, (width, height));
+
+        self.preview_scroll_offset = clamp_scroll_to_capture(
+            self.preview_scroll_offset,
+            captured_lines,
+            self.preview_visible_rows,
+        );
+    }
+
+    /// tmux session name backing the pane the preview currently shows, as a
+    /// function of the selected session and view mode (and, for Terminal,
+    /// the host/container sub-mode). `None` when nothing is selected. Drives
+    /// `sync_preview_capture_worker`.
+    pub(super) fn displayed_pane_tmux_name(&self) -> Option<String> {
+        let id = self.selected_session.as_ref()?;
+        let inst = self.get_instance(id)?;
+        let name = match &self.view_mode {
+            ViewMode::Structured => crate::tmux::Session::generate_name(&inst.id, &inst.title),
+            ViewMode::Terminal => {
+                let mode = if inst.is_sandboxed() {
+                    self.get_terminal_mode(id)
+                } else {
+                    TerminalMode::Host
+                };
+                match mode {
+                    TerminalMode::Host => {
+                        crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title)
+                    }
+                    TerminalMode::Container => {
+                        crate::tmux::ContainerTerminalSession::generate_name(&inst.id, &inst.title)
+                    }
+                }
+            }
+            ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
+                .session_name()
+                .to_string(),
+        };
+        Some(name)
+    }
+
+    /// Point the off-thread capture worker at `desired` (the displayed
+    /// pane's tmux session), then retune its cadence to live-send vs. idle.
+    /// One long-lived worker is spawned lazily on first use and retargeted
+    /// in place (no per-switch respawn); an empty target idles it. Cheap and
+    /// idempotent when the target is unchanged, so render calls it every
+    /// frame. This is what keeps the worker tracking whatever the user is
+    /// looking at instead of only the agent during live-send.
+    pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        // Don't spawn the worker until there's actually something to show.
+        if desired.is_none() && self.preview_capture_worker.is_none() {
+            self.preview_capture_target = None;
+            return;
+        }
+        if self.preview_capture_worker.is_none() {
+            self.preview_capture_worker = Some(live_send::LiveCaptureWorker::spawn(
+                self.preview_wake.clone(),
+            ));
+        }
+        if self.preview_capture_target != desired {
+            if let Some(worker) = self.preview_capture_worker.as_ref() {
+                worker.set_target(desired.clone().unwrap_or_default());
+            }
+            self.preview_capture_target = desired;
+        }
+        // Fast cadence only when the displayed pane IS the live-send target.
+        // Viewing the agent while live-send points at a terminal (or vice
+        // versa) leaves this preview a background view, so it stays on the
+        // idle interval instead of forking every 25ms.
+        let live = self
+            .live_send
+            .as_ref()
+            .is_some_and(|s| self.preview_capture_target.as_deref() == Some(s.tmux_name.as_str()));
+        // Terminal / container panes forward empty captures so a cleared
+        // shell drops its stale text; agent / tool panes preserve the
+        // last-good frame (the #1501 kill switch). The policy follows the
+        // displayed pane, not just the live-send target, so a backgrounded
+        // terminal preview clears the same way the live one does.
+        let forward_empty = matches!(self.view_mode, ViewMode::Terminal);
+        if let Some(worker) = self.preview_capture_worker.as_ref() {
+            worker.set_live(live);
+            worker.set_forward_empty(forward_empty);
+        }
+    }
+
+    /// If the capture worker has fresh content, store it into `select`'s
+    /// cache and report `true` so the caller skips the synchronous fork.
+    /// Returns `false` when the worker has nothing new (cold start, or an
+    /// idle/unchanged pane), leaving the caller's `refresh_preview_cache_core`
+    /// to populate the cache once via the fork gate. Steady state across
+    /// every view goes through here, so `tmux capture-pane` stays off the
+    /// render thread.
+    fn apply_worker_capture(
+        &mut self,
+        width: u16,
+        height: u16,
+        select: fn(&mut Self) -> &mut super::PreviewCache,
+    ) -> bool {
+        let Some(id) = self.selected_session.clone() else {
+            return false;
+        };
+        let scroll_offset = self.preview_scroll_offset;
+        let capture_lines = capture_lines_for(height, scroll_offset);
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            return false;
+        };
+        worker.set_capture_lines(capture_lines);
+        let Some(content) = worker.take_latest() else {
+            return false;
+        };
+        let captured_lines = select(self).store_capture(content, id, (width, height));
+        // `set_capture_lines` is async, so this frame may carry a capture
+        // produced under a smaller line budget (the user just scrolled back
+        // or the pane grew). If it doesn't cover the requested window, fall
+        // through so `refresh_preview_cache_core` does a one-off synchronous
+        // catch-up instead of clamping the offset against an undersized
+        // capture and snapping the preview toward the live edge.
+        if scroll_exceeds_cache(captured_lines, height, scroll_offset) {
+            return false;
+        }
+        self.preview_scroll_offset =
+            clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
+        true
+    }
+
+    pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
+        // The off-thread `LiveCaptureWorker` (retargeted to this pane by
+        // `sync_preview_capture_worker` in `render_preview`) keeps fresh
+        // content flowing on its own thread; `apply_worker_capture` below
+        // just applies the newest it has produced. The synchronous fork via
+        // `refresh_preview_cache_core` remains only as the cold-start /
+        // worker-empty fallback (its 250ms gate still applies there). This
+        // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
+        // frame; the `tui.render` `capture_us` trace measures it) off the
+        // render thread for every view, not just agent live-send.
+        let in_live = self.live_send.is_some();
+        // While in live-send mode, keep the agent's tmux pane sized to the
+        // preview's visible output area so it renders directly into view.
+        self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
+
+        // Outside live-send nothing keeps the agent's pane sized to the
+        // preview's output area. A full-screen agent is sized to whatever
+        // terminal it was last attached from (usually the full window), so it
+        // renders taller than the preview and the bottom-anchored capture
+        // clips the top rows; opening the info header shrinks the area and
+        // clips even more. Resize the detached pane to the output geometry so
+        // the preview is WYSIWYG. Deduped per (session, w, h) so the 250ms poll
+        // doesn't SIGWINCH-storm the agent; the dedup is invalidated on attach
+        // and on live enter/exit, where the real window size changes under us.
+        // Live-send owns its own resize through the worker above, so skip there.
+        if !in_live && width > 0 && height > 0 {
+            if let Some(id) = self.selected_session.clone() {
+                let want = (id, width, height);
+                if self.preview_pane_synced.as_ref() != Some(&want) {
+                    // Only record the dedup once the pane actually exists and was
+                    // resized. If a Stopped session we're viewing is started later
+                    // without an attach in this instance to clear the dedup (e.g.
+                    // a peer or the web structured view launches it), marking it synced now
+                    // would pin the preview to the pre-start size and keep clipping
+                    // until the next geometry change. Leaving it unset retries on
+                    // the next refresh; `exists()` is cache-backed, so the retry is
+                    // cheap.
+                    if let Some(session) = self
+                        .get_instance(&want.0)
+                        .and_then(|inst| inst.tmux_session().ok())
+                        .filter(|s| s.exists())
+                    {
+                        session.resize_window(width, height);
+                        self.preview_pane_synced = Some(want);
+                    }
                 }
             }
         }
+
+        // Apply the worker's latest capture if it has fresh content; that's
+        // the steady-state path and never forks. Only a cold start (worker
+        // just retargeted) or an idle/unchanged pane falls through to the
+        // synchronous fork below.
+        if self.apply_worker_capture(width, height, |s| &mut s.preview_cache) {
+            return;
+        }
+
+        // Cold-start / fallback capture via the fork-based path
+        // (`Session::capture_pane_with_size` via the instance helper). The
+        // 250ms gate in `refresh_preview_cache_core` keeps this from forking
+        // every frame; in steady state the worker above satisfies the render.
+        //
+        // Live vs. non-live failure semantics differ. In live mode an empty
+        // capture (which is what `Session::capture_pane_with_size` returns when
+        // the session is gone OR tmux had a transient hiccup) preserves the
+        // last-known-good capture so the preview doesn't flash blank (the
+        // kill-switch behavior introduced in #1501). The capture closure
+        // returns `None` for that case so the core leaves every cache field
+        // alone, including `session_id` and `dimensions`, which document
+        // "what's in `content`" and would lie if updated past a stale snapshot.
+        // Outside live mode the empty content surfaces as "No output
+        // available", the intended signal that the underlying session is gone.
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.preview_cache,
+            |s, id, capture_lines| {
+                let in_live = s
+                    .live_send
+                    .as_ref()
+                    .is_some_and(|st| st.target == live_send::LiveSendTarget::Agent);
+                // Only treat an empty fork capture as "preserve the existing
+                // cache" when the cache is FOR THIS SAME SESSION. If the user
+                // just switched live-send from session A to session B and B's
+                // first capture comes back empty, holding the kill-switch would
+                // leave A's content on screen under B's header. Cross-session we
+                // always overwrite, falling back to an empty body (the same
+                // "session looks gone" signal the non-live path uses).
+                let same_session = s.preview_cache.session_id.as_deref() == Some(id);
+                let fork_capture = s.get_instance(id).and_then(|inst| {
+                    inst.capture_output_with_size(capture_lines, width, height)
+                        .ok()
+                });
+                if in_live {
+                    match fork_capture {
+                        Some(content) if !content.is_empty() => Some(content),
+                        _ if same_session => None,
+                        _ => Some(String::new()),
+                    }
+                } else {
+                    Some(fork_capture.unwrap_or_default())
+                }
+            },
+        );
+    }
+
+    /// Refresh terminal preview cache if needed (for host terminals)
+    pub(super) fn refresh_terminal_preview_cache_if_needed(&mut self, width: u16, height: u16) {
+        // Symmetric with `refresh_preview_cache_if_needed`: when live-send
+        // is pointed at the host-terminal pane, keep its tmux pane sized to
+        // the visible output area so a window resize or info-header toggle
+        // reflows the shell instead of waiting for a live-mode re-enter.
+        self.resize_live_pane_if_target(live_send::LiveSendTarget::Terminal, width, height);
+        // Worker (retargeted to this pane in `render_preview`) drives the
+        // steady-state refresh fork-free; the core below is the cold-start /
+        // empty-worker fallback.
+        if self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache) {
+            return;
+        }
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.terminal_preview_cache,
+            |s, id, capture_lines| {
+                s.get_instance(id).map(|inst| {
+                    inst.terminal_tmux_session()
+                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .unwrap_or_default()
+                })
+            },
+        );
     }
 
     /// Refresh container terminal preview cache if needed
     fn refresh_container_terminal_preview_cache_if_needed(&mut self, width: u16, height: u16) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
+        // Symmetric with `refresh_preview_cache_if_needed`: when live-send
+        // is pointed at the in-container shell, keep its tmux pane sized to
+        // the visible output area so a window resize or info-header toggle
+        // reflows immediately.
+        self.resize_live_pane_if_target(
+            live_send::LiveSendTarget::ContainerTerminal,
+            width,
+            height,
+        );
+        if self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache) {
+            return;
+        }
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.container_terminal_preview_cache,
+            |s, id, capture_lines| {
+                s.get_instance(id).map(|inst| {
+                    inst.container_terminal_tmux_session()
+                        .and_then(|sess| sess.capture_pane(capture_lines))
+                        .unwrap_or_default()
+                })
+            },
+        );
+    }
 
-        let scroll_offset = self.preview_scroll_offset;
-        let needs_refresh = match &self.selected_session {
-            Some(id) => {
-                self.container_terminal_preview_cache.session_id.as_ref() != Some(id)
-                    || self.container_terminal_preview_cache.dimensions != (width, height)
-                    || scroll_exceeds_cache(
-                        self.container_terminal_preview_cache.captured_lines,
-                        height,
-                        scroll_offset,
-                    )
-                    || self
-                        .container_terminal_preview_cache
-                        .last_refresh
-                        .elapsed()
-                        .as_millis()
-                        > PREVIEW_REFRESH_MS
-            }
-            None => false,
+    fn refresh_tool_preview_cache_if_needed(&mut self, width: u16, height: u16, tool_name: &str) {
+        if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
+            return;
+        }
+        self.refresh_preview_cache_core(
+            width,
+            height,
+            false,
+            |s| &mut s.tool_preview_cache,
+            |s, id, capture_lines| {
+                s.get_instance(id).map(|inst| {
+                    crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
+                        .capture_pane(capture_lines)
+                        .unwrap_or_default()
+                })
+            },
+        );
+    }
+
+    /// `captured_lines` from whichever preview cache is currently on screen.
+    /// Both the preview's own scroll indicator and the live-send footer need
+    /// the active view's line count; reading `preview_cache` (the Agent cache)
+    /// unconditionally shows a stale or empty `[offset/max]` in Terminal or
+    /// Tool live mode, where a different cache backs the visible output.
+    /// Record the output pane's text layout for the drag-select handlers.
+    /// `total_lines` is the parsed scrollback length; `first_line` is
+    /// derived from the same `compute_scroll` the renderer feeds to
+    /// `Paragraph::scroll`, so the snapshot agrees cell-for-cell with what
+    /// was painted this frame.
+    fn set_preview_text_view(&mut self, pane: Rect, total_lines: usize) {
+        let first_line = preview::compute_scroll(
+            total_lines,
+            pane.height as usize,
+            self.preview_scroll_offset,
+        );
+        self.preview_text_view = crate::tui::home::PreviewTextView {
+            pane,
+            first_line: first_line as usize,
+            total_lines,
         };
+    }
 
-        if needs_refresh {
-            if let Some(id) = &self.selected_session {
-                if let Some(inst) = self.get_instance(id) {
-                    let capture_lines = capture_lines_for(height, scroll_offset);
-                    let content = inst
-                        .container_terminal_tmux_session()
-                        .and_then(|s| s.capture_pane(capture_lines))
-                        .unwrap_or_default();
-                    self.container_terminal_preview_cache.captured_lines = content.lines().count();
-                    self.container_terminal_preview_cache.content = content;
-                    self.container_terminal_preview_cache.session_id = Some(id.clone());
-                    self.container_terminal_preview_cache.dimensions = (width, height);
-                    self.container_terminal_preview_cache.last_refresh = Instant::now();
-                    self.preview_scroll_offset = clamp_scroll_to_capture(
-                        self.preview_scroll_offset,
-                        self.container_terminal_preview_cache.captured_lines,
-                        height,
-                    );
+    /// The preview cache backing whatever the pane currently shows,
+    /// resolving the sandbox container-vs-host split for Terminal view.
+    /// Shared by the scroll clamp, the scroll indicator, and the
+    /// drag-select copy so they all read the same content the renderer
+    /// painted.
+    pub(super) fn active_preview_cache(&self) -> &super::PreviewCache {
+        match &self.view_mode {
+            ViewMode::Structured => &self.preview_cache,
+            ViewMode::Tool(_) => &self.tool_preview_cache,
+            ViewMode::Terminal => {
+                let mode = self
+                    .selected_session
+                    .as_ref()
+                    .and_then(|id| self.get_instance(id).map(|inst| (id, inst)))
+                    .map(|(id, inst)| {
+                        if inst.is_sandboxed() {
+                            self.get_terminal_mode(id)
+                        } else {
+                            TerminalMode::Host
+                        }
+                    })
+                    .unwrap_or(TerminalMode::Host);
+                match mode {
+                    TerminalMode::Container => &self.container_terminal_preview_cache,
+                    TerminalMode::Host => &self.terminal_preview_cache,
                 }
             }
         }
+    }
+
+    fn active_captured_lines(&self) -> usize {
+        self.active_preview_cache().captured_lines
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
-            ViewMode::Agent => (theme.border, theme.title),
-            ViewMode::Terminal => (theme.terminal_border, theme.terminal_border),
-            ViewMode::Archive => (theme.border, theme.dimmed),
+            ViewMode::Structured => (theme.border, theme.title),
+            ViewMode::Terminal | ViewMode::Tool(_) => {
+                (theme.terminal_border, theme.terminal_border)
+            }
+        };
+        // Live-send mode swaps the preview border and title to `accent`
+        // so the pane visually matches the M-compose modal's border
+        // color. Without this affordance the only on-screen tell that
+        // keystrokes are being routed to the agent is the status
+        // banner; users have reported losing track when the banner
+        // scrolls off in compact layouts. Title is overridden too so
+        // the border and title color stay consistent when live mode is
+        // entered from Terminal/Tool views (where the underlying
+        // `title_color` is `terminal_border`, not `title`).
+        let (border_color, title_color) = if self.live_send.is_some() {
+            (theme.accent, theme.accent)
+        } else {
+            (border_color, title_color)
         };
 
         let mut block = Block::default()
@@ -901,23 +1843,31 @@ impl HomeView {
                     let idle_age = inst.idle_age();
                     let is_fresh_idle =
                         matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                    let (icon, icon_color) = match inst.status {
-                        Status::Running => (spinner_running(&inst.created_at), theme.running),
-                        Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
-                        Status::Idle if is_fresh_idle => (
-                            spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
-                            theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                        ),
-                        Status::Idle => (
-                            ICON_IDLE,
-                            theme.idle_color_at_age(idle_age, self.idle_decay_window),
-                        ),
-                        Status::Unknown => (ICON_UNKNOWN, theme.waiting),
-                        Status::Stopped => (ICON_STOPPED, theme.dimmed),
-                        Status::Error => (ICON_ERROR, theme.error),
-                        Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
-                        Status::Deleting => (ICON_DELETING, theme.waiting),
-                        Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
+                    // An archived row is parked; its preview body renders the
+                    // "Archived" placeholder. Force the compact title icon to
+                    // the stopped glyph so the hoisted title can't show a live
+                    // spinner from a stale (pre-poll) status and contradict it.
+                    let (icon, icon_color) = if inst.is_archived() {
+                        (ICON_STOPPED, theme.dimmed)
+                    } else {
+                        match inst.status {
+                            Status::Running => (spinner_running(&inst.created_at), theme.running),
+                            Status::Waiting => (spinner_waiting(&inst.created_at), theme.waiting),
+                            Status::Idle if is_fresh_idle => (
+                                spinner_idle_fresh(&inst.created_at, inst.idle_entered_at),
+                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
+                            ),
+                            Status::Idle => (
+                                ICON_IDLE,
+                                theme.idle_color_at_age(idle_age, self.idle_decay_window),
+                            ),
+                            Status::Unknown => (ICON_UNKNOWN, theme.waiting),
+                            Status::Stopped => (ICON_STOPPED, theme.dimmed),
+                            Status::Error => (ICON_ERROR, theme.error),
+                            Status::Starting => (spinner_starting(&inst.created_at), theme.dimmed),
+                            Status::Deleting => (ICON_DELETING, theme.waiting),
+                            Status::Creating => (spinner_starting(&inst.created_at), theme.accent),
+                        }
                     };
                     Line::from(vec![
                         Span::raw(" "),
@@ -934,23 +1884,139 @@ impl HomeView {
         if let Some(line) = compact_title {
             block = block.title(line);
         } else {
-            let title = match self.view_mode {
-                ViewMode::Agent => " Preview ",
-                ViewMode::Terminal => " Terminal Preview ",
-                ViewMode::Archive => " Archive Details ",
+            let title = match &self.view_mode {
+                ViewMode::Structured => " Preview ".to_string(),
+                ViewMode::Terminal => " Terminal Preview ".to_string(),
+                ViewMode::Tool(name) => format!(" {} Preview ", name),
             };
             block = block
                 .title(title)
                 .title_style(Style::default().fg(title_color));
+
+            // Advertise the info-header toggle. The `i` key toggles
+            // `show_preview_info`, which gates the info header in every
+            // view mode now (Agent uses the worktree-flavored header,
+            // Terminal/Tool use the minimal header in `render_terminal_preview`),
+            // so the hint applies everywhere except the compact branch
+            // above, where the outer title is already taken.
+            let key = if self.strict_hotkeys { "I" } else { "i" };
+            let hint_text = if self.show_preview_info {
+                format!(" hide info with {key} ")
+            } else {
+                format!(" show info with {key} ")
+            };
+            let hint_style = Style::default().fg(theme.dimmed).italic();
+
+            // When the info section is hidden, the inner ` Output ` /
+            // ` Terminal Output ` banner (which usually carries the
+            // scroll indicator) is also gone. Surface the indicator
+            // here so users still see how far back they've scrolled.
+            // With borders::ALL the inner is area - 2; with the banner
+            // hidden the output paragraph claims that full inner, so the
+            // visible height is `inner_height` (no extra row dropped). That
+            // equals `PreviewLayout::compute(..).output.height` for the
+            // hidden-header case, which is what the renderers paint into.
+            let scroll_indicator = if !self.show_preview_info {
+                let inner_height = area.height.saturating_sub(2);
+                let visible_height = inner_height as usize;
+                let captured_lines = self.active_captured_lines();
+                format_scroll_indicator(captured_lines, visible_height, self.preview_scroll_offset)
+            } else {
+                None
+            };
+
+            let mut hint_spans = vec![Span::styled(hint_text, hint_style)];
+            if let Some(ind) = scroll_indicator {
+                hint_spans.push(Span::styled(ind, hint_style));
+            }
+            block = block.title_top(Line::from(hint_spans).right_aligned());
         }
 
         let inner = block.inner(area);
         self.preview_area = inner;
+        // `area` is the OUTER preview rect (the block + borders + content).
+        // Stash it so `App::draw_preview_only` can call back into
+        // `render_preview` with the right rect on `%output` wakes; passing
+        // the inner there draws a nested block.
+        self.preview_outer_area = area;
         self.diff_area = Rect::default();
+        // The agent-pane sub-rect of `inner`: full inner when the info
+        // header is hidden or the layout is compact, otherwise inner
+        // shifted down past the info section. `Preview::render_with_cache`
+        // splits the same way internally, so this mirrors what the user
+        // actually sees and is what we size the tmux pane to in live mode.
+        // Default to `inner`; the Agent branch below refines it if it can
+        // resolve the selected instance.
+        self.preview_pane_area = inner;
+        // Track the rows the output body actually paints into, shared with the
+        // scroll clamp and the live banner so their math matches the renderer.
+        // Each view branch refines this after it resolves its real pane rect to
+        // exactly `pane_area.height` (see below); the seed here is only used by
+        // the no-output paths (creating / no selection).
+        self.preview_visible_rows = inner.height as usize;
+        // Seed the text-view snapshot inert; the output branches below
+        // refine it once they know their pane rect and parsed line count.
+        // Paths with no scrollback (creating / no selection) leave it here
+        // so a drag-select over them does nothing.
+        self.preview_text_view = crate::tui::home::PreviewTextView::default();
         frame.render_widget(block, area);
 
+        // An archived session's pane was killed on archive, so there's nothing
+        // live to capture. Short-circuit every view mode to a calm "Archived"
+        // placeholder instead of forking captures that come back empty and
+        // surface as "No output available".
+        let selected_archived = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_archived());
+
+        // A session whose pane is simply gone (killed, exited, server reboot)
+        // with no diagnostic detail carries the generic gone-error. Present
+        // that as a calm "Stopped" placeholder rather than the red crash error;
+        // a real crash leaves a specific message and still renders red. Covers
+        // the just-unarchived row, which sits Stopped until restarted.
+        //
+        // Only in Structured view: the gone-error is about the agent pane, but
+        // Tool / Terminal views show a different, independently-live pane (a tool
+        // session can be running while the agent has exited), so the placeholder
+        // must not hide that pane's output there.
+        let selected_stopped = !selected_archived
+            && matches!(self.view_mode, ViewMode::Structured)
+            && self
+                .selected_session
+                .as_ref()
+                .and_then(|id| self.get_instance(id))
+                .is_some_and(|inst| {
+                    inst.last_error.as_deref() == Some(crate::session::TMUX_SESSION_GONE_ERROR)
+                });
+
+        // Keep the off-thread capture worker pointed at whatever pane this
+        // view shows (and tuned to live-send vs. idle cadence) before any
+        // refresh reads from it. Done once here, not per-branch, so the
+        // creating / no-selection / archived / stopped paths also retarget or
+        // tear it down (no live pane feeds `None` so the worker stops capturing).
+        let desired = if selected_archived || selected_stopped {
+            None
+        } else {
+            self.displayed_pane_tmux_name()
+        };
+        self.sync_preview_capture_worker(desired);
+
+        if selected_archived {
+            self.render_archived_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_stopped {
+            self.render_stopped_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
         match self.view_mode {
-            ViewMode::Agent => {
+            ViewMode::Structured => {
                 // Check if selected session is being created (show hook progress)
                 let is_creating = self
                     .selected_session
@@ -961,8 +2027,47 @@ impl HomeView {
                 if is_creating {
                     self.render_creating_preview(frame, inner, theme);
                 } else {
-                    // Refresh cache before borrowing from instance_map to avoid borrow conflicts
-                    self.refresh_preview_cache_if_needed(inner.width, inner.height);
+                    // Size the tmux pane + cache to the SAME output rect the
+                    // renderer paints into, via the one `PreviewLayout::compute`
+                    // that `render_with_cache` also uses. `layout.output` already
+                    // accounts for the info header and the ` Output ` banner row
+                    // (or claims the full `inner` when the header is hidden /
+                    // compact), so `output.height` is the exact visible body. No
+                    // second banner subtraction here, no parallel split to drift.
+                    let pane_area = self
+                        .selected_session
+                        .as_ref()
+                        .and_then(|id| self.get_instance(id))
+                        .map(|inst| {
+                            preview::PreviewLayout::compute(
+                                inner,
+                                compact,
+                                self.show_preview_info,
+                                preview::agent_info_height(inst),
+                            )
+                            .output
+                        })
+                        .unwrap_or(inner);
+                    self.preview_pane_area = pane_area;
+                    self.preview_visible_rows = pane_area.height as usize;
+                    // Refresh the raw `content` cache, then ensure the
+                    // parsed `Text<'static>` cache reflects it. Doing
+                    // the parse here (under `&mut self.preview_cache`)
+                    // means subsequent shared borrows on
+                    // `parsed_text` and on `self.get_instance` can
+                    // coexist in the actual render call.
+                    let cap_start = Instant::now();
+                    self.refresh_preview_cache_if_needed(pane_area.width, pane_area.height);
+                    self.preview_timings.capture = cap_start.elapsed();
+                    let parse_start = Instant::now();
+                    self.preview_cache.ensure_parsed();
+                    self.preview_timings.parse = parse_start.elapsed();
+                    let total_lines = self
+                        .preview_cache
+                        .parsed_text
+                        .as_ref()
+                        .map_or(0, |t| t.lines.len());
+                    self.set_preview_text_view(pane_area, total_lines);
 
                     if let Some(id) = &self.selected_session {
                         if let Some(inst) = self.get_instance(id) {
@@ -970,12 +2075,12 @@ impl HomeView {
                                 frame,
                                 inner,
                                 inst,
-                                &self.preview_cache.content,
+                                CachedPreview::from_text(self.preview_cache.parsed_text.as_ref()),
                                 self.preview_scroll_offset,
                                 theme,
                                 self.idle_decay_window,
                                 compact,
-                                self.show_branch_in_tui,
+                                self.show_preview_info,
                             );
                         }
                     } else {
@@ -1002,38 +2107,81 @@ impl HomeView {
                         TerminalMode::Host
                     };
 
-                    // Refresh the appropriate cache before borrowing instance
+                    // Compute the output sub-rect symmetric with Agent
+                    // view: when the info header is visible we strip the
+                    // header rows + one banner row off `inner`, so the
+                    // tmux pane resizes match what the user actually
+                    // sees. Without this, live-send against a terminal
+                    // pane sizes tmux to `inner.height` while only
+                    // `inner.height - info_h - 1` rows are visible, and
+                    // the top of the shell output gets clipped on every
+                    // frame.
+                    // Same single-source split as the Agent branch: the tmux
+                    // pane is sized to `PreviewLayout::compute(..).output`, which
+                    // `render_terminal_preview` also paints into.
+                    let pane_area = self
+                        .get_instance(&id)
+                        .map(|inst| {
+                            preview::PreviewLayout::compute(
+                                inner,
+                                compact,
+                                self.show_preview_info,
+                                preview::terminal_info_height(inst),
+                            )
+                            .output
+                        })
+                        .unwrap_or(inner);
+                    self.preview_pane_area = pane_area;
+                    self.preview_visible_rows = pane_area.height as usize;
+
+                    // Refresh the appropriate cache, then warm the
+                    // matching `parsed_text` so the render call below
+                    // can read it via a shared borrow alongside
+                    // `get_instance`.
                     match terminal_mode {
                         TerminalMode::Container => {
                             self.refresh_container_terminal_preview_cache_if_needed(
-                                inner.width,
-                                inner.height,
+                                pane_area.width,
+                                pane_area.height,
                             );
+                            self.container_terminal_preview_cache.ensure_parsed();
                         }
                         TerminalMode::Host => {
                             self.refresh_terminal_preview_cache_if_needed(
-                                inner.width,
-                                inner.height,
+                                pane_area.width,
+                                pane_area.height,
                             );
+                            self.terminal_preview_cache.ensure_parsed();
                         }
                     }
+                    let total_lines = match terminal_mode {
+                        TerminalMode::Container => &self.container_terminal_preview_cache,
+                        TerminalMode::Host => &self.terminal_preview_cache,
+                    }
+                    .parsed_text
+                    .as_ref()
+                    .map_or(0, |t| t.lines.len());
+                    self.set_preview_text_view(pane_area, total_lines);
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
-                        let (terminal_running, preview_content) = match terminal_mode {
+                        let (terminal_running, preview_text) = match terminal_mode {
                             TerminalMode::Container => {
                                 let running = inst
                                     .container_terminal_tmux_session()
                                     .map(|s| s.exists())
                                     .unwrap_or(false);
-                                (running, &self.container_terminal_preview_cache.content)
+                                (
+                                    running,
+                                    self.container_terminal_preview_cache.parsed_text.as_ref(),
+                                )
                             }
                             TerminalMode::Host => {
                                 let running = inst
                                     .terminal_tmux_session()
                                     .map(|s| s.exists())
                                     .unwrap_or(false);
-                                (running, &self.terminal_preview_cache.content)
+                                (running, self.terminal_preview_cache.parsed_text.as_ref())
                             }
                         };
 
@@ -1042,10 +2190,11 @@ impl HomeView {
                             inner,
                             inst,
                             terminal_running,
-                            preview_content,
+                            CachedPreview::from_text(preview_text),
                             self.preview_scroll_offset,
                             theme,
                             compact,
+                            self.show_preview_info,
                         );
                     }
                 } else {
@@ -1122,6 +2271,169 @@ impl HomeView {
                         .style(Style::default().fg(theme.dimmed))
                         .alignment(Alignment::Center);
                     frame.render_widget(hint, inner);
+                }
+            }
+            ViewMode::Tool(ref tool_name) => {
+                let tool_name = tool_name.clone();
+                let selected_id = self.selected_session.clone();
+
+                if let Some(id) = selected_id {
+                    // Same single-source split as the Agent branch: the tmux
+                    // pane is sized to `PreviewLayout::compute(..).output`, which
+                    // `render_terminal_preview` also paints into.
+                    let pane_area = self
+                        .get_instance(&id)
+                        .map(|inst| {
+                            preview::PreviewLayout::compute(
+                                inner,
+                                compact,
+                                self.show_preview_info,
+                                preview::terminal_info_height(inst),
+                            )
+                            .output
+                        })
+                        .unwrap_or(inner);
+                    self.preview_pane_area = pane_area;
+                    self.preview_visible_rows = pane_area.height as usize;
+
+                    self.refresh_tool_preview_cache_if_needed(
+                        pane_area.width,
+                        pane_area.height,
+                        &tool_name,
+                    );
+                    self.tool_preview_cache.ensure_parsed();
+                    let total_lines = self
+                        .tool_preview_cache
+                        .parsed_text
+                        .as_ref()
+                        .map_or(0, |t| t.lines.len());
+                    self.set_preview_text_view(pane_area, total_lines);
+
+                    if let Some(inst) = self.get_instance(&id) {
+                        let tool_session =
+                            crate::tmux::ToolSession::new(&inst.id, &inst.title, &tool_name);
+                        let tool_running = tool_session.exists() && !tool_session.is_pane_dead();
+
+                        Preview::render_terminal_preview(
+                            frame,
+                            inner,
+                            inst,
+                            tool_running,
+                            CachedPreview::from_text(self.tool_preview_cache.parsed_text.as_ref()),
+                            self.preview_scroll_offset,
+                            theme,
+                            compact,
+                            self.show_preview_info,
+                        );
+                    }
+                } else {
+                    let hint = Paragraph::new("Select a session to preview tool")
+                        .style(Style::default().fg(theme.dimmed))
+                        .alignment(Alignment::Center);
+                    frame.render_widget(hint, inner);
+                }
+            }
+        }
+
+        // In live-send mode, place a real terminal cursor over the preview at
+        // the target pane's cursor cell. `capture-pane` carries only cell text
+        // (plus SGR color), not the cursor, so without this the
+        // "feels-attached" preview shows no cursor for programs that rely on
+        // the hardware cursor (shells, codex, anything using DECTCEM) even
+        // though a direct tmux attach would. Programs that paint their own
+        // caret into the cells (e.g. Claude Code's reverse-video block) hide
+        // the hardware cursor, so `cursor_flag` is 0 and this paints nothing
+        // over them, avoiding a double cursor.
+        if let Some(pos) = self.live_preview_cursor_pos() {
+            frame.set_cursor_position(pos);
+        }
+
+        // Selection highlight goes last so it sits on top of whatever
+        // the active ViewMode painted into the inner area. The handlers
+        // only populate `preview_selection` while a drag is live or a
+        // finalized highlight is showing, so this branch is a no-op
+        // otherwise.
+        self.paint_preview_selection(frame, theme);
+    }
+
+    /// Where to paint the live-send cursor this frame, or `None` to paint no
+    /// cursor. Maps the agent pane's `(cursor_x, cursor_y)` (counted from the
+    /// top of the visible screen) onto the preview's output rect.
+    ///
+    /// Only fires while live-send is active and the preview is at the live
+    /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
+    /// live cursor would land on the wrong row. The capture worker only
+    /// publishes a cursor when the displayed pane IS the live-send target, so
+    /// a `Some` here already means "this pane is the one being driven."
+    fn live_preview_cursor_pos(&self) -> Option<Position> {
+        if self.live_send.is_none() || self.preview_scroll_offset != 0 {
+            return None;
+        }
+        let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
+    }
+
+    /// Apply the drag-select highlight to cells inside the preview
+    /// pane. Style is reversed (bg/fg swap) for AA-friendly contrast
+    /// against arbitrary agent output, mirroring how most terminal
+    /// emulators render their own native selections.
+    ///
+    /// Walks the frame buffer rather than re-rendering, so the
+    /// underlying preview pane keeps its existing styles (colored
+    /// diff text, syntax highlighting from the agent) — only the
+    /// bg/fg pair swaps. Cells outside the buffer area are skipped
+    /// rather than treated as an error: a terminal resize during a
+    /// drag can leave a stale extent off-screen for one frame.
+    fn paint_preview_selection(&mut self, frame: &mut Frame, theme: &Theme) {
+        let Some(sel) = self.preview_selection else {
+            return;
+        };
+        let view = self.preview_text_view;
+        let pane = view.pane;
+        // Screen rects for the visible slice of the selection. A selection
+        // that has scrolled partly (or wholly) off screen only paints the
+        // rows still in view; the copy still spans the full range.
+        let segments = sel.screen_flow_rects(view);
+        // Capture the selected text only on the first render that follows
+        // a finalized drag; subsequent renders just keep painting the
+        // highlight. Unlike the old cell-from-buffer read, the copy now
+        // comes from the parsed scrollback cache, so it includes lines
+        // that scrolled out of view.
+        let capture = self.preview_copy_pending;
+        if capture {
+            self.preview_copy_pending = false;
+            self.preview_copy_text = self.extract_preview_selection_text();
+        }
+        if segments.is_empty() {
+            return;
+        }
+        let buf = frame.buffer_mut();
+        let buf_area = buf.area;
+        // After release the highlight darkens slightly so the user
+        // can tell "selection finalized + copied" apart from "still
+        // dragging". A non-finalized in-progress drag uses the
+        // brighter selection-style swatch.
+        let bg = if sel.finalized {
+            theme.selection
+        } else {
+            theme.session_selection
+        };
+        for segment in segments {
+            let clipped = segment.intersection(pane);
+            if clipped.width == 0 || clipped.height == 0 {
+                continue;
+            }
+            for row in clipped.y..clipped.bottom() {
+                for col in clipped.x..clipped.right() {
+                    if !buf_area.contains(Position::from((col, row))) {
+                        continue;
+                    }
+                    let cell = &mut buf[(col, row)];
+                    cell.set_bg(bg);
+                    // Force the foreground to a high-contrast color so
+                    // ANSI-painted bright/dim agent output stays
+                    // readable on top of the new background.
+                    cell.set_fg(theme.text);
                 }
             }
         }
@@ -1232,7 +2544,195 @@ impl HomeView {
         }
     }
 
+    /// Calm placeholder shown in the preview pane when the selected session is
+    /// archived. Archiving kills the pane, so the normal capture path would
+    /// render an empty body ("No output available"); this explains the state
+    /// instead and points at `z` to bring the row back to the active list.
+    fn render_archived_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let title = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| inst.title.clone())
+            .unwrap_or_default();
+        let key = if self.strict_hotkeys { "Z" } else { "z" };
+        let parked = if title.is_empty() {
+            "This session is parked. Its agent was stopped.".to_string()
+        } else {
+            format!("\"{}\" is parked. Its agent was stopped.", title)
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Archived",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(parked, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to unarchive it.", Style::default().fg(theme.dimmed)),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
+    /// Calm placeholder shown when the selected session's pane is simply gone
+    /// (the generic gone-error, no diagnostic detail). Replaces the red crash
+    /// error with a "Stopped, enter to start" message; the row's real status
+    /// icon still signals the state in the sidebar.
+    fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Stopped",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "This session isn't running.",
+                Style::default().fg(theme.dimmed),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled("Enter", Style::default().fg(theme.hint).bold()),
+                Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
+            ]),
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
     fn render_status_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Live-send banner takes over the status bar so the user has an
+        // always-visible reminder that keystrokes are being relayed to
+        // the pane (and how to get out). Distinct color + bold so it
+        // can't be confused with the regular footer. The scroll
+        // indicator (only present when the user has scrolled back from
+        // the live edge) sits between the title and the exit chord
+        // hint so it gets noticed when there's something to notice.
+        if let Some(state) = &self.live_send {
+            let base_title = if state.title.is_empty() {
+                "session"
+            } else {
+                state.title.as_str()
+            };
+            // Surface which pane keystrokes are landing on; the shared
+            // formatter keeps this label in lockstep with the compose
+            // dialog's title.
+            let raw_title = live_send::format_target_label(base_title, state.target);
+            let chip = " \u{25CF} LIVE \u{2192} ";
+            let chip_style = Style::default()
+                .fg(theme.background)
+                .bg(theme.running)
+                .bold();
+
+            // Which-key menu: the leader is armed, so surface the live-send
+            // commands the next key can pick instead of the normal exit
+            // hint. This is the discoverability moment the issue asked for;
+            // pressing the leader shows exactly what it does.
+            if self.live_send_pending_leader {
+                if let Some(leader) = state.leader {
+                    let lead = live_send::display_chord(leader);
+                    let sidebar_cmd = if self.sidebar_collapsed {
+                        "b show sidebar"
+                    } else {
+                        "b hide sidebar"
+                    };
+                    let menu =
+                        format!("  {lead}:  k palette \u{00b7} {sidebar_cmd} \u{00b7} q exit ");
+                    let menu_budget = (area.width as usize)
+                        .saturating_sub(unicode_width::UnicodeWidthStr::width(chip));
+                    let menu = truncate_to_width(&menu, menu_budget);
+                    let spans = vec![
+                        Span::styled(chip, chip_style),
+                        Span::styled(menu, Style::default().fg(theme.accent).bold()),
+                    ];
+                    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+                    return;
+                }
+            }
+
+            // The chord display is built from the user's configured
+            // exit-chord list so the hint always shows what actually
+            // exits live mode for this user. Empty list (impossible
+            // under normal config — parse_chord_list falls back to
+            // the default set) renders as "?" so the user notices
+            // something's wrong rather than thinking the mode is
+            // unescapable.
+            let chord = if state.exit_chords.is_empty() {
+                "?".to_string()
+            } else {
+                live_send::display_chord_list(&state.exit_chords)
+            };
+            let suffix = " to exit ";
+            // Compact reminder that the leader opens the command menu, so
+            // the user can discover the palette / sidebar toggle without
+            // having entered the menu yet. Empty when the leader is
+            // disabled (the user cleared the setting).
+            let leader_hint = state
+                .leader
+                .map(|l| format!(" \u{00b7} {} menu", live_send::display_chord(l)))
+                .unwrap_or_default();
+            // `preview_visible_rows` is the output-body height the renderer
+            // last painted into (pane height minus the inner banner row only
+            // when that banner is shown). Reuse it so the live `[offset/max]`
+            // indicator agrees with the actual scroll math; deriving it from
+            // `dimensions` with a fixed `- 1` would over-count the max by a
+            // row whenever the info header is hidden.
+            let visible_height = self.preview_visible_rows;
+            // Pull `captured_lines` from whichever cache is on screen, not the
+            // Agent cache unconditionally: in Terminal/Tool live mode the
+            // wrong cache would show a stale or empty `[offset/max]`.
+            let scroll = format_scroll_indicator(
+                self.active_captured_lines(),
+                visible_height,
+                self.preview_scroll_offset,
+            )
+            .unwrap_or_default();
+            // Spaces between chip→title and title→chord. Title gets the
+            // budget after the fixed pieces; reserved last so the exit
+            // chord never falls off on narrow terminals.
+            let fixed_width = unicode_width::UnicodeWidthStr::width(chip)
+                + 1 // single space after the chip
+                + 2 // double space before the chord
+                + unicode_width::UnicodeWidthStr::width(chord.as_str())
+                + unicode_width::UnicodeWidthStr::width(suffix)
+                + unicode_width::UnicodeWidthStr::width(leader_hint.as_str())
+                + unicode_width::UnicodeWidthStr::width(scroll.as_str());
+            let title_budget = (area.width as usize).saturating_sub(fixed_width);
+            let title = truncate_to_width(&raw_title, title_budget);
+            let mut spans: Vec<Span<'static>> = vec![
+                Span::styled(chip, chip_style),
+                Span::raw(" "),
+                Span::styled(title, Style::default().fg(theme.text).bold()),
+            ];
+            if !scroll.is_empty() {
+                spans.push(Span::styled(
+                    scroll,
+                    Style::default().fg(theme.dimmed).italic(),
+                ));
+            }
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(
+                chord,
+                Style::default().fg(theme.accent).bold(),
+            ));
+            spans.push(Span::styled(suffix, Style::default().fg(theme.dimmed)));
+            if !leader_hint.is_empty() {
+                spans.push(Span::styled(
+                    leader_hint,
+                    Style::default().fg(theme.dimmed).italic(),
+                ));
+            }
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
+
         let key_style = Style::default().fg(theme.accent).bold();
         let desc_style = Style::default().fg(theme.dimmed);
         let sep_style = Style::default().fg(theme.border);
@@ -1252,8 +2752,8 @@ impl HomeView {
             ]
         };
         // Key-only entry for keys universal enough that a description would be
-        // noise (j/k for nav, ? for help, q for quit, / for search). Saves
-        // ~20 columns of footer width — meaningful at iPhone-Mosh sizes.
+        // noise (? for help, / for search). Saves footer width at iPhone-Mosh
+        // sizes.
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
@@ -1281,6 +2781,21 @@ impl HomeView {
             }
         }
 
+        // Other-TUI indicator: shown only when more than one `aoe` TUI is
+        // alive. Two TUIs watching the same agent sessions clash over pane
+        // sizes (tmux reflows to the smallest attached client), so surface the
+        // count as a heads-up. The value is recomputed on a throttle in the
+        // app loop, not per frame.
+        if self.active_tui_count > 1 {
+            groups.push((
+                0,
+                vec![Span::styled(
+                    format!(" \u{25C9} {} watching ", self.active_tui_count),
+                    Style::default().fg(theme.accent).bold(),
+                )],
+            ));
+        }
+
         // Pending-paste indicator: text was captured at the home view but
         // couldn't be routed yet (no runnable session selected). Surface a
         // high-priority hint so the user knows the paste/dictation didn't
@@ -1295,8 +2810,6 @@ impl HomeView {
                 groups.push((0, spans));
             }
         }
-
-        groups.push((0, mk_key("j/k")));
 
         if let Some(enter_action_text) = match self.flat_items.get(self.cursor) {
             Some(Item::Group {
@@ -1318,6 +2831,11 @@ impl HomeView {
         }
 
         groups.push((2, mk(if strict { "T" } else { "t" }, "View")));
+        if matches!(self.view_mode, ViewMode::Tool(_)) {
+            groups.push((1, mk(";", "Back")));
+        } else if !self.tool_configs.is_empty() {
+            groups.push((2, mk(";", "Tools")));
+        }
         groups.push((3, mk(if strict { "^G" } else { "g" }, "Group")));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
@@ -1333,12 +2851,18 @@ impl HomeView {
 
         groups.push((2, mk(if strict { "N" } else { "n" }, "New")));
 
+        // Priority 1: user's core daily workflow (message / del).
+        // These survive the greedy pack under narrow-pane widths (iPad
+        // Termius / Moshi ~80 cols) because they're the actions the user
+        // reaches for most often. Del stays at p3, less frequent,
+        // OK to drop first.
         if self.selected_session.is_some() {
             if self.view_mode == ViewMode::Archive {
                 groups.push((3, mk(if strict { "R" } else { "r" }, "Restore")));
             } else {
                 groups.push((3, mk(if strict { "M" } else { "m" }, "Msg")));
             }
+            groups.push((1, mk(if strict { "M" } else { "m" }, "Msg")));
         }
         if !self.flat_items.is_empty() {
             groups.push((
@@ -1353,13 +2877,25 @@ impl HomeView {
                 ),
             ));
         }
+        // Attention-workflow shortcuts (Archive / Fav / Snooze) only render
+        // when the user is in Attention sort. They are only useful for
+        // shaping the Attention queue; in Newest / Created / Last Accessed
+        // they just take footer space without changing what the user sees.
+        if self.sort_order == SortOrder::Attention {
+            if !self.flat_items.is_empty() {
+                groups.push((1, mk(if strict { "Z" } else { "z" }, "Archive")));
+            }
+            if self.selected_session.is_some() {
+                groups.push((1, mk(if strict { "F" } else { "f" }, "Fav")));
+                groups.push((1, mk(if strict { "H" } else { "h" }, "Snooze")));
+            }
+        }
 
         groups.push((4, mk(if strict { "A" } else { "a" }, "Archive")));
         groups.push((4, mk_key("/")));
         groups.push((4, mk(if strict { "^D" } else { "D" }, "Diff")));
         groups.push((1, mk("^K", "Cmds")));
         groups.push((0, mk_key("?")));
-        groups.push((0, mk_key(if strict { "Q" } else { "q" })));
 
         // Greedy pack by priority. Width of a group = sum of span char counts;
         // separator between kept groups adds 3 cols each (" · "). Reserve 1
@@ -1409,11 +2945,13 @@ impl HomeView {
         theme: &Theme,
         info: Option<&UpdateInfo>,
         status: Option<&str>,
+        image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
-        // Transient status takes precedence over the persistent update banner
-        // so users see the latest signal (e.g. "restart failed: ...") even
-        // when an update banner is also up.
+        // Precedence (highest first): transient status, app update, then the
+        // sandbox-image update. Only one banner shows at a time, so its keys
+        // ([u]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
+        // the ones above it clear.
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
@@ -1421,6 +2959,8 @@ impl HomeView {
                 " update available {} → {}  [u] update  [Ctrl+x] dismiss",
                 info.current_version, info.latest_version
             )
+        } else if image_update.is_some() {
+            " sandbox image update available  [u] pull  [Ctrl+x] dismiss".to_string()
         } else {
             return;
         };
@@ -1433,6 +2973,251 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The preview split geometry (header / banner / output rows) is now owned
+    // by `preview::PreviewLayout`; its tests live alongside it in
+    // `components/preview.rs`. The render-side regression is covered end to end
+    // by `preview_visible_rows_equal_output_area_with_info_shown` in
+    // `home/tests.rs`, which renders a real frame and asserts
+    // `preview_visible_rows == preview_pane_area.height`.
+
+    fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x,
+            y,
+            visible,
+            pane_height,
+        }
+    }
+
+    #[test]
+    fn live_cursor_maps_directly_when_pane_matches_output() {
+        // Pane sized to the output area (the steady-state live-send case): the
+        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y).
+        let output = Rect::new(40, 5, 80, 24);
+        let pos = map_live_preview_cursor(output, 24, pane_cursor(3, 2, true, 24));
+        assert_eq!(pos, Some(Position::new(43, 7)));
+    }
+
+    #[test]
+    fn live_cursor_anchored_to_bottom_when_pane_taller_than_output() {
+        // Pane is 24 rows but only 10 are visible (top clipped). The bottom 10
+        // pin to the output, so a cursor on the last screen row (y=23) lands on
+        // the output's last row; a cursor in the clipped top maps out and drops.
+        let output = Rect::new(0, 0, 80, 10);
+        assert_eq!(
+            map_live_preview_cursor(output, 10, pane_cursor(0, 23, true, 24)),
+            Some(Position::new(0, 9)),
+        );
+        assert_eq!(
+            map_live_preview_cursor(output, 10, pane_cursor(0, 5, true, 24)),
+            None,
+        );
+    }
+
+    #[test]
+    fn live_cursor_hidden_or_out_of_bounds_paints_nothing() {
+        let output = Rect::new(0, 0, 80, 24);
+        // DECTCEM-hidden cursor: nothing to paint.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, pane_cursor(3, 2, false, 24)),
+            None,
+        );
+        // Column past the output width is dropped rather than clamped.
+        assert_eq!(
+            map_live_preview_cursor(output, 24, pane_cursor(80, 2, true, 24)),
+            None,
+        );
+    }
+
+    #[test]
+    fn truncate_to_width_passthrough_when_fits() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_to_width_appends_ellipsis_when_overflow() {
+        // 5-char budget, 7-char input → 4 chars + ellipsis.
+        assert_eq!(truncate_to_width("abcdefg", 5), "abcd\u{2026}");
+    }
+
+    #[test]
+    fn truncate_to_width_zero_returns_empty() {
+        // Zero budget: title is sacrificed entirely so the fixed exit-
+        // chord text has space to render on very narrow terminals.
+        assert_eq!(truncate_to_width("anything", 0), "");
+    }
+
+    #[test]
+    fn truncate_to_width_respects_wide_chars() {
+        // East Asian wide char is 2 cells. Budget 3 should fit one wide
+        // char + ellipsis (2 + 1 = 3) — but we reserve 1 for ellipsis
+        // so budget for content is 2, fitting exactly one wide char.
+        assert_eq!(truncate_to_width("你好世界", 3), "你\u{2026}");
+    }
+
+    #[test]
+    fn selected_row_style_preserves_readable_status_color() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default().fg(theme.running);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.running));
+    }
+
+    #[test]
+    fn selected_row_style_sets_text_for_default_foreground() {
+        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        let style = Style::default();
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn selected_row_style_falls_back_when_color_clashes() {
+        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        theme.dimmed = theme.session_selection;
+        let style = Style::default().fg(theme.dimmed);
+
+        assert_eq!(selected_row_style(style, &theme).fg, Some(theme.text));
+    }
+
+    #[test]
+    fn compose_list_title_omits_profile_and_suffix_at_defaults() {
+        // Default group/sort and no profile filter: title is just the prefix,
+        // no `[all]` tag, no parenthesized suffix.
+        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::Newest);
+        assert_eq!(title, " aoe ");
+    }
+
+    #[test]
+    fn compose_list_title_includes_profile_when_filter_active() {
+        let title = compose_list_title(
+            "aoe",
+            Some("my-profile"),
+            GroupByMode::Manual,
+            SortOrder::Newest,
+        );
+        assert_eq!(title, " aoe [my-profile] ");
+    }
+
+    #[test]
+    fn compose_list_title_shows_by_project_only() {
+        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
+        assert_eq!(title, " aoe · project ");
+    }
+
+    #[test]
+    fn compose_list_title_shows_sort_only_when_non_default() {
+        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::LastActivity);
+        assert_eq!(title, " aoe · Recent ");
+    }
+
+    #[test]
+    fn compose_list_title_merges_group_and_sort_suffixes() {
+        let title = compose_list_title(
+            "aoe",
+            Some("alpha"),
+            GroupByMode::Project,
+            SortOrder::LastActivity,
+        );
+        assert_eq!(title, " aoe [alpha] · project · Recent ");
+    }
+
+    #[test]
+    fn compose_list_title_default_sort_drops_suffix_segment() {
+        // Newest is the default; it must not appear in the title even when
+        // group mode contributes its own suffix piece.
+        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
+        assert_eq!(title, " aoe · project ");
+    }
+
+    #[test]
+    fn compose_list_title_supports_tool_prefix() {
+        let title = compose_list_title("Tool: foo", None, GroupByMode::Manual, SortOrder::AZ);
+        assert_eq!(title, " Tool: foo · A-Z ");
+    }
+
+    #[test]
+    fn compose_list_title_supports_terminal_prefix() {
+        // Terminal view mode uses the "Terminals" prefix; verify it flows
+        // through the helper just like the Agent and Tool prefixes do.
+        let title = compose_list_title(
+            "Terminals",
+            Some("work"),
+            GroupByMode::Project,
+            SortOrder::Newest,
+        );
+        assert_eq!(title, " Terminals [work] · project ");
+    }
+
+    #[test]
+    fn compose_list_title_default_sort_with_project_and_profile() {
+        // Matrix cell: default sort + project group + active profile.
+        let title = compose_list_title(
+            "aoe",
+            Some("alpha"),
+            GroupByMode::Project,
+            SortOrder::Newest,
+        );
+        assert_eq!(title, " aoe [alpha] · project ");
+    }
+
+    #[test]
+    fn compose_list_title_non_default_sort_with_profile_only() {
+        // Matrix cell: non-default sort + manual group + active profile.
+        let title = compose_list_title(
+            "aoe",
+            Some("alpha"),
+            GroupByMode::Manual,
+            SortOrder::LastActivity,
+        );
+        assert_eq!(title, " aoe [alpha] · Recent ");
+    }
+
+    #[test]
+    fn compose_list_title_non_default_sort_with_project_no_profile() {
+        // Matrix cell: non-default sort + project group + no profile.
+        let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::LastActivity);
+        assert_eq!(title, " aoe · project · Recent ");
+    }
+
+    #[test]
+    fn compose_list_title_renders_oldest_sort_label() {
+        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::Oldest);
+        assert_eq!(title, " aoe · Oldest ");
+    }
+
+    #[test]
+    fn compose_list_title_renders_za_sort_label() {
+        let title = compose_list_title("aoe", None, GroupByMode::Manual, SortOrder::ZA);
+        assert_eq!(title, " aoe · Z-A ");
+    }
+
+    #[test]
+    fn profile_short_code_multi_segment_takes_initials() {
+        assert_eq!(profile_short_code("forit-backup"), "fb");
+        assert_eq!(profile_short_code("pivot-main"), "pm");
+        assert_eq!(profile_short_code("wma-work"), "ww");
+    }
+
+    #[test]
+    fn profile_short_code_single_segment_takes_first_three() {
+        assert_eq!(profile_short_code("default"), "def");
+        assert_eq!(profile_short_code("ForIT"), "for");
+    }
+
+    #[test]
+    fn profile_short_code_caps_at_four_chars() {
+        assert_eq!(profile_short_code("a-b-c-d-e-f"), "abcd");
+    }
+
+    #[test]
+    fn profile_short_code_lowercases_and_ignores_empty_segments() {
+        assert_eq!(profile_short_code("Forit_Backup"), "fb");
+        assert_eq!(profile_short_code("--foo--"), "foo");
+        assert_eq!(profile_short_code(""), "");
+    }
 
     #[test]
     fn format_relative_age_none_returns_empty() {
@@ -1478,6 +3263,24 @@ mod tests {
     #[test]
     fn capture_lines_for_adds_buffer_to_height() {
         assert_eq!(capture_lines_for(30, 0), 50);
+    }
+
+    #[test]
+    fn clamp_scroll_to_capture_uses_visible_height_verbatim() {
+        // Content exactly fills a 40-row banner-less pane: visible_height == 40,
+        // so there is nothing to scroll back to and any offset clamps to 0.
+        // The pre-fix code derived `area_height - 1` internally, which left a
+        // phantom max offset of 1 and stalled live-follow a row early.
+        assert_eq!(clamp_scroll_to_capture(1, 40, 40), 0);
+        assert_eq!(clamp_scroll_to_capture(5, 40, 40), 0);
+    }
+
+    #[test]
+    fn clamp_scroll_to_capture_allows_real_scrollback() {
+        // 60 captured lines into a 40-row view leaves 20 rows of real history;
+        // offsets within that range pass through, larger ones clamp to the max.
+        assert_eq!(clamp_scroll_to_capture(10, 60, 40), 10);
+        assert_eq!(clamp_scroll_to_capture(50, 60, 40), 20);
     }
 
     #[test]
@@ -1567,6 +3370,34 @@ mod tests {
         // unconditional render path.
         // prefix(20) + slot(6) + badge(12) + margin(1) = 39 > 35.
         assert_eq!(activity_column_padding(20, 35, 12), None);
+    }
+
+    #[test]
+    fn row_tag_content_fits_within_max_width() {
+        // RowTag.rendered() right-pads to max_width via `{:<width$}` —
+        // if content ever exceeds max_width the format width is ignored
+        // and the bracket span jitters. profile_short_code's documented
+        // cap of 4 is the tightest case to spot-check.
+        assert!(profile_short_code("forit-backup-extra").len() <= 4);
+    }
+
+    #[test]
+    fn row_tag_rendered_pads_to_max_width() {
+        let short = RowTag {
+            content: "fb".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(short.rendered(), "[fb  ]");
+        let exact = RowTag {
+            content: "forb".to_string(),
+            max_width: 4,
+        };
+        assert_eq!(exact.rendered(), "[forb]");
+        let sb = RowTag {
+            content: "sb".to_string(),
+            max_width: 2,
+        };
+        assert_eq!(sb.rendered(), "[sb]");
     }
 
     #[test]

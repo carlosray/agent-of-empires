@@ -52,6 +52,10 @@ pub struct HookEvent {
     pub matcher: Option<&'static str>,
     /// AoE status to write when this event fires (`"running"`, `"idle"`, `"waiting"`).
     pub status: Option<&'static str>,
+    /// When `true`, install an additional hook command that extracts
+    /// `session_id` from the agent's stdin JSON payload and writes it to
+    /// `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`.
+    pub session_id_capture: bool,
 }
 
 /// Configuration for installing status-detection hooks into an agent's settings file.
@@ -59,8 +63,39 @@ pub struct AgentHookConfig {
     /// Path relative to the home dir where the agent's settings live
     /// (e.g. `.claude/settings.json`).
     pub settings_rel_path: &'static str,
+    /// Optional env var that overrides the agent's config directory
+    /// (e.g. `CLAUDE_CONFIG_DIR`). When set in the session's host environment,
+    /// or in AoE's own environment, the settings file lives directly under that
+    /// directory using the basename of `settings_rel_path`, rather than under
+    /// `~/<settings_rel_path>`. `None` for agents with a fixed home-relative path.
+    pub config_dir_env_var: Option<&'static str>,
     /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
+}
+
+/// Installer for an agent whose status hooks live in a config format the
+/// generic [`AgentHookConfig`] (JSON `settings.json`) path cannot emit: settl
+/// (TOML), hermes (YAML), kiro (per-agent JSON). Bundling the host path, the
+/// sandbox path, and the install/uninstall function pointers here lets every
+/// call site (`status_hook_env_prefix`, host install, sandbox install,
+/// `uninstall_all_hooks`) dispatch through one field instead of matching agent
+/// names. An agent has at most one of `hook_config` or `sidecar_hooks`.
+pub struct SidecarHooks {
+    /// Config path relative to the home directory for a host session
+    /// (e.g. `.hermes/config.yaml`).
+    pub host_config_subpath: &'static str,
+    /// Config path relative to the home directory for a sandboxed session
+    /// (e.g. `.hermes/sandbox/config.yaml`). The `sandbox` segment mirrors the
+    /// container staging dir. Empty (and unused) for `host_only` agents.
+    pub sandbox_config_subpath: &'static str,
+    /// Write AoE status hooks into the config file at the given path.
+    pub install: fn(&std::path::Path) -> anyhow::Result<()>,
+    /// Remove AoE status hooks from the config file at the given path.
+    /// Returns whether anything was changed.
+    pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,
+    /// Optional host-only follow-up run after a successful host install
+    /// (e.g. kiro promotes its `aoe-hooks` agent to the active default).
+    pub post_install_host: Option<fn()>,
 }
 
 /// Everything we know about a single agent CLI.
@@ -88,6 +123,10 @@ pub struct AgentDef {
     /// hooks into the agent's settings file so status is written to a file instead
     /// of being parsed from tmux pane content.
     pub hook_config: Option<AgentHookConfig>,
+    /// Sidecar hook installer for agents whose config format the generic
+    /// `hook_config` path cannot emit (settl/hermes/kiro). Mutually exclusive
+    /// with `hook_config`.
+    pub sidecar_hooks: Option<SidecarHooks>,
     /// How this agent resumes a prior session.
     pub resume_strategy: ResumeStrategy,
     /// If true, this agent can only run on the host (no sandbox/worktree support).
@@ -103,32 +142,85 @@ pub struct AgentDef {
     pub install_hint: &'static str,
 }
 
-/// Hook events shared by Claude Code and Cursor CLI.
-const CLAUDE_CURSOR_HOOK_EVENTS: &[HookEvent] = &[
+/// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
+/// `session_id_capture: true` so the per-instance sidecar
+/// (`/tmp/aoe-hooks/<id>/session_id`) is updated whenever Claude rotates
+/// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
+/// `claude_poll_fn` reads this sidecar before falling back to its disk
+/// scan.
+const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "SessionStart",
+        matcher: None,
+        status: None,
+        session_id_capture: true,
+    },
     HookEvent {
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
+        session_id_capture: true,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "ElicitationResult",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
+    },
+];
+
+/// Cursor CLI hook events. No `session_id_capture`: Cursor's session id is
+/// not consumed by AoE pollers, and Cursor's hook payload uses a different
+/// schema, so installing the capture command would do useless work on every
+/// `UserPromptSubmit`.
+const CURSOR_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "PreToolUse",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "UserPromptSubmit",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Stop",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Notification",
+        matcher: Some("permission_prompt|elicitation_dialog"),
+        status: Some("waiting"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "ElicitationResult",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
     },
 ];
 
@@ -141,26 +233,72 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
         name: "PreToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "UserPromptSubmit",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "PostToolUse",
         matcher: None,
         status: Some("running"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Stop",
         matcher: None,
         status: Some("idle"),
+        session_id_capture: false,
     },
     HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
+    },
+];
+
+/// Codex hook events. Codex loads these from the `[hooks]` table in
+/// `~/.codex/config.toml`.
+const CODEX_HOOK_EVENTS: &[HookEvent] = &[
+    HookEvent {
+        name: "SessionStart",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "UserPromptSubmit",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "PreToolUse",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "PermissionRequest",
+        matcher: None,
+        status: Some("waiting"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "PostToolUse",
+        matcher: None,
+        status: Some("running"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Stop",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
     },
 ];
 
@@ -177,8 +315,10 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CLAUDE_CONFIG_DIR", "/root/.claude")],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".claude/settings.json",
-            events: CLAUDE_CURSOR_HOOK_EVENTS,
+            config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
+            events: CLAUDE_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
@@ -198,6 +338,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_opencode_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -214,6 +355,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_vibe_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -231,7 +373,14 @@ pub const AGENTS: &[AgentDef] = &[
         set_default_command: true,
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
-        hook_config: None,
+        hook_config: Some(AgentHookConfig {
+            settings_rel_path: ".codex/config.toml",
+            // Codex resolves its config dir via `CODEX_HOME` through a bespoke
+            // path pair; install/uninstall are special-cased on agent name.
+            config_dir_env_var: None,
+            events: CODEX_HOOK_EVENTS,
+        }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
         host_only: false,
         // Codex has paste-burst detection with a 120ms Enter-suppression window;
@@ -252,29 +401,35 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".gemini/settings.json",
+            config_dir_env_var: None,
             events: &[
                 HookEvent {
                     name: "BeforeTool",
                     matcher: None,
                     status: Some("running"),
+                    session_id_capture: false,
                 },
                 HookEvent {
                     name: "BeforeAgent",
                     matcher: None,
                     status: Some("running"),
+                    session_id_capture: false,
                 },
                 HookEvent {
                     name: "AfterAgent",
                     matcher: None,
                     status: Some("idle"),
+                    session_id_capture: false,
                 },
                 HookEvent {
                     name: "Notification",
                     matcher: Some("ToolPermission"),
                     status: Some("waiting"),
+                    session_id_capture: false,
                 },
             ],
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -292,8 +447,10 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("CURSOR_CONFIG_DIR", "/root/.cursor")],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".cursor/settings.json",
-            events: CLAUDE_CURSOR_HOOK_EVENTS,
+            config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
+            events: CURSOR_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -310,6 +467,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_copilot_status,
         container_env: &[("COPILOT_CONFIG_DIR", "/root/.copilot")],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -327,10 +485,11 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_pi_status,
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--session"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
-        install_hint: "npm install -g @mariozechner/pi-coding-agent",
+        install_hint: "npm install -g @earendil-works/pi-coding-agent",
     },
     AgentDef {
         name: "droid",
@@ -343,6 +502,7 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_droid_status,
         container_env: &[],
         hook_config: None,
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -358,7 +518,17 @@ pub const AGENTS: &[AgentDef] = &[
         set_default_command: false,
         detect_status: status_detection::detect_settl_status,
         container_env: &[],
+        // settl uses TOML config (`[[hooks]]` entries), not the JSON
+        // settings.json schema, so it installs via a sidecar hook. host_only,
+        // so the sandbox subpath is unused.
         hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".settl/config.toml",
+            sandbox_config_subpath: "",
+            install: crate::hooks::install_settl_hooks,
+            uninstall: crate::hooks::uninstall_settl_hooks,
+            post_install_host: None,
+        }),
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: true,
         send_keys_enter_delay_ms: 0,
@@ -381,9 +551,16 @@ pub const AGENTS: &[AgentDef] = &[
         // allowlist file, which AoE pre-populates in install_hermes_hooks.
         container_env: &[("HERMES_ACCEPT_HOOKS", "1")],
         // Hermes uses YAML (`hooks: { event: [...] }`) rather than the
-        // JSON settings.json schema shared by Claude/Cursor/Gemini, so
-        // hook_config: None and install is special-cased like settl.
+        // JSON settings.json schema shared by Claude/Cursor/Gemini, so it
+        // installs via a sidecar hook rather than hook_config.
         hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: ".hermes/config.yaml",
+            sandbox_config_subpath: ".hermes/sandbox/config.yaml",
+            install: crate::hooks::install_hermes_hooks,
+            uninstall: crate::hooks::uninstall_hermes_hooks,
+            post_install_host: None,
+        }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -402,10 +579,18 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         // Kiro uses a per-agent JSON config (lowercase event names, flat
         // {command} objects) rather than the JSON settings.json schema shared
-        // by Claude/Cursor/Gemini, so hook_config: None and install is
-        // special-cased like hermes/settl. Status comes from the hook sidecar
-        // file written by install_kiro_hooks; the pane stub is unused.
+        // by Claude/Cursor/Gemini, so it installs via a sidecar hook. Status
+        // comes from the hook sidecar file written by install_kiro_hooks; the
+        // pane stub is unused. post_install_host promotes the aoe-hooks agent
+        // to Kiro's active default.
         hook_config: None,
+        sidecar_hooks: Some(SidecarHooks {
+            host_config_subpath: crate::hooks::KIRO_HOOKS_AGENT_FILE,
+            sandbox_config_subpath: ".kiro/sandbox/agents/aoe-hooks.json",
+            install: crate::hooks::install_kiro_hooks,
+            uninstall: crate::hooks::uninstall_kiro_hooks,
+            post_install_host: Some(crate::hooks::set_kiro_default_agent_if_builtin),
+        }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -423,8 +608,10 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[],
         hook_config: Some(AgentHookConfig {
             settings_rel_path: ".qwen/settings.json",
+            config_dir_env_var: None,
             events: QWEN_HOOK_EVENTS,
         }),
+        sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
             existing: "--resume",
             new_session: "--session-id",
@@ -432,6 +619,23 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "npm install -g @qwen-code/qwen-code",
+    },
+    AgentDef {
+        name: "antigravity",
+        binary: "agy",
+        aliases: &["agy"],
+        detection: DetectionMethod::Which("agy"),
+        yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
+        instruction_flag: None,
+        set_default_command: false,
+        detect_status: status_detection::detect_antigravity_status,
+        container_env: &[],
+        hook_config: None,
+        sidecar_hooks: None,
+        resume_strategy: ResumeStrategy::Unsupported,
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
     },
 ];
 
@@ -518,6 +722,7 @@ mod tests {
         assert_eq!(get_agent("hermes").unwrap().binary, "hermes");
         assert_eq!(get_agent("kiro").unwrap().binary, "kiro-cli");
         assert_eq!(get_agent("qwen").unwrap().binary, "qwen");
+        assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
     }
 
     #[test]
@@ -548,8 +753,20 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "claude", "opencode", "vibe", "codex", "gemini", "cursor", "copilot", "pi",
-                "droid", "settl", "hermes", "kiro", "qwen"
+                "claude",
+                "opencode",
+                "vibe",
+                "codex",
+                "gemini",
+                "cursor",
+                "copilot",
+                "pi",
+                "droid",
+                "settl",
+                "hermes",
+                "kiro",
+                "qwen",
+                "antigravity"
             ]
         );
     }
@@ -574,6 +791,8 @@ mod tests {
         assert_eq!(resolve_tool_name("kiro"), Some("kiro"));
         assert_eq!(resolve_tool_name("kiro-cli"), Some("kiro"));
         assert_eq!(resolve_tool_name("qwen"), Some("qwen"));
+        assert_eq!(resolve_tool_name("antigravity"), Some("antigravity"));
+        assert_eq!(resolve_tool_name("agy"), Some("antigravity"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         assert_eq!(resolve_tool_name("unknown-tool"), None);
@@ -592,6 +811,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("hermes")), 11);
         assert_eq!(settings_index_from_name(Some("kiro")), 12);
         assert_eq!(settings_index_from_name(Some("qwen")), 13);
+        assert_eq!(settings_index_from_name(Some("antigravity")), 14);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -604,6 +824,7 @@ mod tests {
         assert_eq!(name_from_settings_index(11), Some("hermes"));
         assert_eq!(name_from_settings_index(12), Some("kiro"));
         assert_eq!(name_from_settings_index(13), Some("qwen"));
+        assert_eq!(name_from_settings_index(14), Some("antigravity"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -627,6 +848,7 @@ mod tests {
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);
+        assert_eq!(send_keys_enter_delay("antigravity"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
     }
 
@@ -651,7 +873,7 @@ mod tests {
         // Pi is distributed via npm, not pip (issue #818).
         assert_eq!(
             install_hint("pi"),
-            Some("npm install -g @mariozechner/pi-coding-agent")
+            Some("npm install -g @earendil-works/pi-coding-agent")
         );
         // Mistral Vibe's PyPI package is `mistral-vibe`, not `vibe-tool`.
         assert_eq!(install_hint("vibe"), Some("pip install mistral-vibe"));
@@ -670,6 +892,10 @@ mod tests {
         assert_eq!(
             install_hint("kiro"),
             Some("curl -fsSL https://cli.kiro.dev/install | bash")
+        );
+        assert_eq!(
+            install_hint("antigravity"),
+            Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
         assert!(install_hint("unknown").is_none());
     }

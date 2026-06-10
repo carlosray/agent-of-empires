@@ -18,7 +18,7 @@ pub struct LogLevelArgs {
     pub level: Option<String>,
 
     /// Raw EnvFilter directive. Use this for per-target tuning, e.g.
-    /// `--filter cockpit.acp=trace,info`. Bare `--filter debug` is
+    /// `--filter acp.protocol=trace,info`. Bare `--filter debug` is
     /// rejected; use the positional `level` form instead.
     #[arg(long)]
     pub filter: Option<String>,
@@ -28,6 +28,7 @@ pub struct LogLevelArgs {
     pub get: bool,
 }
 
+#[tracing::instrument(target = "cli.log_level", skip_all)]
 pub async fn run(args: LogLevelArgs) -> Result<()> {
     let urls = read_serve_urls();
     let Some(primary) = urls.first() else {

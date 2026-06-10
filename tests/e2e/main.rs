@@ -17,15 +17,26 @@
 
 mod harness;
 
+mod acp_focus_isolation_e2e;
+mod acp_orphan_runner_recovery_e2e;
+mod acp_session_log_tee_e2e;
+mod acp_tool_cards_e2e;
+mod archive_restore;
 mod cli;
 mod command_palette;
 mod errors;
+mod filewatch_tui_burst_reload;
+mod filewatch_tui_dynamic_profile;
+mod filewatch_tui_reload;
+mod intro;
 mod logs;
 mod new_session;
 mod profile_picker;
 mod project_registry;
 mod sandbox;
 mod serve;
+mod settings;
+mod tool_sessions;
 mod tui_launch;
 mod unified_view;
 mod update_command;

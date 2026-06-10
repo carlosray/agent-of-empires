@@ -26,27 +26,19 @@ export type PushState =
   | { kind: "disabled-by-server" }
   | { kind: "error"; message: string };
 
-const isIOS = () =>
-  typeof navigator !== "undefined" &&
-  /iPad|iPhone|iPod/.test(navigator.userAgent);
+const isIOS = () => typeof navigator !== "undefined" && /iPad|iPhone|iPod/.test(navigator.userAgent);
 
 const isStandalone = (): boolean => {
   if (typeof window === "undefined") return false;
   // iOS uses navigator.standalone; other platforms use the display-mode
   // media query. Both are worth checking.
-  const ios = (window.navigator as unknown as { standalone?: boolean })
-    .standalone === true;
-  const displayMode = window.matchMedia?.(
-    "(display-mode: standalone)",
-  ).matches;
+  const ios = (window.navigator as unknown as { standalone?: boolean }).standalone === true;
+  const displayMode = window.matchMedia?.("(display-mode: standalone)").matches;
   return ios || !!displayMode;
 };
 
 const supportsPush = (): boolean =>
-  typeof window !== "undefined" &&
-  "serviceWorker" in navigator &&
-  "PushManager" in window &&
-  "Notification" in window;
+  typeof window !== "undefined" && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
 
 /** Web Push requires a secure context. Localhost and 127.0.0.1 are
  *  allowed over http for dev, but any LAN IP or hostname must be
@@ -116,11 +108,10 @@ export function usePushSubscription() {
   }, []);
 
   useEffect(() => {
-    // refresh() is the initial-mount fetch; setState-in-effect is the
-    // correct pattern here (nothing external to subscribe to, just a
-    // one-shot async read of feature availability + server status).
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    refresh();
+    const timer = setTimeout(() => {
+      void refresh();
+    }, 0);
+    return () => clearTimeout(timer);
   }, [refresh]);
 
   const enable = useCallback(async () => {
@@ -245,5 +236,16 @@ export function usePushSubscription() {
     }
   }, []);
 
-  return { state, enable, disable, sendTest, refresh };
+  // Re-subscribe: unsubscribe then re-subscribe in a single click. Used
+  // by the "Re-subscribe" affordance in NotificationSettings to refresh
+  // the server-side `Subscription.origin` field after the user moved
+  // the deployment to a different port or origin. Existing subs from
+  // before the origin-tracking landed have no recorded origin and get
+  // skipped on send (#1188); re-subscribing refreshes the entry.
+  const resubscribe = useCallback(async () => {
+    await disable();
+    await enable();
+  }, [disable, enable]);
+
+  return { state, enable, disable, sendTest, refresh, resubscribe };
 }

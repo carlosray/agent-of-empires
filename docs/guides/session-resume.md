@@ -1,48 +1,41 @@
 # Session Resume (Claude)
 
-Agent of Empires can persist Claude Code conversation IDs so sessions resume their prior context after a reboot, an `aoe` upgrade, or a `kill-server`. No more hunting through `/resume` to find the right session.
+Claude Code sessions launched through AoE resume their prior conversation automatically after a reboot, an `aoe` upgrade, or a `kill-server`. No need to hunt through `/resume` to find the right session.
 
-## How it works
+This is automatic and on by default. Runtime conversation changes (via `/clear`, `--fork-session`, `--continue`, or starting fresh in the pane) are picked up too, in both host and sandboxed (Docker) modes.
 
-When you launch a Claude session through AoE, AoE generates a UUID and passes it to `claude --session-id <uuid>`. Claude uses that UUID for the conversation; AoE records it in `sessions.json`. On every subsequent launch of the same instance, AoE invokes `claude --resume <uuid>` so the conversation picks up where it left off.
+## Pinning or resetting a conversation
 
-A background poller checks `~/.claude/projects/<project>/` every 2 seconds for the most recently modified session file. If the session ID rotates at runtime — for example after `/clear`, `--fork-session`, or starting a fresh `claude` invocation in the same tmux pane — the poller catches the new ID and AoE persists it transparently. Next launch resumes the new conversation, not the stale one.
-
-For sandboxed (Docker) sessions, the poller runs the same scan inside the container via `docker exec`, since Claude writes its session files to the container's filesystem rather than the host's.
-
-## What's covered
-
-- Launch, store, resume across reboots and `aoe` upgrades, in both host and sandboxed modes.
-- Runtime rotation via `/clear`, `--fork-session`, or fresh `claude` invocation in the same pane.
-- Manual override via the CLI when you want to point a session at a specific conversation.
-
-## What's not covered (yet)
-
-- Other agents (OpenCode, Codex, Gemini, Vibe, Pi). They're tracked behind separate follow-up PRs; their sessions still launch fresh until then.
-
-## Manual override
-
-To point a session at a different Claude conversation ID without launching it:
+Pin a session to a specific Claude conversation:
 
 ```sh
 aoe session set-session-id <session-name-or-id> <claude-session-uuid>
 ```
 
-To clear a stored ID (next launch will start a fresh conversation):
+The pin is sticky: every launch passes `--resume <uuid>` until you change it. If a pinned conversation becomes invalid, the next launch starts fresh automatically.
+
+Start fresh once:
 
 ```sh
 aoe session set-session-id <session-name-or-id> ""
 ```
 
+This is one-shot; the next launch starts fresh, then auto-resume takes over again. To stay fresh every launch, clear before each restart.
+
+Structured-view sessions manage their own conversation through ACP and reject `set-session-id`. Toggle the session out of structured view first, or set the resume target through the structured view UI.
+
 ## Disabling
 
-There's no toggle. If you want a fresh conversation, clear the stored ID with the CLI command above, or delete the session and recreate it.
+There is no toggle. To start fresh once, use `set-session-id ""`. To drop the persisted state entirely, delete the session and recreate it.
 
 ## Storage
 
-The session ID lives in `sessions.json` in your AoE config directory:
+State lives in `sessions.json` in your AoE config directory:
 
 - **Linux**: `$XDG_CONFIG_HOME/agent-of-empires/profiles/<profile>/sessions.json`
 - **macOS/Windows**: `~/.agent-of-empires/profiles/<profile>/sessions.json`
 
-Look for the `agent_session_id` field on each instance.
+Two relevant fields:
+
+- `agent_session_id`: the observed conversation ID. Auto-managed; do not edit.
+- `resume_intent`: your intent (`Default`, `Use(uuid)`, `Cleared`). Set via the CLI above. Absent when `Default`.

@@ -2,16 +2,19 @@
 
 mod input;
 mod render;
+mod split;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use crate::file_watch::FileWatchService;
 use crate::git::diff::{
     check_merge_base_status, compute_changed_files, compute_file_diff, get_default_base_ref,
     list_branches, DiffFile, FileDiff,
 };
 use crate::session::config::{load_config, save_config};
-use crate::session::Config;
+use crate::session::{load_profile_config, resolve_config_or_warn, save_profile_config, Config};
 use crate::tui::dialogs::InfoDialog;
 
 pub use input::DiffAction;
@@ -70,6 +73,9 @@ pub struct DiffView {
     /// Context lines for diff
     pub(crate) context_lines: usize,
 
+    /// Render the selected file's diff side-by-side instead of unified.
+    pub(crate) split_view: bool,
+
     /// Show help overlay
     pub(crate) show_help: bool,
 
@@ -78,6 +84,24 @@ pub struct DiffView {
 
     /// Warning dialog shown when merge-base can't be computed
     pub(crate) warning_dialog: Option<InfoDialog>,
+
+    /// Override that has been persisted to disk but not yet propagated
+    /// back to HomeView's in-memory `Instance.base_branch_override`.
+    /// HomeView consumes this after each key event via
+    /// `take_pending_override` and applies it to its cache; without
+    /// this hand-off, HomeView's next `commit` would overwrite the
+    /// disk value with its stale memory copy. See #1175.
+    pub(crate) pending_override: Option<(String, Option<String>)>,
+
+    /// Inner rect of the file-list panel, captured during `render`.
+    /// Lets a click on a file row select it and a hover highlight it
+    /// the same way `j`/`k` would.
+    pub(crate) file_list_inner: ratatui::layout::Rect,
+
+    /// Process-wide file-watch primitive, threaded through to per-session
+    /// `Storage` writes so the local in-process Local fast path fires when
+    /// the diff view persists a `base_branch_override`.
+    pub(crate) file_watch: Arc<FileWatchService>,
 }
 
 impl DiffView {
@@ -85,32 +109,51 @@ impl DiffView {
     /// branch through the picker only mutates in-memory state. Callers
     /// that have a session id should use `new_for_session` so the
     /// override persists.
-    pub fn new(repo_path: PathBuf) -> anyhow::Result<Self> {
-        Self::new_for_session(repo_path, None, String::new(), None)
+    pub fn new(repo_path: PathBuf, file_watch: Arc<FileWatchService>) -> anyhow::Result<Self> {
+        Self::new_for_session(repo_path, None, String::new(), None, None, file_watch)
     }
 
     /// Create a diff view bound to a session. `base_override` (the
     /// session's persisted `base_branch_override`) wins over the
-    /// profile default and auto-detection. Subsequent calls to
-    /// `select_branch` persist the new ref back to the session record.
+    /// worktree's recorded base branch (`worktree_base`), which wins
+    /// over the profile default and auto-detection. Subsequent calls
+    /// to `select_branch` persist the new ref back to the session
+    /// record.
     pub fn new_for_session(
         repo_path: PathBuf,
         session_id: Option<String>,
         profile: String,
         base_override: Option<String>,
+        worktree_base: Option<String>,
+        file_watch: Arc<FileWatchService>,
     ) -> anyhow::Result<Self> {
-        let config = Config::load_or_warn();
+        // Use the profile-merged config so a per-profile Diff override (e.g.
+        // split_view) is honored on open. The session-agnostic path (empty
+        // profile) falls back to the global config.
+        let config = if profile.is_empty() {
+            Config::load_or_warn()
+        } else {
+            resolve_config_or_warn(&profile)
+        };
 
         let base_branch = base_override
             .as_deref()
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string)
+            .or_else(|| {
+                worktree_base
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string)
+            })
             .or_else(|| config.diff.default_branch.clone())
             .or_else(|| get_default_base_ref(&repo_path).ok())
             .unwrap_or_else(|| "main".to_string());
 
         let context_lines = config.diff.context_lines;
+        let split_view = config.diff.split_view;
 
         let warning_dialog = check_merge_base_status(&repo_path, &base_branch)
             .map(|msg| InfoDialog::new("Warning", &msg));
@@ -130,9 +173,13 @@ impl DiffView {
             error_message: None,
             success_message: None,
             context_lines,
+            split_view,
             show_help: false,
             file_list_width: config.app_state.diff_file_list_width.unwrap_or(35),
             warning_dialog,
+            pending_override: None,
+            file_list_inner: ratatui::layout::Rect::default(),
+            file_watch,
         };
 
         view.refresh_files()?;
@@ -153,6 +200,21 @@ impl DiffView {
     /// Get the currently selected file
     pub fn selected_file(&self) -> Option<&DiffFile> {
         self.files.get(self.selected_file)
+    }
+
+    /// Repo-relative path of the selected file as a string, if any.
+    pub(crate) fn selected_path_string(&self) -> Option<String> {
+        self.selected_file()
+            .map(|f| f.path.to_string_lossy().to_string())
+    }
+
+    /// Copy the selected file's repo-relative path to the system clipboard and
+    /// surface a confirmation in the footer.
+    pub(crate) fn copy_selected_path(&mut self) {
+        if let Some(path) = self.selected_path_string() {
+            crate::tui::clipboard::copy_to_clipboard(&path);
+            self.success_message = Some(format!("Copied {path}"));
+        }
     }
 
     /// Get or compute the diff for the selected file
@@ -214,19 +276,30 @@ impl DiffView {
         }
     }
 
-    fn persist_base_override(&self) -> anyhow::Result<()> {
-        let Some(session_id) = self.session_id.as_deref() else {
+    fn persist_base_override(&mut self) -> anyhow::Result<()> {
+        let Some(session_id) = self.session_id.clone() else {
             return Ok(());
         };
-        let storage = crate::session::Storage::new(&self.profile)?;
-        let (mut instances, groups) = storage.load_with_groups()?;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == session_id) else {
-            return Ok(());
-        };
-        inst.base_branch_override = Some(self.base_branch.clone());
-        let group_tree = crate::session::GroupTree::new_with_groups(&instances, &groups);
-        storage.save_with_groups(&instances, &group_tree)?;
+        let storage = crate::session::Storage::new(&self.profile, self.file_watch.clone())?;
+        let new_override = Some(self.base_branch.clone());
+        let id_for_closure = session_id.clone();
+        let new_override_for_closure = new_override.clone();
+        storage.update(|instances, _groups| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_for_closure) {
+                inst.base_branch_override = new_override_for_closure;
+            }
+            Ok(())
+        })?;
+        self.pending_override = Some((session_id, new_override));
         Ok(())
+    }
+
+    /// Drain a pending base-branch override that was just persisted to
+    /// disk. HomeView calls this after each key event so its in-memory
+    /// `Instance.base_branch_override` stays consistent with disk;
+    /// otherwise its next `commit` would overwrite the persisted value.
+    pub fn take_pending_override(&mut self) -> Option<(String, Option<String>)> {
+        self.pending_override.take()
     }
 
     /// Navigate to next file
@@ -295,6 +368,44 @@ impl DiffView {
         }
     }
 
+    /// Persist the current `split_view` choice so it survives restarts and
+    /// stays in sync with the settings TUI. A profile-scoped session writes the
+    /// choice to that profile's override; a session-agnostic view writes the
+    /// global default.
+    pub(crate) fn persist_split_view(&self) {
+        if self.profile.is_empty() {
+            if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+                config.diff.split_view = self.split_view;
+                if let Err(e) = save_config(&config) {
+                    tracing::warn!("failed to persist diff split_view: {e}");
+                }
+            }
+            return;
+        }
+        match load_profile_config(&self.profile) {
+            Ok(mut profile_config) => {
+                // Overrides are sparse JSON (#1692): set diff.split_view in the
+                // generic override map rather than a typed DiffConfigOverride.
+                let diff = profile_config
+                    .overrides
+                    .entry("diff".to_string())
+                    .or_insert_with(|| serde_json::json!({}));
+                if let Some(obj) = diff.as_object_mut() {
+                    obj.insert("split_view".to_string(), serde_json::json!(self.split_view));
+                }
+                if let Err(e) = save_profile_config(&self.profile, &profile_config) {
+                    tracing::warn!(
+                        "failed to persist diff split_view for profile {}: {e}",
+                        self.profile
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to load profile config {}: {e}", self.profile);
+            }
+        }
+    }
+
     /// Minimal DiffView for unit tests. Centralised so new fields only need
     /// a default value in one place.
     #[cfg(test)]
@@ -314,9 +425,13 @@ impl DiffView {
             error_message: None,
             success_message: None,
             context_lines: 3,
+            split_view: false,
             show_help: false,
             file_list_width: 35,
             warning_dialog: None,
+            pending_override: None,
+            file_list_inner: ratatui::layout::Rect::default(),
+            file_watch: FileWatchService::noop(),
         }
     }
 }

@@ -1,4 +1,5 @@
-import { test, expect, Page } from "@playwright/test";
+import { test, expect } from "./helpers/mockedTest";
+import { Page } from "@playwright/test";
 import { clickSidebarSession } from "./helpers/sidebar";
 import { mockTerminalApis } from "./helpers/terminal-mocks";
 
@@ -24,9 +25,7 @@ const DIFF_FILES_RESPONSE = {
 
 async function setupSession(page: Page) {
   await mockTerminalApis(page);
-  await page.route("**/api/sessions/*/diff/files", (r) =>
-    r.fulfill({ json: DIFF_FILES_RESPONSE }),
-  );
+  await page.route("**/api/sessions/*/diff/files", (r) => r.fulfill({ json: DIFF_FILES_RESPONSE }));
   await page.route("**/api/git/branches**", (r) =>
     r.fulfill({
       json: [
@@ -41,9 +40,7 @@ async function setupSession(page: Page) {
 test.use({ viewport: { width: 1280, height: 720 } });
 
 test.describe("Diff base override (#970)", () => {
-  test("clicking the chip opens a typeahead populated from /api/git/branches", async ({
-    page,
-  }) => {
+  test("clicking the chip opens a typeahead populated from /api/git/branches", async ({ page }) => {
     await setupSession(page);
     await page.goto("/");
     await expect(page.locator("header")).toBeVisible();
@@ -58,9 +55,7 @@ test.describe("Diff base override (#970)", () => {
     await expect(page.getByRole("option", { name: /upstream\/main/ })).toBeVisible();
   });
 
-  test("selecting a branch PATCHes diff-base and the chip reflects the new value", async ({
-    page,
-  }) => {
+  test("selecting a branch PATCHes diff-base and the chip reflects the new value", async ({ page }) => {
     await setupSession(page);
     let patched: { base_branch?: string | null } | null = null;
     let getCount = 0;
@@ -102,7 +97,9 @@ test.describe("Diff base override (#970)", () => {
     await page.getByRole("option", { name: /develop/ }).click();
     await expect.poll(() => patched?.base_branch).toBe("develop");
     await expect(
-      page.getByRole("button", { name: /Change diff base \(current: develop\)/ }),
+      page.getByRole("button", {
+        name: /Change diff base \(current: develop\)/,
+      }),
     ).toBeVisible({ timeout: 5000 });
   });
 
@@ -113,27 +110,30 @@ test.describe("Diff base override (#970)", () => {
     await page.route("**/api/sessions", (r) => {
       if (r.request().method() === "POST") return r.fulfill({ status: 400 });
       return r.fulfill({
-        json: [
-          {
-            id: "pinch-test",
-            title: "pinch-test",
-            project_path: "/tmp/pinch-test",
-            group_path: "/tmp",
-            tool: "claude",
-            status: "Running",
-            yolo_mode: false,
-            created_at: new Date().toISOString(),
-            last_accessed_at: null,
-            last_error: null,
-            branch: null,
-            main_repo_path: null,
-            base_branch_override: "upstream/main",
-            is_sandboxed: false,
-            has_terminal: true,
-            profile: "default",
-            workspace_repos: [],
-          },
-        ],
+        json: {
+          sessions: [
+            {
+              id: "pinch-test",
+              title: "pinch-test",
+              project_path: "/tmp/pinch-test",
+              group_path: "/tmp",
+              tool: "claude",
+              status: "Running",
+              yolo_mode: false,
+              created_at: new Date().toISOString(),
+              last_accessed_at: null,
+              last_error: null,
+              branch: null,
+              main_repo_path: null,
+              base_branch_override: "upstream/main",
+              is_sandboxed: false,
+              has_terminal: true,
+              profile: "default",
+              workspace_repos: [],
+            },
+          ],
+          workspace_ordering: [],
+        },
       });
     });
     let patched: { base_branch?: string | null } | null = null;

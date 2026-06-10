@@ -22,6 +22,39 @@ pub struct Session {
     name: String,
 }
 
+/// The active pane's cursor, queried alongside a `capture-pane` so the
+/// live-send preview can paint a real cursor (`capture-pane` returns cell
+/// text only; tmux's own client draws the cursor from these pane fields).
+/// `pane_height` rides along so the renderer can map `y` (counted from the
+/// top of the visible screen) onto the bottom-anchored preview output rect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneCursor {
+    pub x: u16,
+    pub y: u16,
+    /// `#{cursor_flag}`: 0 when the application hid the cursor (DECTCEM),
+    /// e.g. an agent that parks it while "working". Don't paint when false.
+    pub visible: bool,
+    pub pane_height: u16,
+}
+
+impl PaneCursor {
+    /// Parse the single space-separated line emitted by the
+    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}` format.
+    fn parse(line: &str) -> Option<Self> {
+        let mut fields = line.split_whitespace();
+        let x = fields.next()?.parse().ok()?;
+        let y = fields.next()?.parse().ok()?;
+        let flag: u8 = fields.next()?.parse().ok()?;
+        let pane_height = fields.next()?.parse().ok()?;
+        Some(Self {
+            x,
+            y,
+            visible: flag != 0,
+            pane_height,
+        })
+    }
+}
+
 impl Session {
     pub fn new(id: &str, title: &str) -> Result<Self> {
         Ok(Self {
@@ -84,7 +117,7 @@ impl Session {
 
         // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
         // Log args at debug level for troubleshooting.
-        tracing::debug!(
+        tracing::debug!(target: "tmux.command",
             "tmux new-session args: {:?}",
             args.iter()
                 .map(|a| crate::session::environment::redact_env_values(a))
@@ -173,19 +206,7 @@ impl Session {
             process::kill_process_tree(pane_pid);
         }
 
-        let output = Command::new("tmux")
-            .args(["kill-session", "-t", &self.name])
-            .output()?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Session vanished between the exists() check and kill-session
-            // (e.g. process tree kill caused tmux to tear it down). That's
-            // fine -- the goal was to remove the session and it's gone.
-            if !stderr.contains("can't find session") {
-                bail!("Failed to kill tmux session: {}", stderr);
-            }
-        }
+        super::utils::kill_session_if_present(&self.name)?;
 
         refresh_session_cache();
 
@@ -323,6 +344,53 @@ impl Session {
         }
     }
 
+    /// Capture the pane like [`capture_pane`](Self::capture_pane), but in the
+    /// same `tmux` fork also query the cursor position + visibility, so the
+    /// live-send preview can paint a real cursor without paying a second fork
+    /// per capture cycle. The cursor line is emitted first (a single
+    /// `display-message` line) and the capture content follows; we split it
+    /// back off. Returns `None` for the cursor if the pane is gone or the
+    /// header didn't parse, in which case the caller simply paints no cursor.
+    pub fn capture_pane_with_cursor(&self, lines: usize) -> Result<(String, Option<PaneCursor>)> {
+        if !self.exists() {
+            return Ok((String::new(), None));
+        }
+
+        let target = format!("{}:^.0", self.name);
+        let start = format!("-{}", lines);
+        let output = Command::new("tmux")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "-F",
+                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}",
+                ";",
+                "capture-pane",
+                "-t",
+                &target,
+                "-p",
+                "-e",
+                "-S",
+                &start,
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            return Ok((String::new(), None));
+        }
+
+        let raw = String::from_utf8_lossy(&output.stdout);
+        // The cursor line is the first line; everything after the first
+        // newline is the verbatim `capture-pane` output (same bytes the
+        // plain `capture_pane` path returns).
+        let mut parts = raw.splitn(2, '\n');
+        let cursor_line = parts.next().unwrap_or("");
+        let content = parts.next().unwrap_or("").to_string();
+        Ok((content, PaneCursor::parse(cursor_line)))
+    }
+
     pub fn get_pane_pid(&self) -> Option<u32> {
         process::get_pane_pid(&self.name)
     }
@@ -364,17 +432,30 @@ impl Session {
         let line_count = text.lines().count();
         let max_line = text.lines().map(str::len).max().unwrap_or(0);
 
-        // Long or multi-line messages go through the tmux paste-buffer path
-        // (load-buffer over stdin, then paste-buffer with bracketed-paste
+        // Non-trivial or multi-line messages go through the tmux paste-buffer
+        // path (load-buffer over stdin, then paste-buffer with bracketed-paste
         // markers). The per-line `send-keys -l` + ESC+CR path encodes
         // newlines as Shift+Enter, which is brittle compared to the
         // bracketed-paste contract claude-code (and most agents in raw mode)
-        // are designed to ingest; the byte threshold is a conservative cap
-        // so very long single-line payloads also take the safer path.
-        const PASTE_BYTE_THRESHOLD: usize = 2048;
+        // are designed to ingest.
+        //
+        // The threshold is intentionally small: bracketed paste is also what
+        // prevents the receiving agent's input-burst detector from treating
+        // the trailing Enter as part of the keystroke stream and inserting a
+        // newline instead of submitting. Empirically, on Mosh sessions
+        // (bracketed-paste stripped end-to-end) a single-line ~365-byte
+        // VoiceInk dictation that took the `send-keys -l` path was followed
+        // by `tmux send-keys Enter` at 0ms and the agent rendered the text
+        // but never submitted, because the Enter arrived inside the burst
+        // window. Routing anything beyond a handful of characters through
+        // the bracketed-paste path frames it as a paste, after which the
+        // trailing Enter reliably submits. See gemini-cli#26114 for
+        // independent confirmation that claude-code handles paste correctly
+        // only when bracketed-paste markers are present.
+        const PASTE_BYTE_THRESHOLD: usize = 16;
         let use_paste_buffer = byte_len >= PASTE_BYTE_THRESHOLD || text.contains('\n');
 
-        tracing::debug!(
+        tracing::debug!(target: "tmux.command",
             "send_keys_with_delay: bytes={} lines={} max_line={} use_paste_buffer={} target={}",
             byte_len,
             line_count,
@@ -399,6 +480,55 @@ impl Session {
         Self::tmux_send(&target, &["Enter"])?;
 
         Ok(())
+    }
+
+    /// Restore automatic window sizing after live-send forced a manual
+    /// size. tmux's `resize-window -x -y` silently switches the window-
+    /// size option to `manual`, so without this call a later
+    /// `attach-session` from a full-size terminal would keep the window
+    /// at the small preview dimensions live-send left behind. Re-setting
+    /// the option to `latest` is the documented escape hatch and matches
+    /// the policy `append_window_size_args` installs at session create.
+    /// Best-effort: failures (session gone, tmux ENOENT) are swallowed
+    /// so a stuck pane never blocks the user's exit from live mode.
+    pub fn reset_size_to_latest_client(&self) {
+        if !self.exists() {
+            return;
+        }
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", &self.name, "window-size", "latest"])
+            .output();
+    }
+
+    /// Resize the (detached) window to `cols`x`rows`. Best-effort: a missing
+    /// session or a tmux ENOENT is swallowed so a transient failure never
+    /// blocks a render.
+    ///
+    /// Used to keep a detached agent's pane sized to the visible preview area:
+    /// a full-screen agent is sized to whatever terminal it was last attached
+    /// from, so without this it renders taller than the preview window and the
+    /// bottom-anchored capture clips the top rows (worse when the info header
+    /// steals rows). Mirrors what live-send does through its worker.
+    ///
+    /// NOTE: tmux's `resize-window -x -y` silently flips the window-size option
+    /// to `manual`, so any later `attach-session` must call
+    /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
+    /// or the window stays pinned at these preview dimensions.
+    pub fn resize_window(&self, cols: u16, rows: u16) {
+        if cols == 0 || rows == 0 || !self.exists() {
+            return;
+        }
+        let _ = Command::new("tmux")
+            .args([
+                "resize-window",
+                "-t",
+                &self.name,
+                "-x",
+                &cols.to_string(),
+                "-y",
+                &rows.to_string(),
+            ])
+            .output();
     }
 
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.
@@ -516,6 +646,7 @@ fn build_create_args(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_helpers::TmuxTestSession;
     use super::*;
 
     /// Helper: check if tmux is available for tests that need it
@@ -528,6 +659,90 @@ mod tests {
     }
 
     #[test]
+    fn pane_cursor_parses_format_line() {
+        let c = PaneCursor::parse("3 2 1 24").expect("parses");
+        assert_eq!(
+            c,
+            PaneCursor {
+                x: 3,
+                y: 2,
+                visible: true,
+                pane_height: 24,
+            }
+        );
+        // cursor_flag 0 => hidden.
+        assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
+        // Garbage / short input yields None rather than a bogus cursor.
+        assert!(PaneCursor::parse("").is_none());
+        assert!(PaneCursor::parse("1 2 3").is_none());
+        assert!(PaneCursor::parse("a b c d").is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_pane_with_cursor_returns_content_and_cursor() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_cursor");
+        let name = guard.name().to_string();
+        // `printf` (no trailing newline, no shell prompt, no input echo) parks
+        // the cursor deterministically just past the written text: "hello" is
+        // 5 columns, so the cursor lands at (5, 0). `sleep` keeps the pane
+        // alive across the capture; generous so a test thread starved by
+        // parallel suite load can't outlive the pane before capturing.
+        let status = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "40",
+                "-y",
+                "10",
+                "sh -c 'printf hello; sleep 60'",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+
+        // Poll until the pane has painted; a fixed sleep is flaky under
+        // parallel test load (the pane needs the shell to spawn and printf
+        // to run before capture sees anything).
+        let session = Session::from_name(&name);
+        let mut painted = (String::new(), None);
+        for _ in 0..50 {
+            let (content, cursor) = session
+                .capture_pane_with_cursor(5)
+                .expect("capture with cursor");
+            if content.contains("hello") {
+                painted = (content, cursor);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let (content, cursor) = painted;
+
+        // The capture content is the same text the plain path would return:
+        // the cursor line must have been split off, not leak into the body.
+        assert!(
+            content.contains("hello"),
+            "capture content should hold the written text, got: {content:?}"
+        );
+        let cursor = cursor.expect("a live session reports a cursor");
+        assert!(cursor.visible, "default cursor is visible");
+        assert_eq!(cursor.pane_height, 10, "pane was created 10 rows tall");
+        assert_eq!(
+            (cursor.x, cursor.y),
+            (5, 0),
+            "cursor parks just past 'hello'"
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_remain_on_exit_and_pane_dead() {
         if !tmux_available() {
@@ -535,7 +750,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_remain_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_remain");
+        let session_name = guard.name().to_string();
         // Chain set-option -p with new-session to avoid race condition
         let output = Command::new("tmux")
             .args([
@@ -580,11 +796,6 @@ mod tests {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         assert!(pane_dead, "Pane should be dead after command exits");
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -595,7 +806,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_alive_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_alive");
+        let session_name = guard.name().to_string();
 
         // Create a session with a long-running command
         let output = Command::new("tmux")
@@ -632,11 +844,6 @@ mod tests {
             .map(|s| s.trim() == "1")
             .unwrap_or(false);
         assert!(!pane_dead, "Pane should be alive while command is running");
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for #435: with multiple tmux windows, pane health
@@ -650,7 +857,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_multiwin_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_multiwin");
+        let session_name = guard.name().to_string();
 
         // Create session with a long-running command in window 0
         let output = Command::new("tmux")
@@ -709,11 +917,6 @@ mod tests {
             !is_pane_dead(&session_name),
             "is_pane_dead should check the first window's pane, not the active window"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test: capture_pane must target the first window's pane
@@ -727,7 +930,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_capture_multiwin_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_capture_multiwin");
+        let session_name = guard.name().to_string();
 
         // Create session running sleep in the first window
         let output = Command::new("tmux")
@@ -783,11 +987,6 @@ mod tests {
             !session.is_pane_running_shell(),
             "is_pane_running_shell should check first window (sleep), not active window (sh)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test: is_pane_running_shell must target the first window's
@@ -800,7 +999,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_shell_multiwin_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_shell_multiwin");
+        let session_name = guard.name().to_string();
 
         // Create session running sleep (not a shell) in the first window
         let output = Command::new("tmux")
@@ -845,11 +1045,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should target first window (sleep), not active window (sh)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for #488: when a user creates a split pane and makes it
@@ -863,7 +1058,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_splitpane_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_splitpane");
+        let session_name = guard.name().to_string();
 
         // Create session with a long-running command (the "agent")
         let output = Command::new("tmux")
@@ -916,11 +1112,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should check pane 0 (sleep), not the active split pane (shell)"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for #488: ensure status checks work correctly when both
@@ -933,7 +1124,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_splitpbi_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_splitpbi");
+        let session_name = guard.name().to_string();
 
         // Create session with pane-base-index 0 pinned (as aoe does)
         let output = Command::new("tmux")
@@ -990,11 +1182,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "is_pane_running_shell should check pane 0 (sleep) with pane-base-index pinned to 0"
         );
-
-        // Clean up
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -1066,7 +1253,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_shell_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_shell");
+        let session_name = guard.name().to_string();
 
         let output = Command::new("tmux")
             .args([
@@ -1090,10 +1278,6 @@ mod tests {
             is_pane_running_shell(&session_name),
             "Session running sh should be detected as a shell"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     #[test]
@@ -1104,7 +1288,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_noshell_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_noshell");
+        let session_name = guard.name().to_string();
 
         let output = Command::new("tmux")
             .args([
@@ -1129,10 +1314,6 @@ mod tests {
             !is_pane_running_shell(&session_name),
             "Session running 'sleep' should not be detected as a shell"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// Regression test for the dead-pane restart bug: a session whose pane
@@ -1146,7 +1327,8 @@ mod tests {
             return;
         }
 
-        let session_name = format!("aoe_test_respawn_{}", std::process::id());
+        let guard = TmuxTestSession::new("aoe_test_respawn");
+        let session_name = guard.name().to_string();
 
         // Start a session with a command that exits immediately and
         // remain-on-exit set, so we end up with a dead pane. Pin
@@ -1209,10 +1391,6 @@ mod tests {
             !respawned_again,
             "respawn_dead_pane should report no-op on live pane"
         );
-
-        let _ = Command::new("tmux")
-            .args(["kill-session", "-t", &session_name])
-            .output();
     }
 
     /// respawn_dead_pane on a non-existent session is a safe no-op.

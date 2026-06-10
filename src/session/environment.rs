@@ -221,12 +221,36 @@ pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
             match std::env::var(entry) {
                 Ok(v) => out.push_str(&format!("{}={} ", entry, shell_escape(&v))),
                 Err(_) => {
-                    tracing::warn!("host environment variable {} is not set; skipping", entry)
+                    tracing::warn!(target: "session.create", "host environment variable {} is not set; skipping", entry)
                 }
             }
         }
     }
     out
+}
+
+pub(crate) fn resolve_host_environment_value(
+    entries: &[String],
+    target_key: &str,
+) -> Option<String> {
+    let mut resolved_value = None;
+    for entry in entries {
+        if let Some((key, value)) = entry.split_once('=') {
+            if key == target_key {
+                if let Some(value) = resolve_env_value(value) {
+                    resolved_value = Some(value);
+                }
+            }
+        } else if entry == target_key {
+            match std::env::var(entry) {
+                Ok(value) => resolved_value = Some(value),
+                Err(_) => {
+                    tracing::warn!("host environment variable {} is not set; skipping", entry)
+                }
+            }
+        }
+    }
+    resolved_value
 }
 
 /// Resolve an environment value. If the value starts with `$`, read the
@@ -239,7 +263,7 @@ pub(crate) fn resolve_env_value(val: &str) -> Option<String> {
         match std::env::var(var_name) {
             Ok(v) => Some(v),
             Err(_) => {
-                tracing::warn!(
+                tracing::warn!(target: "session.create",
                     "Environment variable ${} is not set on host, skipping",
                     var_name
                 );
@@ -249,6 +273,36 @@ pub(crate) fn resolve_env_value(val: &str) -> Option<String> {
     } else {
         Some(val.to_string())
     }
+}
+
+/// Validate every entry in a list and return any warnings.
+///
+/// Mirrors what `collect_environment` will silently drop at container
+/// create or docker exec time, so callers can surface the same warnings
+/// to the user via toast or stderr before the failure becomes invisible.
+///
+/// `DEFAULT_TERMINAL_ENV_VARS` are pass-through-if-set toggles (FORCE_COLOR
+/// and NO_COLOR in particular are mutually exclusive and intentionally
+/// unset on most hosts), so we skip them. Without this skip, every new
+/// sandboxed session pops a warning dialog for env vars the user never
+/// set on purpose.
+pub fn validate_env_entries<I, S>(entries: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            let s = e.as_ref();
+            let key = s.split_once('=').map(|(k, _)| k).unwrap_or(s);
+            if DEFAULT_TERMINAL_ENV_VARS.contains(&key) {
+                None
+            } else {
+                validate_env_entry(s)
+            }
+        })
+        .collect()
 }
 
 /// Validate an env entry string and return a warning message if it references
@@ -269,7 +323,7 @@ pub fn validate_env_entry(entry: &str) -> Option<String> {
                 Some("Warning: bare '$' in value has no variable name".to_string())
             } else if resolve_env_value(value).is_none() {
                 Some(format!(
-                    "Warning: ${} is not set on the host -- it will be empty in the container",
+                    "Warning: ${} is not set on the host, so the value will be empty in the container",
                     var_name
                 ))
             } else {
@@ -283,7 +337,7 @@ pub fn validate_env_entry(entry: &str) -> Option<String> {
         // Bare key -- pass through from host
         if std::env::var(entry).is_err() {
             Some(format!(
-                "Warning: {} is not set on the host -- it will be empty in the container",
+                "Warning: {} is not set on the host, so the value will be empty in the container",
                 entry
             ))
         } else {
@@ -384,7 +438,7 @@ pub(crate) fn collect_environment(
                         });
                     }
                     Err(_) => {
-                        tracing::warn!(
+                        tracing::warn!(target: "session.create",
                             "Environment variable {} is not set on host, skipping",
                             entry
                         );
@@ -392,6 +446,33 @@ pub(crate) fn collect_environment(
                 }
             }
         }
+    }
+
+    // Git's safe-directory check fails when the container user (root) does not
+    // match the file owner (host UID 1000, shown as "ubuntu" inside the
+    // aoe-dev-sandbox image). Bind-mounted repos trigger:
+    //   fatal: detected dubious ownership in repository at '...'
+    // We inject safe.directory=* via Git's env-var config API (Git 2.31+),
+    // which overrides the check without modifying any files.
+    // Placed after the user entries loop so caller-provided GIT_CONFIG_*
+    // values take precedence (first-wins deduplication via seen_keys).
+    if seen_keys.insert("GIT_CONFIG_COUNT".to_string()) {
+        result.push(EnvEntry::Literal {
+            key: "GIT_CONFIG_COUNT".to_string(),
+            value: "1".to_string(),
+        });
+    }
+    if seen_keys.insert("GIT_CONFIG_KEY_0".to_string()) {
+        result.push(EnvEntry::Literal {
+            key: "GIT_CONFIG_KEY_0".to_string(),
+            value: "safe.directory".to_string(),
+        });
+    }
+    if seen_keys.insert("GIT_CONFIG_VALUE_0".to_string()) {
+        result.push(EnvEntry::Literal {
+            key: "GIT_CONFIG_VALUE_0".to_string(),
+            value: "*".to_string(),
+        });
     }
 
     result
@@ -442,7 +523,7 @@ pub(crate) fn build_docker_env_args(
 ) -> DockerExecEnv {
     let sandbox_config = resolved_sandbox_config(profile, project_path);
 
-    tracing::debug!(
+    tracing::debug!(target: "session.create",
         "build_docker_env_args: profile={:?}, config.sandbox.environment={:?}, extra_env={:?}",
         profile,
         sandbox_config.environment,
@@ -451,12 +532,12 @@ pub(crate) fn build_docker_env_args(
 
     let env_entries = collect_environment(&sandbox_config, sandbox);
 
-    tracing::debug!(
+    tracing::debug!(target: "session.create",
         "build_docker_env_args: resolved {} env entries",
         env_entries.len()
     );
     for entry in &env_entries {
-        tracing::debug!("  env: {}=<set>", entry.key());
+        tracing::debug!(target: "session.create", "  env: {}=<set>", entry.key());
     }
 
     let mut docker_flag_parts: Vec<String> = Vec::new();
@@ -496,16 +577,16 @@ mod tests {
     fn test_build_docker_env_args_uses_passed_profile_not_global_default() {
         let temp_home = tempfile::TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         // Determine app dir layout (matches session::get_app_dir_path).
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let app_dir = temp_home
             .path()
             .join(".config")
-            .join(crate::session::APP_DIR_NAME_LINUX);
-        #[cfg(not(target_os = "linux"))]
+            .join(crate::session::APP_DIR_NAME_XDG);
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let app_dir = temp_home.path().join(crate::session::APP_DIR_NAME_OTHER);
 
         let profiles_dir = app_dir.join("profiles");
@@ -752,6 +833,35 @@ environment = ["GH_TOKEN=write_token"]
         assert_eq!(prefix, "X='a b'\\''c$d' ");
     }
 
+    #[test]
+    fn test_resolve_host_environment_value_uses_last_resolved_entry() {
+        std::env::remove_var("AOE_TEST_MISSING_HOST_ENV_VALUE");
+        let entries = vec![
+            "CODEX_HOME=/first".to_string(),
+            "OTHER=value".to_string(),
+            "CODEX_HOME=$AOE_TEST_MISSING_HOST_ENV_VALUE".to_string(),
+            "CODEX_HOME=/second".to_string(),
+        ];
+
+        assert_eq!(
+            resolve_host_environment_value(&entries, "CODEX_HOME"),
+            Some("/second".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_host_environment_value_matches_host_env_grammar() {
+        std::env::set_var("AOE_TEST_CODEX_HOME_REF", "/from-host");
+        let entries = vec!["CODEX_HOME=$AOE_TEST_CODEX_HOME_REF".to_string()];
+
+        assert_eq!(
+            resolve_host_environment_value(&entries, "CODEX_HOME"),
+            Some("/from-host".to_string())
+        );
+
+        std::env::remove_var("AOE_TEST_CODEX_HOME_REF");
+    }
+
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
@@ -799,6 +909,70 @@ environment = ["GH_TOKEN=write_token"]
         let entry = find_entry(&result, "MY_KEY").expect("MY_KEY not found");
         assert_eq!(entry.value(), "my_value");
         assert!(matches!(entry, EnvEntry::Literal { .. }));
+    }
+
+    #[test]
+    fn test_collect_environment_includes_git_safe_directory() {
+        let config = SandboxConfig::default();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+        let count = find_entry(&result, "GIT_CONFIG_COUNT").expect("GIT_CONFIG_COUNT not found");
+        assert_eq!(count.value(), "1");
+        assert!(matches!(count, EnvEntry::Literal { .. }));
+
+        let key = find_entry(&result, "GIT_CONFIG_KEY_0").expect("GIT_CONFIG_KEY_0 not found");
+        assert_eq!(key.value(), "safe.directory");
+        assert!(matches!(key, EnvEntry::Literal { .. }));
+
+        let value =
+            find_entry(&result, "GIT_CONFIG_VALUE_0").expect("GIT_CONFIG_VALUE_0 not found");
+        assert_eq!(value.value(), "*");
+        assert!(matches!(value, EnvEntry::Literal { .. }));
+    }
+
+    #[test]
+    fn test_collect_environment_git_safe_directory_user_override() {
+        // If the user already provides GIT_CONFIG_* entries (e.g. via
+        // sandbox.environment or extra_env), their values must take
+        // precedence over the built-in safe.directory defaults.
+        let config = SandboxConfig::default();
+        let info = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: Some(vec![
+                "GIT_CONFIG_COUNT=2".to_string(),
+                "GIT_CONFIG_KEY_0=safe.directory".to_string(),
+                "GIT_CONFIG_VALUE_0=/workspace/custom".to_string(),
+                "GIT_CONFIG_KEY_1=safe.directory".to_string(),
+                "GIT_CONFIG_VALUE_1=/workspace/other".to_string(),
+            ]),
+            custom_instruction: None,
+        };
+
+        let result = collect_environment(&config, &info);
+        let count = find_entry(&result, "GIT_CONFIG_COUNT").expect("GIT_CONFIG_COUNT not found");
+        assert_eq!(count.value(), "2");
+        assert!(matches!(count, EnvEntry::Literal { .. }));
+
+        let value0 =
+            find_entry(&result, "GIT_CONFIG_VALUE_0").expect("GIT_CONFIG_VALUE_0 not found");
+        assert_eq!(value0.value(), "/workspace/custom");
+        assert!(matches!(value0, EnvEntry::Literal { .. }));
+
+        let value1 =
+            find_entry(&result, "GIT_CONFIG_VALUE_1").expect("GIT_CONFIG_VALUE_1 not found");
+        assert_eq!(value1.value(), "/workspace/other");
+        assert!(matches!(value1, EnvEntry::Literal { .. }));
     }
 
     #[test]
@@ -947,6 +1121,76 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     fn test_validate_env_entry_escaped_dollar() {
         assert_eq!(validate_env_entry("MY_KEY=$$ESCAPED"), None);
+    }
+
+    #[test]
+    fn test_validate_env_entries_returns_one_warning_per_missing_var() {
+        // Use unique names to avoid collisions with other tests' env state.
+        std::env::remove_var("AOE_TEST_BATCH_MISSING_A");
+        std::env::remove_var("AOE_TEST_BATCH_MISSING_B");
+        std::env::set_var("AOE_TEST_BATCH_PRESENT", "ok");
+
+        let entries = vec![
+            "GH_TOKEN=$AOE_TEST_BATCH_MISSING_A".to_string(),
+            "OK=$AOE_TEST_BATCH_PRESENT".to_string(),
+            "ALSO_BROKEN=$AOE_TEST_BATCH_MISSING_B".to_string(),
+            "LITERAL=fine".to_string(),
+        ];
+        let warnings = validate_env_entries(&entries);
+        assert_eq!(
+            warnings.len(),
+            2,
+            "expected 2 warnings, got: {:?}",
+            warnings
+        );
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("AOE_TEST_BATCH_MISSING_A")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("AOE_TEST_BATCH_MISSING_B")));
+
+        std::env::remove_var("AOE_TEST_BATCH_PRESENT");
+    }
+
+    #[test]
+    fn test_validate_env_entries_empty_list() {
+        assert!(validate_env_entries(Vec::<String>::new()).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_validate_env_entries_skips_default_terminal_vars_when_unset() {
+        // Stash + remove the defaults so the test catches all four keys even
+        // on CI hosts where TERM/COLORTERM are set. `serial(shell_env)` matches
+        // the pattern used by other tests in this file that mutate globally-
+        // shared env vars.
+        let originals: Vec<(&&str, Option<String>)> = DEFAULT_TERMINAL_ENV_VARS
+            .iter()
+            .map(|k| (k, std::env::var(*k).ok()))
+            .collect();
+        for key in DEFAULT_TERMINAL_ENV_VARS {
+            std::env::remove_var(key);
+        }
+
+        let entries: Vec<String> = DEFAULT_TERMINAL_ENV_VARS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let warnings = validate_env_entries(&entries);
+
+        for (key, original) in originals {
+            match original {
+                Some(v) => std::env::set_var(*key, v),
+                None => std::env::remove_var(*key),
+            }
+        }
+
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings for default terminal vars even when unset, got: {:?}",
+            warnings
+        );
     }
 
     #[test]

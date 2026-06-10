@@ -2,15 +2,29 @@
 
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use tui_input::Input;
 
 use rattles::presets::prelude as spinners;
 
 use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
-use crate::tui::components::{render_text_field, render_text_field_with_ghost};
+use crate::tui::components::{
+    focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
+    render_text_field_with_ghost, render_tool_config_overlay, set_prefixed_input_cursor_position,
+    tool_config_suffix_spans, tool_cycler_spans, visible_slice,
+};
 use crate::tui::styles::Theme;
 
 impl NewSessionDialog {
-    pub fn render(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Rebuilt every frame: layout changes (a profile gains/loses
+        // its description row, scratch toggles off worktree, etc.) move
+        // every subsequent field, so stale rects would point at the
+        // wrong row. Clearing here also wipes rects when an overlay
+        // mode replaces the main form, so a click during sandbox /
+        // tool / worktree config mode doesn't snap focus to whatever
+        // main-form field used to be under that cell.
+        self.focusable_rects.clear();
+
         // If loading, render the loading overlay instead
         if self.loading {
             self.render_loading(frame, area, theme);
@@ -41,11 +55,28 @@ impl NewSessionDialog {
         let has_sandbox = self.docker_available && !is_host_only;
         let has_yolo = !self.selected_tool_always_yolo();
         let dialog_width = 80;
+        // Capture the full overlay area up front so the centered-pop
+        // pickers at the bottom of this function don't accidentally
+        // use a per-field `area` that the loop below shadows on every
+        // row. Without this the dir / group / branch / projects
+        // pickers anchor against whichever Layout chunk the local
+        // `area` last pointed at (typically the Group row) and render
+        // as a tiny strip inside the underlying dialog.
+        let full_area = area;
+        // When the selected profile has a description, the profile row needs
+        // an extra line to render it beneath the name. We compute this once
+        // here so the layout constraint and the renderer agree on height.
+        let profile_field_height: u16 =
+            if has_profile_selection && self.selected_profile_description().is_some() {
+                3
+            } else {
+                2
+            };
 
         // Build constraints dynamically based on visible fields only
         let mut constraints = Vec::new();
         if has_profile_selection {
-            constraints.push(Constraint::Length(2)); // Profile
+            constraints.push(Constraint::Length(profile_field_height)); // Profile
         }
         constraints.extend([
             Constraint::Length(2), // Title
@@ -64,14 +95,18 @@ impl NewSessionDialog {
         constraints.push(Constraint::Length(2)); // Group (always, at the bottom)
 
         // For errors, calculate how many lines we need based on the text length.
-        // Inner width = dialog_width - 2 (border) - 2 (margin) = 76
+        // Inner width = dialog_width - 2 (border) - 2 (margin) = 76.
+        // The regular hint line reserves 2 rows so the per-field keybind
+        // hints can wrap (e.g. when both path-shortcut hints and the global
+        // Ctrl+T scratch chip are present at once) instead of getting
+        // truncated mid-word at the modal edge.
         let error_lines: u16 = if let Some(error) = &self.error_message {
             let inner_width = (dialog_width - 4) as usize;
             let error_text = format!("✗ Error: {}", error);
             let needed = (error_text.len() as u16).div_ceil(inner_width as u16);
             needed.clamp(2, 6)
         } else {
-            1
+            2
         };
         constraints.push(Constraint::Min(error_lines)); // Hints/errors
 
@@ -139,104 +174,61 @@ impl NewSessionDialog {
 
         // Profile picker (only when multiple profiles)
         if has_profile_selection {
-            self.render_profile_field(frame, chunks[ci], theme);
+            let area = chunks[ci];
+            self.render_profile_field(frame, area, theme);
+            self.focusable_rects.push((0, area));
             ci += 1;
         }
 
         // Path (rendered first so the user picks the working directory
         // before naming the session).
-        let path_placeholder = if self.focused_field == self.path_field() {
+        let path_field_idx = self.path_field();
+        let path_placeholder = if self.focused_field == path_field_idx {
             Some("(Ctrl+P to browse directories)")
         } else {
             None
         };
-        self.render_path_field(frame, chunks[ci], path_placeholder, theme);
+        let area = chunks[ci];
+        self.render_path_field(frame, area, path_placeholder, theme);
+        self.focusable_rects.push((path_field_idx, area));
         ci += 1;
 
         // Title
+        let area = chunks[ci];
         render_text_field(
             frame,
-            chunks[ci],
+            area,
             "Title:",
             &self.title,
             self.focused_field == title_field,
             Some("(random civ)"),
             theme,
         );
+        self.focusable_rects.push((title_field, area));
         ci += 1;
 
-        // Tool (always shown, interactive or read-only)
+        // Tool (always shown, interactive or read-only). The cycler itself is
+        // shared with the Restart dialog via `tool_cycler_spans`; the New
+        // dialog appends its own config summary and Ctrl+P hint afterwards.
         let tool_field = base + 2;
         let is_tool_focused = has_tool_selection && self.focused_field == tool_field;
+        let mut tool_spans = tool_cycler_spans(
+            "Tool:",
+            self.available_tools[self.tool_index].as_str(),
+            self.tool_index,
+            self.available_tools.len(),
+            is_tool_focused,
+            theme,
+        );
+        let has_config =
+            !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
+        tool_spans.extend(tool_config_suffix_spans(has_config, is_tool_focused, theme));
+        let area = chunks[ci];
+        frame.render_widget(Paragraph::new(Line::from(tool_spans)), area);
+        // Push the tool rect only when interactive (multiple tools).
+        // A read-only tool row shouldn't accept focus on click.
         if has_tool_selection {
-            let label_style = if is_tool_focused {
-                Style::default().fg(theme.accent).underlined()
-            } else {
-                Style::default().fg(theme.text)
-            };
-
-            let mut tool_spans = vec![Span::styled("Tool:", label_style), Span::raw(" ")];
-
-            let selected_name = &self.available_tools[self.tool_index];
-            let total = self.available_tools.len();
-            let dimmed = Style::default().fg(theme.dimmed);
-            let accent = Style::default().fg(theme.accent).bold();
-
-            if is_tool_focused {
-                tool_spans.push(Span::styled("← ", dimmed));
-            }
-            tool_spans.push(Span::styled("● ", accent));
-            tool_spans.push(Span::styled(selected_name.as_str(), accent));
-            tool_spans.push(Span::styled(
-                format!("  [{}/{}]", self.tool_index + 1, total),
-                dimmed,
-            ));
-            if is_tool_focused {
-                tool_spans.push(Span::styled("  →", dimmed));
-            }
-
-            // Show Ctrl+P hint and summary of tool config
-            let has_config =
-                !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-            if has_config {
-                tool_spans.push(Span::styled(
-                    "  (configured)",
-                    Style::default().fg(theme.dimmed),
-                ));
-            }
-            if is_tool_focused {
-                tool_spans.push(Span::styled(
-                    if has_config {
-                        "  Ctrl+P: edit"
-                    } else {
-                        "  (Ctrl+P to configure)"
-                    },
-                    Style::default().fg(theme.dimmed),
-                ));
-            }
-
-            frame.render_widget(Paragraph::new(Line::from(tool_spans)), chunks[ci]);
-        } else {
-            let tool_style = Style::default().fg(theme.text);
-            let mut tool_spans = vec![
-                Span::styled("Tool:", tool_style),
-                Span::raw(" "),
-                Span::styled(
-                    self.available_tools[0].as_str(),
-                    Style::default().fg(theme.accent),
-                ),
-            ];
-
-            let has_config =
-                !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-            if has_config {
-                tool_spans.push(Span::styled(
-                    "  (configured)",
-                    Style::default().fg(theme.dimmed),
-                ));
-            }
-
-            frame.render_widget(Paragraph::new(Line::from(tool_spans)), chunks[ci]);
+            self.focusable_rects.push((tool_field, area));
         }
         ci += 1;
 
@@ -269,7 +261,9 @@ impl NewSessionDialog {
                     },
                 ),
             ]);
-            frame.render_widget(Paragraph::new(yolo_line), chunks[ci]);
+            let area = chunks[ci];
+            frame.render_widget(Paragraph::new(yolo_line), area);
+            self.focusable_rects.push((yolo_mode_field, area));
             ci += 1;
         }
 
@@ -326,7 +320,9 @@ impl NewSessionDialog {
                 ));
             }
 
-            frame.render_widget(Paragraph::new(Line::from(spans)), chunks[ci]);
+            let area = chunks[ci];
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            self.focusable_rects.push((worktree_field, area));
             ci += 1;
         }
 
@@ -367,7 +363,9 @@ impl NewSessionDialog {
                 ));
             }
 
-            frame.render_widget(Paragraph::new(Line::from(spans)), chunks[ci]);
+            let area = chunks[ci];
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            self.focusable_rects.push((sandbox_field, area));
             ci += 1;
         }
 
@@ -378,9 +376,10 @@ impl NewSessionDialog {
             } else {
                 None
             };
+        let area = chunks[ci];
         render_text_field_with_ghost(
             frame,
-            chunks[ci],
+            area,
             "Group:",
             &self.group,
             self.focused_field == group_field,
@@ -388,6 +387,7 @@ impl NewSessionDialog {
             self.group_ghost_text(),
             theme,
         );
+        self.focusable_rects.push((group_field, area));
         ci += 1;
 
         // Hints/errors (last chunk)
@@ -456,62 +456,80 @@ impl NewSessionDialog {
                 hint_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.hint)));
                 hint_spans.push(Span::raw(" configure  "));
             }
+            // Ctrl+T scratch chip. Always present so the binding is
+            // discoverable without opening the `?` overlay. When focus is on
+            // the Path row the chip is emphasized (bold accent) so users
+            // about to type a path can see "you can skip this entirely with
+            // Ctrl+T". When scratch is already on, the chip flips to the
+            // undo verb and styles as accent so it reads as the active state.
+            let path_focused = self.focused_field == self.path_field();
+            let (scratch_key_style, scratch_label) = if self.scratch {
+                (
+                    Style::default().fg(theme.accent).bold(),
+                    " scratch on (undo)  ",
+                )
+            } else if path_focused {
+                (Style::default().fg(theme.accent).bold(), " scratch  ")
+            } else {
+                (Style::default().fg(theme.hint), " scratch  ")
+            };
+            hint_spans.push(Span::styled("Ctrl+T", scratch_key_style));
+            hint_spans.push(Span::raw(scratch_label));
+
             hint_spans.push(Span::styled("Enter", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" create  "));
             hint_spans.push(Span::styled("?", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" help  "));
             hint_spans.push(Span::styled("Esc", Style::default().fg(theme.hint)));
             hint_spans.push(Span::raw(" cancel"));
-            frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[hint_chunk]);
+            frame.render_widget(
+                Paragraph::new(Line::from(hint_spans)).wrap(Wrap { trim: true }),
+                chunks[hint_chunk],
+            );
         }
 
         if self.show_help {
-            self.render_help_overlay(frame, area, theme);
+            self.render_help_overlay(frame, full_area, theme);
         }
 
         if self.group_picker.is_active() {
-            self.group_picker.render(frame, area, theme);
+            self.group_picker.render(frame, full_area, theme);
         }
 
         if self.branch_picker.is_active() {
-            self.branch_picker.render(frame, area, theme);
+            self.branch_picker.render(frame, full_area, theme);
         }
 
         if self.projects_picker.is_active() {
-            self.projects_picker.render(frame, area, theme);
+            self.projects_picker.render(frame, full_area, theme);
         }
 
         if self.dir_picker.is_active() {
-            self.dir_picker.render(frame, area, theme);
+            self.dir_picker.render(frame, full_area, theme);
         }
     }
 
     fn render_profile_field(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let is_focused = self.focused_field == 0;
-        let label_style = if is_focused {
-            Style::default().fg(theme.accent).underlined()
-        } else {
-            Style::default().fg(theme.text)
-        };
+        let spans = profile_cycler_spans(
+            "Profile:",
+            self.selected_profile(),
+            self.available_profiles.len(),
+            self.focused_field == 0,
+            theme,
+        );
 
-        let selected = self.selected_profile();
-        let profile_style = if is_focused {
-            Style::default().fg(theme.accent).bold()
-        } else {
-            Style::default().fg(theme.accent)
-        };
-
-        let mut spans = vec![Span::styled("Profile:", label_style), Span::raw(" ")];
-
-        if self.available_profiles.len() > 1 {
-            spans.push(Span::styled("< ", Style::default().fg(theme.dimmed)));
-            spans.push(Span::styled(selected, profile_style));
-            spans.push(Span::styled(" >", Style::default().fg(theme.dimmed)));
-        } else {
-            spans.push(Span::styled(selected, profile_style));
+        let mut lines = vec![Line::from(spans)];
+        // Show the selected profile's description on the line below when one
+        // is set, so users can tell what each profile is for without leaving
+        // the dialog. (#949)
+        if let Some(desc) = self.selected_profile_description() {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", desc),
+                Style::default().fg(theme.dimmed),
+            )));
         }
 
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_path_field(
@@ -547,46 +565,83 @@ impl NewSessionDialog {
         let value_style = Style::default().fg(value_color);
 
         let value = self.path.value();
+        let prefix_width = 6; // "Path: "
+        let available_width = area.width.saturating_sub(prefix_width as u16) as usize;
+
         let mut spans = vec![Span::styled("Path:", label_style), Span::raw(" ")];
+
+        // Scratch mode disables this field. The undo hint lives in the
+        // bottom hint chip (`Ctrl+T scratch on (undo)`), so the marker
+        // here can be terse.
+        if self.scratch {
+            spans.push(Span::styled(
+                "(scratch directory)",
+                Style::default().fg(theme.dimmed),
+            ));
+            frame.render_widget(Paragraph::new(Line::from(spans)), area);
+            return;
+        }
 
         if value.is_empty() && !is_focused {
             if let Some(placeholder_text) = placeholder {
                 spans.push(Span::styled(placeholder_text, value_style));
             }
         } else if is_focused {
-            let cursor_pos = self.path.visual_cursor();
+            let scroll = input_scroll(&self.path, available_width);
             let cursor_style = if flashing_invalid {
                 Style::default().fg(theme.background).bg(theme.error)
             } else {
                 Style::default().fg(theme.background).bg(theme.accent)
             };
-
-            let before: String = value.chars().take(cursor_pos).collect();
-            let cursor_char: String = value
-                .chars()
-                .nth(cursor_pos)
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| " ".to_string());
-            let after: String = value.chars().skip(cursor_pos + 1).collect();
-
-            if !before.is_empty() {
-                spans.push(Span::styled(before, value_style));
-            }
-            spans.push(Span::styled(cursor_char, cursor_style));
-            if !after.is_empty() {
-                spans.push(Span::styled(after, value_style));
-            }
-            if let Some(ghost) = self.ghost_text() {
-                spans.push(Span::styled(ghost, Style::default().fg(theme.dimmed)));
+            let (field_spans, end_visible) = focused_input_spans(
+                value,
+                self.path.cursor(),
+                scroll,
+                available_width,
+                value_style,
+                cursor_style,
+            );
+            spans.extend(field_spans);
+            // Only show ghost when end of input is visible
+            if end_visible {
+                if let Some(ghost) = self.ghost_text() {
+                    spans.push(Span::styled(ghost, Style::default().fg(theme.dimmed)));
+                }
             }
         } else {
-            spans.push(Span::styled(value, value_style));
+            let scroll = input_scroll(&self.path, available_width);
+            let (visible, _) = visible_slice(value, scroll, available_width);
+            spans.push(Span::styled(visible, value_style));
         }
 
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+        if is_focused {
+            set_prefixed_input_cursor_position(frame, area, "Path: ", &self.path);
+        }
     }
 
-    fn render_sandbox_config(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn set_input_cursor_on_row(
+        frame: &mut Frame,
+        area: Rect,
+        row: usize,
+        prefix: &str,
+        input: &Input,
+    ) {
+        if row >= area.height as usize {
+            return;
+        }
+        let row_area = Rect {
+            x: area.x,
+            y: area.y.saturating_add(row as u16),
+            width: area.width,
+            height: 1,
+        };
+        set_prefixed_input_cursor_position(frame, row_area, prefix, input);
+    }
+
+    fn render_sandbox_config(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.sandbox_config_rects.clear();
         let dialog_width: u16 = 72;
 
         // Sandbox config fields: image, env, inherited
@@ -646,10 +701,12 @@ impl NewSessionDialog {
             None,
             theme,
         );
+        self.sandbox_config_rects.push((0, chunks[ci]));
         ci += 1;
 
         // Environment
         self.render_env_field(frame, chunks[ci], self.sandbox_focused_field == 1, theme);
+        self.sandbox_config_rects.push((1, chunks[ci]));
         ci += 1;
 
         // Inherited settings (always visible, not focusable)
@@ -672,106 +729,30 @@ impl NewSessionDialog {
         }
     }
 
-    fn render_tool_config(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let dialog_width: u16 = 72;
-
-        let constraints = vec![
-            Constraint::Length(2), // Command Override
-            Constraint::Length(2), // Extra Args
-            Constraint::Min(1),    // Hints
-        ];
-
-        let fields_height: u16 = constraints
-            .iter()
-            .map(|c| match c {
-                Constraint::Length(n) => *n,
-                Constraint::Min(n) => *n,
-                _ => 0,
-            })
-            .sum();
-        let dialog_height = fields_height + 4;
-
+    fn render_tool_config(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let selected_tool = self
             .available_tools
             .get(self.tool_index)
             .or_else(|| self.available_tools.first())
             .map(|s| s.as_str())
             .unwrap_or("claude");
-        let title = format!(" Tool Configuration: {} ", selected_tool);
-
-        let dialog_area = crate::tui::dialogs::centered_rect(area, dialog_width, dialog_height);
-
-        frame.render_widget(Clear, dialog_area);
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent))
-            .title(title)
-            .title_style(Style::default().fg(theme.title).bold());
-
-        let inner = block.inner(dialog_area);
-        frame.render_widget(block, dialog_area);
-
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints(constraints)
-            .split(inner);
-
-        // Command Override
-        let cmd_placeholder = if self.tool_config_focused_field == 0 {
-            Some("(replaces default binary)")
-        } else if self.command_override.value().is_empty() {
-            Some("(default)")
-        } else {
-            None
-        };
-        render_text_field(
+        self.tool_config_rects = render_tool_config_overlay(
             frame,
-            chunks[0],
-            "Command:",
+            area,
+            selected_tool,
             &self.command_override,
-            self.tool_config_focused_field == 0,
-            cmd_placeholder,
-            theme,
-        );
-
-        // Extra Args
-        let args_placeholder = if self.tool_config_focused_field == 1 {
-            Some("(e.g. --port 8080)")
-        } else if self.extra_args.value().is_empty() {
-            Some("(none)")
-        } else {
-            None
-        };
-        render_text_field(
-            frame,
-            chunks[1],
-            "Extra Args:",
             &self.extra_args,
-            self.tool_config_focused_field == 1,
-            args_placeholder,
+            self.tool_config_focused_field,
             theme,
         );
-
-        // Hints
-        let hint_spans = vec![
-            Span::styled("Tab", Style::default().fg(theme.hint)),
-            Span::raw(" next  "),
-            Span::styled("Enter", Style::default().fg(theme.hint)),
-            Span::raw(" done  "),
-            Span::styled("Esc", Style::default().fg(theme.hint)),
-            Span::raw(" back"),
-        ];
-        frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[2]);
 
         if self.show_help {
             self.render_help_overlay(frame, area, theme);
         }
     }
 
-    fn render_worktree_config(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_worktree_config(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.worktree_config_rects.clear();
         let dialog_width: u16 = 72;
 
         let repos_height: u16 = if self.workspace_repos_expanded {
@@ -830,6 +811,7 @@ impl NewSessionDialog {
             Some("(empty = title)"),
             theme,
         );
+        self.worktree_config_rects.push((0, chunks[0]));
 
         // New Branch checkbox
         {
@@ -862,6 +844,7 @@ impl NewSessionDialog {
                 Span::styled(format!(" {}", text), text_style),
             ]);
             frame.render_widget(Paragraph::new(line), chunks[1]);
+            self.worktree_config_rects.push((1, chunks[1]));
         }
 
         // Base Branch (only meaningful when "new branch" is checked; when
@@ -881,6 +864,7 @@ impl NewSessionDialog {
                 Some(placeholder),
                 theme,
             );
+            self.worktree_config_rects.push((2, chunks[2]));
         }
 
         // Extra Repos
@@ -890,6 +874,7 @@ impl NewSessionDialog {
             self.worktree_config_focused_field == 3,
             theme,
         );
+        self.worktree_config_rects.push((3, chunks[3]));
 
         // Hints
         let mut hint_spans = vec![
@@ -965,6 +950,7 @@ impl NewSessionDialog {
         } else {
             // Expanded view with list
             let mut lines: Vec<Line> = Vec::new();
+            let mut cursor_row: Option<(usize, &'static str, &Input)> = None;
 
             // Header with controls hint
             let header = Line::from(vec![
@@ -998,6 +984,7 @@ impl NewSessionDialog {
                         Span::styled("_", Style::default().fg(theme.accent)),
                     ]);
                     lines.push(input_line);
+                    cursor_row = Some((lines.len() - 1, "  + ", input));
                 } else {
                     // Editing existing item
                     for (i, entry) in self.extra_env.iter().enumerate() {
@@ -1012,6 +999,7 @@ impl NewSessionDialog {
                                 Span::styled("_", Style::default().fg(theme.accent)),
                             ]);
                             lines.push(input_line);
+                            cursor_row = Some((lines.len() - 1, "  > ", input));
                         } else {
                             let prefix = "    ";
                             lines.push(Line::from(Span::styled(
@@ -1046,6 +1034,9 @@ impl NewSessionDialog {
             }
 
             frame.render_widget(Paragraph::new(lines), area);
+            if let Some((row, prefix, input)) = cursor_row {
+                Self::set_input_cursor_on_row(frame, area, row, prefix, input);
+            }
         }
     }
 
@@ -1085,6 +1076,7 @@ impl NewSessionDialog {
         } else {
             // Expanded view with list
             let mut lines: Vec<Line> = Vec::new();
+            let mut cursor_row: Option<(usize, &'static str, &Input)> = None;
 
             let header = Line::from(vec![
                 Span::styled("Extra Repos:", label_style),
@@ -1101,17 +1093,26 @@ impl NewSessionDialog {
                     .as_ref()
                     .map(|g| g.ghost_text.clone());
 
+                let prefix_width = 4; // "  + " or "  > "
+                let available_width = area.width.saturating_sub(prefix_width as u16) as usize;
+
                 let make_input_line = |prefix: &'static str,
                                        val: &str,
                                        ghost: &Option<String>,
-                                       th: &Theme|
+                                       th: &Theme,
+                                       inp: &Input|
                  -> Line<'static> {
+                    let scroll = input_scroll(inp, available_width);
+                    let (visible_value, end_visible) = visible_slice(val, scroll, available_width);
+
                     let mut spans = vec![
                         Span::styled(prefix, Style::default().fg(th.accent)),
-                        Span::styled(val.to_string(), Style::default().fg(th.accent).bold()),
+                        Span::styled(visible_value, Style::default().fg(th.accent).bold()),
                     ];
-                    if let Some(ref g) = ghost {
-                        spans.push(Span::styled(g.clone(), Style::default().fg(th.dimmed)));
+                    if end_visible {
+                        if let Some(ref g) = ghost {
+                            spans.push(Span::styled(g.clone(), Style::default().fg(th.dimmed)));
+                        }
                     }
                     spans.push(Span::styled("_", Style::default().fg(th.accent)));
                     Line::from(spans)
@@ -1129,11 +1130,25 @@ impl NewSessionDialog {
                             Style::default().fg(theme.text),
                         )));
                     }
-                    lines.push(make_input_line("  + ", input.value(), &ghost_text, theme));
+                    lines.push(make_input_line(
+                        "  + ",
+                        input.value(),
+                        &ghost_text,
+                        theme,
+                        input,
+                    ));
+                    cursor_row = Some((lines.len() - 1, "  + ", input));
                 } else {
                     for (i, entry) in self.workspace_repos.iter().enumerate() {
                         if i == self.workspace_repo_selected_index {
-                            lines.push(make_input_line("  > ", input.value(), &ghost_text, theme));
+                            lines.push(make_input_line(
+                                "  > ",
+                                input.value(),
+                                &ghost_text,
+                                theme,
+                                input,
+                            ));
+                            cursor_row = Some((lines.len() - 1, "  > ", input));
                         } else {
                             let prefix = "    ";
                             lines.push(Line::from(Span::styled(
@@ -1168,6 +1183,9 @@ impl NewSessionDialog {
             }
 
             frame.render_widget(Paragraph::new(lines), area);
+            if let Some((row, prefix, input)) = cursor_row {
+                Self::set_input_cursor_on_row(frame, area, row, prefix, input);
+            }
         }
     }
 
@@ -1204,8 +1222,8 @@ impl NewSessionDialog {
 
         let dialog_width: u16 = HELP_DIALOG_WIDTH;
         let has_profile_selection = self.has_profile_selection();
-        // Base fields: Title, Path, YOLO, Worktree, Group + close hint
-        let base_height: u16 = 17;
+        // Base fields: Scratch, Title, Path, YOLO, Worktree, Group + close hint
+        let base_height: u16 = 20;
         let dialog_height: u16 = base_height
             + if has_profile_selection { 3 } else { 0 }
             + if has_tool_selection { 3 } else { 0 }
@@ -1228,26 +1246,20 @@ impl NewSessionDialog {
 
         let mut lines: Vec<Line> = Vec::new();
 
-        for (idx, help) in FIELD_HELP.iter().enumerate() {
-            if idx == 0 && !has_profile_selection {
-                continue; // Profile
+        // Gate by name (not index) so inserting a new FIELD_HELP entry does
+        // not silently shift every condition by one.
+        for help in FIELD_HELP {
+            let show = match help.name {
+                "Profile" => has_profile_selection,
+                "Tool" => has_tool_selection,
+                "YOLO Mode" => !self.selected_tool_always_yolo(),
+                "Sandbox" => has_sandbox,
+                "Image" | "Environment" => show_sandbox_options_help,
+                _ => true,
+            };
+            if !show {
+                continue;
             }
-            // idx 1 (Title), idx 2 (Path) always shown
-            if idx == 3 && !has_tool_selection {
-                continue; // Tool
-            }
-            if idx == 4 && self.selected_tool_always_yolo() {
-                continue; // YOLO (hidden for AlwaysYolo agents)
-            }
-            // idx 5 (Worktree) always shown
-            if idx == 6 && !has_sandbox {
-                continue; // Sandbox
-            }
-            if (7..=8).contains(&idx) && !show_sandbox_options_help {
-                continue; // Image, Env
-            }
-            // idx 9 (Group) always shown
-
             lines.push(Line::from(Span::styled(
                 help.name,
                 Style::default().fg(theme.accent).bold(),

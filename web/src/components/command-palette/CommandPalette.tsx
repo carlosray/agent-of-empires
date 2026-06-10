@@ -14,15 +14,19 @@ export function CommandPalette({ open, onClose, actions }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
 
+  // Capture the launcher before moving focus into the palette, then restore
+  // it on close so Esc / backdrop-close return keyboard users to where they
+  // were instead of dropping focus on <body>. autoFocus cannot restore focus,
+  // and capturing in a post-commit effect would already see the input.
   useEffect(() => {
-    if (open) {
-      previousFocusRef.current = document.activeElement as HTMLElement | null;
-      const t = setTimeout(() => inputRef.current?.focus(), 0);
-      return () => {
-        clearTimeout(t);
-        previousFocusRef.current?.focus?.();
-      };
-    }
+    if (!open) return;
+    previousFocusRef.current = document.activeElement as HTMLElement | null;
+    const t = setTimeout(() => inputRef.current?.focus(), 0);
+    return () => {
+      clearTimeout(t);
+      const prev = previousFocusRef.current;
+      if (prev?.isConnected) prev.focus();
+    };
   }, [open]);
 
   const grouped = useMemo(() => {
@@ -83,9 +87,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
         </div>
 
         <Command.List className="max-h-[50vh] overflow-y-auto p-1">
-          <Command.Empty className="px-4 py-8 text-center text-sm text-text-muted">
-            No matches
-          </Command.Empty>
+          <Command.Empty className="px-4 py-8 text-center text-sm text-text-muted">No matches</Command.Empty>
 
           {GROUP_ORDER.map((groupName) => {
             const items = grouped.get(groupName) ?? [];
@@ -97,11 +99,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
                 className="mb-1 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-text-muted"
               >
                 {items.map((action) => {
-                  const searchValue = [
-                    action.title,
-                    action.subtitle ?? "",
-                    ...(action.keywords ?? []),
-                  ].join(" ");
+                  const searchValue = [action.title, action.subtitle ?? "", ...(action.keywords ?? [])].join(" ");
                   return (
                     <Command.Item
                       key={action.id}
@@ -111,21 +109,12 @@ export function CommandPalette({ open, onClose, actions }: Props) {
                     >
                       {action.status && (
                         <span className="font-mono text-text-muted w-4 shrink-0 text-center">
-                          <StatusGlyph
-                            status={action.status}
-                            createdAt={action.statusCreatedAt ?? null}
-                          />
+                          <StatusGlyph status={action.status} createdAt={action.statusCreatedAt ?? null} />
                         </span>
                       )}
-                      {action.icon && (
-                        <span className="shrink-0 text-text-muted">{action.icon}</span>
-                      )}
+                      {action.icon && <span className="shrink-0 text-text-muted">{action.icon}</span>}
                       <span className="truncate">{action.title}</span>
-                      {action.subtitle && (
-                        <span className="truncate text-text-muted text-xs">
-                          {action.subtitle}
-                        </span>
-                      )}
+                      {action.subtitle && <span className="truncate text-text-muted text-xs">{action.subtitle}</span>}
                       <span className="flex-1" />
                       {action.shortcut && (
                         <kbd className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-surface-900 border border-surface-700 text-text-muted">
@@ -142,7 +131,9 @@ export function CommandPalette({ open, onClose, actions }: Props) {
 
         <div className="flex items-center justify-between px-4 h-8 border-t border-surface-700/50 text-[11px] font-mono text-text-muted">
           <span>↑↓ navigate · ↵ select · esc close</span>
-          <span>{actions.length} action{actions.length === 1 ? "" : "s"}</span>
+          <span>
+            {actions.length} action{actions.length === 1 ? "" : "s"}
+          </span>
         </div>
       </Command>
     </div>
