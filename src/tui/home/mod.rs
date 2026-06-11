@@ -619,6 +619,9 @@ pub struct HomeView {
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
 
+    // Detached LLM session-summary upgrades.
+    pub(super) summary_service: crate::session::summary::SummaryService,
+
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
 
@@ -1195,6 +1198,7 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
+            summary_service: crate::session::summary::SummaryService::new(),
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             creation_poller: CreationPoller::new(),
@@ -1750,18 +1754,92 @@ impl HomeView {
     /// Apply any pending status updates from the background poller.
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
+        let mut any_change = false;
         if let Some(updates) = self.status_poller.try_recv_updates() {
-            let mut any_change = !updates.is_empty();
+            any_change = !updates.is_empty();
             for update in updates {
                 self.apply_one_status_update(update.clone());
                 if self.apply_tool_session_update(&update) {
                     any_change = true;
                 }
+                self.apply_summary_update(update);
             }
             self.pending_status_refresh = false;
-            return any_change;
         }
-        false
+        // Land any completed LLM summary upgrades, regardless of whether a
+        // status batch arrived this tick.
+        if self.drain_summary_upgrades() {
+            any_change = true;
+        }
+        any_change
+    }
+
+    /// Persist a freshly extracted summary onto the instance and, when the
+    /// poller flagged an LLM upgrade, hand the request to the summary service.
+    fn apply_summary_update(&mut self, update: StatusUpdate) {
+        let Some(summary) = update.tool_session_summary else {
+            if let Some(request) = update.summary_llm_request {
+                self.summary_service.spawn(request);
+            }
+            return;
+        };
+        let mut changed = false;
+        self.mutate_instance(&update.id, |inst| {
+            if inst.tool_session_summary.as_ref() != Some(&summary) {
+                inst.tool_session_summary = Some(summary.clone());
+                changed = true;
+            }
+        });
+        if let Some(request) = update.summary_llm_request {
+            self.summary_service.spawn(request);
+        }
+        if changed {
+            if let Err(e) = self.save() {
+                tracing::error!("Failed to save after summary update: {e}");
+            }
+        }
+    }
+
+    /// Apply completed LLM summary upgrades to their instances. An empty result
+    /// text means the call failed: keep the extracted text but mark it `Final`
+    /// so it is not retried. Returns true if any instance changed.
+    fn drain_summary_upgrades(&mut self) -> bool {
+        let results = self.summary_service.drain();
+        if results.is_empty() {
+            return false;
+        }
+        let mut any_change = false;
+        let mut needs_save = false;
+        for result in results {
+            // Find the instance whose current summary is still awaiting this
+            // upgrade (matching display_id, still Extracted).
+            let target = self.instances.iter().find_map(|inst| {
+                inst.tool_session_summary.as_ref().and_then(|s| {
+                    (s.display_id == result.display_id
+                        && s.state == crate::session::SummaryState::Extracted)
+                        .then(|| inst.id.clone())
+                })
+            });
+            let Some(id) = target else {
+                continue;
+            };
+            self.mutate_instance(&id, |inst| {
+                if let Some(summary) = inst.tool_session_summary.as_mut() {
+                    if !result.text.is_empty() {
+                        summary.text = result.text.clone();
+                    }
+                    summary.state = crate::session::SummaryState::Final;
+                }
+            });
+            any_change = true;
+            needs_save = true;
+        }
+        if needs_save {
+            if let Err(e) = self.save() {
+                tracing::error!("Failed to save after summary upgrade: {e}");
+            }
+        }
+        any_change
     }
 
     /// Apply a single status update from the poller. Extracted from the

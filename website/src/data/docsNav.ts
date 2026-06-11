@@ -71,6 +71,7 @@ export const docsNav: NavSection[] = [
       { title: "Session Archive", href: "/docs/fork-features/session-archive/" },
       { title: "Tool Session Tracking", href: "/docs/fork-features/tool-session-tracking/" },
       { title: "Terminal Tab Titles", href: "/docs/fork-features/terminal-tab-title/" },
+      { title: "Tool Session Summary", href: "/docs/fork-features/session-summary/" },
     ],
   },
   {

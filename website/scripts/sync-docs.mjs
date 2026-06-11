@@ -376,6 +376,15 @@ const PAGES = [
     title: "Terminal Tab Titles on Attach",
     description:
       "Rename the outer terminal tab on attach and restore a dashboard title when returning to AoE.",
+  },
+  {
+    source: "docs/fork-features/session-summary.md",
+    dest: "docs/fork-features/session-summary.md",
+    title: "Tool Session Summary in TUI Preview Panel",
+    description:
+      "Show a one-line summary of what each agent session is about, extracted from tool artifacts and optionally upgraded by an LLM.",
+  },
+  {
     source: "docs/telemetry.md",
     dest: "docs/telemetry.md",
     title: "Telemetry",
@@ -417,6 +426,7 @@ const URL_MAP = {
   "docs/fork-features/tool-session-tracking.md": "/docs/fork-features/tool-session-tracking/",
   "docs/fork-features/session-archive.md": "/docs/fork-features/session-archive/",
   "docs/fork-features/terminal-tab-title.md": "/docs/fork-features/terminal-tab-title/",
+  "docs/fork-features/session-summary.md": "/docs/fork-features/session-summary/",
   "docs/telemetry.md": "/docs/telemetry/",
   // Guides
   "docs/guides/shell-completions.md": "/guides/shell-completions/",

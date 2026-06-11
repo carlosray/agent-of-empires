@@ -25,6 +25,7 @@ pub(crate) mod serde_helpers;
 pub mod settings_schema;
 pub mod stop;
 mod storage;
+pub mod summary;
 pub(crate) mod tool_session;
 pub mod worktree_edit;
 
@@ -35,9 +36,9 @@ pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, save_config,
     validate_snooze_duration, ClickAction, Config, ContainerRuntimeName, DefaultTerminalMode,
-    GroupByMode, NewSessionAttachMode, RowTagMode, SandboxConfig, SessionConfig, TelemetryConfig,
-    ThemeConfig, TmuxClipboardMode, TmuxConfig, TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig,
-    VolumeIgnoresStrategy, WorktreeConfig,
+    GroupByMode, LlmConfig, NewSessionAttachMode, RowTagMode, SandboxConfig, SessionConfig,
+    TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxConfig, TmuxMouseMode, TmuxStatusBarMode,
+    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
@@ -50,8 +51,8 @@ pub use groups::{
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
     EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
-    Status, TerminalInfo, ToolSession, ToolSessionProbe, ToolSessionProbeState, View,
-    WorkspaceInfo, WorkspaceRepo, WorktreeInfo, TMUX_SESSION_GONE_ERROR,
+    Status, SummaryState, TerminalInfo, ToolSession, ToolSessionProbe, ToolSessionProbeState,
+    ToolSessionSummary, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, TMUX_SESSION_GONE_ERROR,
 };
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,

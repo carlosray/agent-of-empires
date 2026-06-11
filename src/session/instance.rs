@@ -323,6 +323,29 @@ pub struct ToolSession {
     pub updated_at: DateTime<Utc>,
 }
 
+/// How far the summary evaluation for a tool session has progressed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryState {
+    /// Baseline text is set (native title or first user message). An LLM
+    /// upgrade is configured and may still replace the text.
+    Extracted,
+    /// Evaluation is complete: the LLM call finished (success or failure) or no
+    /// LLM is configured. The text is never recomputed for this `display_id`.
+    Final,
+}
+
+/// A one line summary of what a tool session is about, shown in the TUI preview
+/// panel under `Session ID:`. Keyed by the tool session `display_id` so a
+/// session rebind invalidates it and triggers re-evaluation. Persisted on
+/// `Instance` so dead and errored sessions keep their summary across restarts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolSessionSummary {
+    pub display_id: String,
+    pub text: String,
+    pub state: SummaryState,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolSessionProbeState {
@@ -495,6 +518,10 @@ pub struct Instance {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_session: Option<ToolSession>,
+    /// One line summary of the tool session, shown in the preview panel.
+    /// Evaluated once per `tool_session.display_id`; see `session::summary`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_session_summary: Option<ToolSessionSummary>,
     /// User intent gating `acquire_session_id`. See `ResumeIntent` for
     /// semantics. Non-`Default` values (`Use`, `Cleared`) are written only
     /// by user-initiated CLI commands; daemon-internal paths demote to
@@ -823,6 +850,7 @@ impl Instance {
             terminal_info: None,
             agent_session_id: None,
             tool_session: None,
+            tool_session_summary: None,
             resume_intent: ResumeIntent::Default,
             source_profile: String::new(),
             notify_on_waiting: None,

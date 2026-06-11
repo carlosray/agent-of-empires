@@ -47,13 +47,20 @@ impl<'a> CachedPreview<'a> {
 pub fn agent_info_height(instance: &Instance) -> u16 {
     let base: u16 = 3; // profile+tool / path / status
     let sandbox_lines: u16 = if instance.is_sandboxed() { 1 } else { 0 };
-    let tool_session_lines: u16 = if crate::session::tool_session::tracking_enabled(instance)
-        && instance.tool_session.is_some()
-    {
+    let tracking_enabled = crate::session::tool_session::tracking_enabled(instance);
+    let tool_session_lines: u16 = if tracking_enabled && instance.tool_session.is_some() {
         1
     } else {
         0
     };
+    // The "Summary:" line is shown whenever tracking is on and a summary exists,
+    // independent of whether the Session ID line is present.
+    let summary_lines: u16 = if tracking_enabled && instance.tool_session_summary.is_some() {
+        1
+    } else {
+        0
+    };
+    let tool_session_lines = tool_session_lines + summary_lines;
     if let Some(wt) = instance.worktree_info.as_ref() {
         // blank + header + branch + main (+ optional base)
         let base_branch_line: u16 = if wt.base_branch.is_some() { 1 } else { 0 };
@@ -387,6 +394,15 @@ impl Preview {
                     Span::styled(&tool_session.display_id, Style::default().fg(theme.text)),
                 ]));
             }
+            // One line summary of what the session is about. Shown for any
+            // status, including dead and errored panes, so a stopped session
+            // still says what it was for.
+            if let Some(summary) = &instance.tool_session_summary {
+                info_lines.push(Line::from(vec![
+                    Span::styled("Summary:    ", Style::default().fg(theme.dimmed)),
+                    Span::styled(&summary.text, Style::default().fg(theme.text)),
+                ]));
+            }
         }
 
         // Add worktree information if present
@@ -695,6 +711,61 @@ mod tests {
 
         assert!(!rendered.contains("Session ID:"));
         assert!(!rendered.contains("session-123"));
+    }
+
+    #[test]
+    fn test_preview_renders_summary_under_session_id() {
+        let dir = tempdir().unwrap();
+        save_repo_config(
+            dir.path(),
+            &serde_json::from_value::<RepoConfig>(
+                serde_json::json!({"session": {"tool_session_tracking": true}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut instance = instance_with_tool_session(dir.path());
+        instance.tool_session_summary = Some(crate::session::ToolSessionSummary {
+            display_id: "session-123".to_string(),
+            text: "Fix the login bug".to_string(),
+            state: crate::session::SummaryState::Final,
+        });
+
+        let rendered = render_preview(&instance);
+
+        let session_id_at = rendered.find("Session ID:");
+        let summary_at = rendered.find("Summary:");
+        assert!(summary_at.is_some(), "rendered:\n{rendered}");
+        assert!(
+            rendered.contains("Fix the login bug"),
+            "rendered:\n{rendered}"
+        );
+        // Summary must come after Session ID and before the Git/Worktree block.
+        assert!(session_id_at < summary_at, "rendered:\n{rendered}");
+    }
+
+    #[test]
+    fn test_preview_hides_summary_when_tracking_disabled() {
+        let dir = tempdir().unwrap();
+        save_repo_config(
+            dir.path(),
+            &serde_json::from_value::<RepoConfig>(
+                serde_json::json!({"session": {"tool_session_tracking": false}}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut instance = instance_with_tool_session(dir.path());
+        instance.tool_session_summary = Some(crate::session::ToolSessionSummary {
+            display_id: "session-123".to_string(),
+            text: "Fix the login bug".to_string(),
+            state: crate::session::SummaryState::Final,
+        });
+
+        let rendered = render_preview(&instance);
+
+        assert!(!rendered.contains("Summary:"));
+        assert!(!rendered.contains("Fix the login bug"));
     }
 
     #[test]

@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
-use crate::session::{Instance, Status, ToolSession, ToolSessionProbe};
+use crate::session::summary::SummaryLlmRequest;
+use crate::session::{Instance, Status, ToolSession, ToolSessionProbe, ToolSessionSummary};
 
 /// Adaptive polling intervals (in cycles). 0 = never poll.
 const TIER_HOT: u64 = 1;
@@ -33,6 +34,42 @@ const TIER_COLD: u64 = 60;
 /// sessions blocks the UI. Sessions without a resolved mapping still refresh
 /// every cycle so the initial bind happens promptly.
 const TOOL_SESSION_REFRESH_EVERY: u64 = 12;
+
+/// Evaluate the tool session summary for an instance. Returns the baseline
+/// summary to persist and, when an LLM upgrade applies, the request to fire.
+/// Cheap when no work is needed: the config read and artifact parse happen only
+/// while the summary is missing or stale for the current `display_id`.
+fn evaluate_summary(
+    inst: &Instance,
+    tool_session: Option<&ToolSession>,
+) -> (Option<ToolSessionSummary>, Option<SummaryLlmRequest>) {
+    use crate::session::summary;
+
+    let Some(tool_session) = tool_session else {
+        return (None, None);
+    };
+    if !summary::needs_eval(inst, tool_session) {
+        return (None, None);
+    }
+    let Ok(config) = crate::session::tool_session::effective_config(inst) else {
+        return (None, None);
+    };
+    let llm_enabled = config.llm.summary_enabled();
+    let Some(new_summary) = summary::compute_summary_update(inst, tool_session, llm_enabled) else {
+        return (None, None);
+    };
+
+    let llm_request = if new_summary.state == crate::session::SummaryState::Extracted {
+        summary::extract_first_message(inst, tool_session).map(|input| SummaryLlmRequest {
+            display_id: tool_session.display_id.clone(),
+            input,
+            config: config.llm.clone(),
+        })
+    } else {
+        None
+    };
+    (Some(new_summary), llm_request)
+}
 
 fn polling_tier(status: Status) -> u64 {
     match status {
@@ -58,6 +95,13 @@ pub struct StatusUpdate {
     pub tool_session: Option<ToolSession>,
     pub tool_session_probe: Option<ToolSessionProbe>,
     pub tool_session_changed: bool,
+    /// A freshly extracted baseline summary, set when the instance's tool
+    /// session has no summary yet (or one for a different `display_id`). The
+    /// main thread persists it onto the Instance.
+    pub tool_session_summary: Option<ToolSessionSummary>,
+    /// Set alongside an `Extracted` summary when an LLM upgrade should be fired.
+    /// The main thread hands it to the summary service.
+    pub summary_llm_request: Option<SummaryLlmRequest>,
     /// Pulled from tmux `#{session_activity}` via
     /// `update_status_with_metadata`. Carried back so the main thread can
     /// persist it to the real Instance; the poller mutates a clone, so any
@@ -167,6 +211,8 @@ pub(super) fn poll_statuses_once(
                                 tool_session: None,
                                 tool_session_probe: None,
                                 tool_session_changed: false,
+                                tool_session_summary: None,
+                                summary_llm_request: None,
                             });
                         }
                     }
@@ -199,6 +245,16 @@ pub(super) fn poll_statuses_once(
                     None
                 };
 
+            // Evaluate the session summary against the effective tool session
+            // (the just-refreshed one, or the persisted one when refresh was
+            // skipped this cycle). Only does work when a new summary is needed.
+            let effective_tool_session = tool_session_change
+                .as_ref()
+                .and_then(|change| change.tool_session.clone())
+                .or_else(|| inst.tool_session.clone());
+            let (tool_session_summary, summary_llm_request) =
+                evaluate_summary(&inst, effective_tool_session.as_ref());
+
             Some(StatusUpdate {
                 id: inst.id,
                 status: inst.status,
@@ -213,6 +269,8 @@ pub(super) fn poll_statuses_once(
                     .as_ref()
                     .and_then(|change| change.tool_session_probe.clone()),
                 tool_session_changed: tool_session_change.is_some(),
+                tool_session_summary,
+                summary_llm_request,
             })
         })
         .collect()
@@ -295,6 +353,8 @@ mod tests {
             tool_session: None,
             tool_session_probe: None,
             tool_session_changed: false,
+            tool_session_summary: None,
+            summary_llm_request: None,
             last_accessed_at: None,
             pane_dead: false,
         };

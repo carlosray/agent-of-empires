@@ -62,6 +62,9 @@ pub struct Config {
     #[serde(default)]
     pub logging: LoggingConfig,
 
+    #[serde(default)]
+    pub llm: LlmConfig,
+
     /// Environment variables injected into the host command line for every
     /// session spawned at global scope. Entries are `KEY=value`, `KEY=$VAR`
     /// (read VAR from the host env), `KEY=$$literal` (escape a `$`), or
@@ -1364,6 +1367,43 @@ impl Default for AuthConfig {
         Self {
             persist_sessions: true,
         }
+    }
+}
+
+/// Generic LLM helper configuration (an OpenAI-compatible endpoint). Shared by
+/// any fork feature that wants an LLM assist; the first consumer is the tool
+/// session summary line in the TUI preview panel. Future LLM-assisted features
+/// add their own `*_model` field to this same section rather than introducing a
+/// new one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, SettingsSection)]
+#[setting_section(name = "llm", category = "LLM")]
+pub struct LlmConfig {
+    /// OpenAI-compatible base URL, e.g. `https://api.openai.com/v1`. The summary
+    /// request is `POST {api_base_url}/chat/completions`. Empty disables every
+    /// LLM call; extraction-based summaries still work.
+    #[serde(default)]
+    #[setting(label = "API base URL", widget = "text")]
+    pub api_base_url: String,
+
+    /// Bearer token sent as `Authorization: Bearer <token>`. Stored in
+    /// `config.toml` like other local secrets. Optional for endpoints that need
+    /// no auth (e.g. a local server).
+    #[serde(default)]
+    #[setting(label = "API token", widget = "text")]
+    pub api_token: String,
+
+    /// Model used to generate session summaries. Empty disables LLM summaries
+    /// (the extracted first-message text is kept as the final summary).
+    #[serde(default)]
+    #[setting(label = "Summary model", widget = "text")]
+    pub summary_model: String,
+}
+
+impl LlmConfig {
+    /// Whether an LLM summary call should be attempted. Requires both a base URL
+    /// and a model; the token is optional so no-auth local endpoints work.
+    pub fn summary_enabled(&self) -> bool {
+        !self.api_base_url.trim().is_empty() && !self.summary_model.trim().is_empty()
     }
 }
 

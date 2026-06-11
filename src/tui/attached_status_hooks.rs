@@ -149,6 +149,8 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             tool_session: None,
             tool_session_probe: None,
             tool_session_changed: false,
+            tool_session_summary: None,
+            summary_llm_request: None,
         })
         .collect()
 }
@@ -187,6 +189,8 @@ mod tests {
                 tool_session: None,
                 tool_session_probe: None,
                 tool_session_changed: false,
+                tool_session_summary: None,
+                summary_llm_request: None,
             }],
             true,
         );

@@ -15,6 +15,7 @@ Treat it as the fork changelog for product behavior:
 - [Session archive](session-archive.md)
 - [Tool session tracking and restore](tool-session-tracking.md)
 - [Terminal tab titles on attach](terminal-tab-title.md)
+- [Tool session summary in TUI preview panel](session-summary.md)
 
 ## How To Extend This Section
 

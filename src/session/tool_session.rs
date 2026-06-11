@@ -348,7 +348,7 @@ pub fn select_refreshed_tool_session(
     }
 }
 
-fn effective_config(instance: &Instance) -> Result<Config> {
+pub(crate) fn effective_config(instance: &Instance) -> Result<Config> {
     let profile = if instance.source_profile.is_empty() {
         super::config::resolve_default_profile()
     } else {
@@ -596,7 +596,7 @@ fn discover_pi_candidates(project_path: &Path) -> Result<Vec<ToolSessionCandidat
     Ok(candidates)
 }
 
-fn claude_project_dir_name(project_path: &Path) -> String {
+pub(crate) fn claude_project_dir_name(project_path: &Path) -> String {
     format!(
         "-{}",
         project_path

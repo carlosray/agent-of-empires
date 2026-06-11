@@ -4877,6 +4877,8 @@ fn apply_status_update_propagates_idle_entered_at_into_live_instance() {
         tool_session: None,
         tool_session_probe: None,
         tool_session_changed: false,
+        tool_session_summary: None,
+        summary_llm_request: None,
         last_accessed_at: None,
         pane_dead: false,
     });
@@ -4908,6 +4910,8 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         tool_session: None,
         tool_session_probe: None,
         tool_session_changed: false,
+        tool_session_summary: None,
+        summary_llm_request: None,
         last_accessed_at: None,
         pane_dead: false,
     });
@@ -4928,6 +4932,8 @@ fn apply_status_update_clears_idle_entered_at_on_idle_to_running() {
         tool_session: None,
         tool_session_probe: None,
         tool_session_changed: false,
+        tool_session_summary: None,
+        summary_llm_request: None,
         last_accessed_at: None,
         pane_dead: false,
     });
@@ -5028,6 +5034,8 @@ fn apply_status_update_skips_terminal_states() {
         tool_session: None,
         tool_session_probe: None,
         tool_session_changed: false,
+        tool_session_summary: None,
+        summary_llm_request: None,
         last_accessed_at: None,
         pane_dead: false,
     });
@@ -5108,6 +5116,8 @@ fn apply_status_update_runs_status_hook_on_transition() {
         tool_session: None,
         tool_session_probe: None,
         tool_session_changed: false,
+        tool_session_summary: None,
+        summary_llm_request: None,
     });
 
     let launches = take_recorded_launches();
@@ -5176,6 +5186,8 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         tool_session: None,
         tool_session_probe: None,
         tool_session_changed: false,
+        tool_session_summary: None,
+        summary_llm_request: None,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -5212,6 +5224,8 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             tool_session: None,
             tool_session_probe: None,
             tool_session_changed: false,
+            tool_session_summary: None,
+            summary_llm_request: None,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
@@ -5538,6 +5552,8 @@ fn test_apply_status_updates_persists_tool_session_to_storage() {
             state: ToolSessionProbeState::Resolved,
         }),
         tool_session_changed: true,
+        tool_session_summary: None,
+        summary_llm_request: None,
     };
 
     let changed = view.apply_tool_session_update(&update);
@@ -6581,6 +6597,8 @@ fn test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_
             state: ToolSessionProbeState::Ambiguous,
         }),
         tool_session_changed: true,
+        tool_session_summary: None,
+        summary_llm_request: None,
     };
 
     let changed = view.apply_tool_session_update(&update);
