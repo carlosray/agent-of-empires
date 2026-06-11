@@ -164,6 +164,9 @@ pub(super) fn poll_statuses_once(
                                 // Sandboxed sessions don't have a tmux pane in the
                                 // usual sense; the Error tier itself sinks the row.
                                 pane_dead: false,
+                                tool_session: None,
+                                tool_session_probe: None,
+                                tool_session_changed: false,
                             });
                         }
                     }
@@ -177,6 +180,25 @@ pub(super) fn poll_statuses_once(
 
             inst.update_status_with_metadata(metadata);
 
+            // Run tool_session refresh on a slower cadence than the
+            // status tier. Each refresh fans out to lsof or sqlite3
+            // subprocesses; running it every cycle multiplies that
+            // cost by the session count and starves the UI thread.
+            // Sessions with a Pending probe (the launch grace window)
+            // still refresh every cycle so the initial bind happens
+            // promptly.
+            let in_initial_bind_window = inst.tool_session.is_none()
+                && matches!(
+                    inst.tool_session_probe.as_ref().map(|p| p.state),
+                    Some(crate::session::ToolSessionProbeState::Pending)
+                );
+            let tool_session_change =
+                if in_initial_bind_window || state.cycle_count % TOOL_SESSION_REFRESH_EVERY == 0 {
+                    crate::session::tool_session::refresh(&inst).ok().flatten()
+                } else {
+                    None
+                };
+
             Some(StatusUpdate {
                 id: inst.id,
                 status: inst.status,
@@ -184,6 +206,13 @@ pub(super) fn poll_statuses_once(
                 idle_entered_at: inst.idle_entered_at,
                 last_accessed_at: inst.last_accessed_at,
                 pane_dead,
+                tool_session: tool_session_change
+                    .as_ref()
+                    .and_then(|change| change.tool_session.clone()),
+                tool_session_probe: tool_session_change
+                    .as_ref()
+                    .and_then(|change| change.tool_session_probe.clone()),
+                tool_session_changed: tool_session_change.is_some(),
             })
         })
         .collect()

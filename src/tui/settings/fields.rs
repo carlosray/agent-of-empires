@@ -1428,11 +1428,13 @@ mod tests {
         assert!(
             fields
                 .iter()
-                .any(|f| f.key == FieldKey::RenameTerminalTabOnAttach),
+                .any(|f| f.ident() == "tmux.rename_terminal_tab_on_attach"),
             "Tmux settings should include the tab rename toggle"
         );
         assert!(
-            fields.iter().any(|f| f.key == FieldKey::DashboardTabTitle),
+            fields
+                .iter()
+                .any(|f| f.ident() == "tmux.dashboard_tab_title"),
             "Tmux settings should include the dashboard tab title"
         );
     }
@@ -1442,22 +1444,37 @@ mod tests {
         let global = Config::default();
         let mut profile = ProfileConfig::default();
         let field = SettingField {
-            key: FieldKey::DashboardTabTitle,
-            label: "Dashboard Tab Title",
-            description: "",
+            kind: FieldKind::Schema {
+                section: "tmux".to_string(),
+                field: "dashboard_tab_title".to_string(),
+                widget: crate::session::settings_schema::WidgetKind::Text {
+                    multiline: false,
+                    mono: false,
+                },
+                validation: crate::session::settings_schema::ValidationKind::None,
+                profile_overridable: true,
+            },
+            label: "Dashboard Tab Title".to_string(),
+            description: String::new(),
             value: FieldValue::Text("Empire".to_string()),
             category: SettingsCategory::Tmux,
             has_override: false,
             inherited_display: None,
         };
 
-        apply_field_to_profile(&field, &global, &mut profile);
+        apply_field_to_config(
+            &field,
+            SettingsScope::Profile,
+            &mut global.clone(),
+            &mut profile,
+        );
 
         assert_eq!(
             profile
-                .tmux
-                .as_ref()
-                .and_then(|t| t.dashboard_tab_title.as_deref()),
+                .overrides
+                .get("tmux")
+                .and_then(|t| t.get("dashboard_tab_title"))
+                .and_then(|v| v.as_str()),
             Some("Empire")
         );
     }
@@ -1477,7 +1494,7 @@ mod tests {
         assert!(
             fields
                 .iter()
-                .any(|field| field.key == FieldKey::ToolSessionTracking),
+                .any(|f| f.ident() == "session.tool_session_tracking"),
             "Session settings should include the tool session tracking toggle"
         );
     }
@@ -1487,22 +1504,34 @@ mod tests {
         let global = Config::default();
         let mut profile = ProfileConfig::default();
         let field = SettingField {
-            key: FieldKey::ToolSessionTracking,
-            label: "Tool Session Tracking",
-            description: "",
+            kind: FieldKind::Schema {
+                section: "session".to_string(),
+                field: "tool_session_tracking".to_string(),
+                widget: crate::session::settings_schema::WidgetKind::Toggle,
+                validation: crate::session::settings_schema::ValidationKind::None,
+                profile_overridable: true,
+            },
+            label: "Tool Session Tracking".to_string(),
+            description: String::new(),
             value: FieldValue::Bool(true),
             category: SettingsCategory::Session,
             has_override: false,
             inherited_display: None,
         };
 
-        apply_field_to_profile(&field, &global, &mut profile);
+        apply_field_to_config(
+            &field,
+            SettingsScope::Profile,
+            &mut global.clone(),
+            &mut profile,
+        );
 
         assert_eq!(
             profile
-                .session
-                .as_ref()
-                .and_then(|session| session.tool_session_tracking),
+                .overrides
+                .get("session")
+                .and_then(|s| s.get("tool_session_tracking"))
+                .and_then(|v| v.as_bool()),
             Some(true)
         );
     }

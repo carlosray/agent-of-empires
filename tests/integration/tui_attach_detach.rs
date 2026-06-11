@@ -132,12 +132,12 @@ fn test_terminal_mode_sequence_documented() {
         &[
             "disable_raw_mode",
             "LeaveAlternateScreen",
-            "DisableBracketedPaste",
             "DisableMouseCapture",
+            "DisableBracketedPaste",
             "cursor::Show",
             "Write::flush",
             "event_stream.take",
-            "let result = f()",
+            "let result = f(",
         ],
     );
 

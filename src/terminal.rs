@@ -41,7 +41,7 @@ pub fn dashboard_title(config: &crate::session::TmuxConfig) -> Option<String> {
 
 pub fn dashboard_title_for_profile(profile: &str) -> Option<String> {
     let profile = if profile.is_empty() {
-        crate::session::DEFAULT_PROFILE
+        "default"
     } else {
         profile
     };

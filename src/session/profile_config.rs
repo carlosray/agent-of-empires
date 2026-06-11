@@ -127,7 +127,6 @@ pub fn merge_configs(global: Config, profile: &ProfileConfig) -> Config {
     merge_configs_generic(&global, &profile.overrides_value())
 }
 
-
 /// Generic single-source merge (#1692): serialize the global config to JSON,
 /// apply the overrides as a sparse JSON merge (object keys recurse, scalars and
 /// arrays replace), and deserialize back into a typed [`Config`].
@@ -140,7 +139,6 @@ pub fn merge_configs_generic(global: &Config, overrides: &serde_json::Value) -> 
     let mut base = serde_json::to_value(global).expect("Config serializes to JSON");
     crate::session::settings_schema::merge_json(&mut base, overrides);
     serde_json::from_value(base).expect("merged config deserializes")
-
 }
 
 /// Validate Docker volume format (host:container[:options])

@@ -199,7 +199,10 @@ fn test_display_branch_persists_across_save_load() -> Result<()> {
     let mut instance = Instance::new("Git Session", "/path/repo");
     instance.display_branch = Some("feature/persisted".to_string());
 
-    storage.save(std::slice::from_ref(&instance))?;
+    storage.update(|instances, _| {
+        instances.push(instance.clone());
+        Ok(())
+    })?;
 
     let loaded = storage.load()?;
     assert_eq!(
@@ -209,7 +212,6 @@ fn test_display_branch_persists_across_save_load() -> Result<()> {
 
     Ok(())
 }
-
 
 #[test]
 #[serial]

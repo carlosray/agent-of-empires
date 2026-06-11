@@ -69,7 +69,7 @@ async fn list_archived(profile: &str, json: bool, all: bool) -> Result<()> {
     let entries = if all {
         load_all_archives()?
     } else {
-        let storage = Storage::new(profile)?;
+        let storage = Storage::new_unwatched(profile)?;
         storage.load_archive()?
     };
 
@@ -93,7 +93,7 @@ async fn list_archived(profile: &str, json: bool, all: bool) -> Result<()> {
 }
 
 async fn show_archived(profile: &str, identifier: &str) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let entries = storage.load_archive()?;
     let entry = resolve_archive(identifier, &entries)?;
 
@@ -118,7 +118,7 @@ async fn show_archived(profile: &str, identifier: &str) -> Result<()> {
 }
 
 async fn restore_archived(profile: &str, identifier: &str) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let (mut instances, groups) = storage.load_with_groups()?;
     let entries = storage.load_archive()?;
     let entry = resolve_archive(identifier, &entries)?.clone();
@@ -139,7 +139,7 @@ async fn restore_archived(profile: &str, identifier: &str) -> Result<()> {
 }
 
 async fn delete_archived(profile: &str, identifier: &str) -> Result<()> {
-    let storage = Storage::new(profile)?;
+    let storage = Storage::new_unwatched(profile)?;
     let entries = storage.load_archive()?;
     let entry = resolve_archive(identifier, &entries)?;
     let title = entry.instance.title.clone();
@@ -156,7 +156,7 @@ async fn delete_archived(profile: &str, identifier: &str) -> Result<()> {
 fn load_all_archives() -> Result<Vec<ArchivedSession>> {
     let mut all = Vec::new();
     for profile in crate::session::list_profiles()? {
-        let storage = Storage::new(&profile)?;
+        let storage = Storage::new_unwatched(&profile)?;
         all.extend(storage.load_archive()?);
     }
     all.sort_by(|left, right| right.archived_at.cmp(&left.archived_at));

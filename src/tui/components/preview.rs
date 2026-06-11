@@ -47,19 +47,24 @@ impl<'a> CachedPreview<'a> {
 pub fn agent_info_height(instance: &Instance) -> u16 {
     let base: u16 = 3; // profile+tool / path / status
     let sandbox_lines: u16 = if instance.is_sandboxed() { 1 } else { 0 };
-    let tool_session_lines: u16 =
-        if crate::session::tool_session::tracking_enabled(instance) && instance.tool_session.is_some() {
-            1
-        } else {
-            0
-        };
+    let tool_session_lines: u16 = if crate::session::tool_session::tracking_enabled(instance)
+        && instance.tool_session.is_some()
+    {
+        1
+    } else {
+        0
+    };
     if let Some(wt) = instance.worktree_info.as_ref() {
         // blank + header + branch + main (+ optional base)
         let base_branch_line: u16 = if wt.base_branch.is_some() { 1 } else { 0 };
         base + sandbox_lines + tool_session_lines + 4 + base_branch_line
     } else {
         // blank + "─ Git ─" header + branch (only when display_branch is set)
-        let branch_lines: u16 = if instance.display_branch.is_some() { 3 } else { 0 };
+        let branch_lines: u16 = if instance.display_branch.is_some() {
+            3
+        } else {
+            0
+        };
         base + sandbox_lines + tool_session_lines + branch_lines
     }
 }
@@ -605,9 +610,7 @@ fn restore_trailing_slash(mut path: String, had_trailing_slash: bool) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{
-        save_repo_config, Instance, RepoConfig, SessionConfigOverride, ToolSession,
-    };
+    use crate::session::{save_repo_config, Instance, RepoConfig, ToolSession};
     use chrono::Utc;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -624,12 +627,12 @@ mod tests {
                     frame,
                     frame.area(),
                     instance,
-                    "",
+                    CachedPreview::from_text(None),
                     0,
                     &theme,
                     Duration::from_secs(300),
                     false,
-                    false,
+                    true,
                 );
             })
             .unwrap();
@@ -659,20 +662,20 @@ mod tests {
         let dir = tempdir().unwrap();
         save_repo_config(
             dir.path(),
-            &RepoConfig {
-                session: Some(SessionConfigOverride {
-                    tool_session_tracking: Some(true),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            &serde_json::from_value::<RepoConfig>(
+                serde_json::json!({"session": {"tool_session_tracking": true}}),
+            )
+            .unwrap(),
         )
         .unwrap();
         let instance = instance_with_tool_session(dir.path());
 
         let rendered = render_preview(&instance);
 
-        assert!(rendered.contains("Session ID: session-123"));
+        assert!(
+            rendered.contains("Session ID: session-123"),
+            "rendered:\n{rendered}"
+        );
     }
 
     #[test]
@@ -680,13 +683,10 @@ mod tests {
         let dir = tempdir().unwrap();
         save_repo_config(
             dir.path(),
-            &RepoConfig {
-                session: Some(SessionConfigOverride {
-                    tool_session_tracking: Some(false),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            &serde_json::from_value::<RepoConfig>(
+                serde_json::json!({"session": {"tool_session_tracking": false}}),
+            )
+            .unwrap(),
         )
         .unwrap();
         let instance = instance_with_tool_session(dir.path());

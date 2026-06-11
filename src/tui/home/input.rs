@@ -1790,7 +1790,12 @@ impl HomeView {
                 DialogResult::Submit(options) => {
                     let allow_archive = self.delete_dialog_allow_archive;
                     self.unified_delete_dialog = None;
-                    if let Err(e) = self.delete_selected(&options) {
+                    let result = if allow_archive {
+                        self.delete_selected(&options)
+                    } else {
+                        self.delete_selected_permanently(&options)
+                    };
+                    if let Err(e) = result {
                         tracing::error!(target: "tui.input", "Failed to delete session: {}", e);
                     }
                     self.delete_dialog_allow_archive = true;
@@ -2146,45 +2151,10 @@ impl HomeView {
                 self.view_mode = ViewMode::Structured;
                 return None;
             }
-            KeyCode::Char('P') => {
-                self.show_profile_picker();
-            }
-            KeyCode::Char('p') => {
-                let profile = self.active_profile.as_deref().unwrap_or("default");
-                self.projects_dialog = Some(ProjectsDialog::new(profile));
-            }
-            #[cfg(feature = "serve")]
-            KeyCode::Char('R') => {
-                self.serve_view = Some(crate::tui::dialogs::ServeView::new());
-            }
-            #[cfg(not(feature = "serve"))]
-            KeyCode::Char('R') => {
-                self.info_dialog = Some(InfoDialog::new(
-                    "Serve unavailable",
-                    "This `aoe` binary was built without the `serve` feature, \
-                     so the web dashboard, local network serving, and \
-                     Cloudflare Tunnel integration are not included.\n\n\
-                     To serve to your phone (LAN / Tailscale / tunnel):\n\
-                       \u{2022} Install a release build from GitHub Releases, or\n\
-                       \u{2022} Build from source with:\n\
-                         cargo build --release --features serve\n\n\
-                     Once you have a `serve`-enabled binary, press R again to \
-                     open the serve dialog.",
-                ));
-            }
-            KeyCode::Char('t') => {
-                self.view_mode = match self.view_mode {
-                    ViewMode::Agent => ViewMode::Terminal,
-                    ViewMode::Terminal => ViewMode::Agent,
-                    ViewMode::Archive => ViewMode::Agent,
-                };
-                self.flat_items = self.build_flat_items();
-                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                self.update_selected();
-            }
+            // Toggle archive view (fork-only; not in bindings registry).
             KeyCode::Char('a') => {
                 self.view_mode = if self.view_mode == ViewMode::Archive {
-                    ViewMode::Agent
+                    ViewMode::Structured
                 } else {
                     ViewMode::Archive
                 };
@@ -2192,90 +2162,55 @@ impl HomeView {
                 self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
                 self.update_selected();
             }
-            KeyCode::Char('T') => {
-                if self.view_mode == ViewMode::Archive {
-                    return None;
-                }
-                // Quick-attach to paired terminal from any view
-                if let Some(id) = &self.selected_session {
-                    if let Some(inst) = self.get_display_instance(id) {
-                        if matches!(inst.status, Status::Deleting | Status::Creating) {
-                            return None;
-                        }
+            // List-width adjustments with capital H/L (fork-only; not in bindings).
+            KeyCode::Char('H') => {
+                self.shrink_list();
+            }
+            KeyCode::Char('L') => {
+                self.grow_list();
+            }
+            // Tab: live-send / attach-terminal toggle (fork addition).
+            KeyCode::Tab => {
+                let swap_to_attach = self
+                    .selected_session
+                    .as_deref()
+                    .map(|id| {
+                        matches!(
+                            self.default_attach_mode(id),
+                            Some(crate::session::NewSessionAttachMode::LiveSend)
+                        )
+                    })
+                    .unwrap_or(false);
+                if swap_to_attach {
+                    if let Some(action) = self.tab_attach_action() {
+                        return Some(action);
                     }
-                    let terminal_mode = if let Some(inst) = self.get_instance(id) {
-                        if inst.is_sandboxed() {
-                            self.get_terminal_mode(id)
-                        } else {
-                            TerminalMode::Host
-                        }
-                    } else {
-                        TerminalMode::Host
-                    };
-                    return Some(Action::AttachTerminal(id.clone(), terminal_mode));
+                } else if let Some(action) = self.start_live_send() {
+                    return Some(action);
                 }
             }
-            KeyCode::Char('c') if self.view_mode == ViewMode::Terminal => {
-                if let Some(id) = &self.selected_session {
-                    if let Some(inst) = self.get_instance(id) {
-                        if inst.is_sandboxed() {
-                            let id = id.clone();
-                            self.toggle_terminal_mode(&id);
-                        } else {
-                            self.info_dialog = Some(InfoDialog::new(
-                                "Not Available",
-                                "Only sandboxed sessions support container terminals. This session runs directly on the host.",
-                            ));
-                        }
-                    }
-                }
+            // Ctrl+D in non-strict mode forces permanent deletion (skip archive).
+            // In strict mode, Ctrl+D is bound to Diff via the registry; the guard
+            // below only fires when Ctrl is held but it's non-strict mode and the
+            // registry won't consume this chord.
+            KeyCode::Char('d')
+                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.strict_hotkeys =>
+            {
+                self.open_permanent_delete_for_selected();
+                return None;
             }
-            KeyCode::Char('/') => {
-                self.search_active = true;
-                self.search_query = Input::default();
-            }
-            KeyCode::Char('n') => {
-                if !self.search_matches.is_empty() {
-                    self.search_match_index =
-                        (self.search_match_index + 1) % self.search_matches.len();
-                    self.cursor = self.search_matches[self.search_match_index];
-                    self.update_selected();
-                } else if self.creating_stub_id.is_some() {
+            // Restore archived session (fork-only; only fires in Archive view).
+            KeyCode::Char('r') if self.view_mode == ViewMode::Archive => {
+                if let Err(e) = self.restore_selected_archive() {
                     self.info_dialog = Some(InfoDialog::new(
-                        "Please Wait",
-                        "A session is already being created. Wait for it to finish or press Ctrl+C to cancel.",
-                    ));
-                } else if !self.available_tools.any_available() {
-                    self.show_no_agents();
-                } else {
-                    let existing_groups: Vec<String> =
-                        self.all_groups().iter().map(|g| g.path.clone()).collect();
-                    let current_profile = self
-                        .active_profile
-                        .clone()
-                        .unwrap_or_else(|| "default".to_string());
-                    let profiles =
-                        list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-                    self.new_dialog = Some(NewSessionDialog::new(
-                        self.available_tools.clone(),
-                        existing_groups,
-                        &current_profile,
-                        profiles,
+                        "Restore Archived Session",
+                        &format!("Failed to restore archived session: {}", e),
                     ));
                 }
             }
-            KeyCode::Char('N') => {
-                if !self.search_matches.is_empty() {
-                    self.search_match_index = if self.search_match_index == 0 {
-                        self.search_matches.len() - 1
-                    } else {
-                        self.search_match_index - 1
-                    };
-                    self.cursor = self.search_matches[self.search_match_index];
-                    self.update_selected();
-                } else {
-                    self.open_new_from_selection();
-                }
+            // Refresh branch display for selected session (fork-only, non-strict only).
+            KeyCode::Char('B') if !self.strict_hotkeys => {
+                self.refresh_selected_branch();
             }
             _ => {}
         }
@@ -2291,8 +2226,76 @@ impl HomeView {
             return self.run_action(id, update_info);
         }
 
-        // Typing guard: in non-strict mode, bare letters that aren't bindings
-        // fall through here as a no-op.
+        // Navigation / structural keys: identical in both modes, never relocate.
+        match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => self.move_cursor(-10),
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => self.move_cursor(10),
+            KeyCode::Char('{') => self.move_cursor(-10),
+            KeyCode::Char('}') => self.move_cursor(10),
+            KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
+            KeyCode::PageUp => self.move_cursor(-10),
+            KeyCode::PageDown => self.move_cursor(10),
+            KeyCode::Home => {
+                self.cursor = 0;
+                self.mouse_pos = None;
+                self.update_selected();
+            }
+            KeyCode::End | KeyCode::Char('G') if !self.flat_items.is_empty() => {
+                self.cursor = self.flat_items.len() - 1;
+                self.mouse_pos = None;
+                self.update_selected();
+            }
+            KeyCode::Char('<') => self.shrink_list(),
+            KeyCode::Char('>') => self.grow_list(),
+            KeyCode::Enter => {
+                if self.selected_session.is_some() {
+                    return self.activate_selected_session();
+                } else if let Some(Item::Group { path, .. }) = self.flat_items.get(self.cursor) {
+                    let path = path.clone();
+                    self.toggle_group_collapsed(&path);
+                }
+            }
+            // h/l group collapse/expand: listed explicitly so they are matched
+            // BEFORE the strict-mode typing guard below. In Attention sort, `h`
+            // is bound to ToggleSnooze via the registry and reaches here only
+            // when the registry declines (non-Attention sort), making this the
+            // correct fallback.
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Some(Item::Group {
+                    path, collapsed, ..
+                }) = self.flat_items.get(self.cursor)
+                {
+                    if !collapsed {
+                        let path = path.clone();
+                        self.toggle_group_collapsed(&path);
+                    }
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(Item::Group {
+                    path, collapsed, ..
+                }) = self.flat_items.get(self.cursor)
+                {
+                    if *collapsed {
+                        let path = path.clone();
+                        self.toggle_group_collapsed(&path);
+                    }
+                }
+            }
+            // Strict-mode typing guard: any bare lowercase letter not bound to
+            // an action or navigation key opens the compose dialog pre-filled
+            // with that character (the no-destructive-lowercase contract).
+            KeyCode::Char(c)
+                if self.strict_hotkeys
+                    && key.modifiers == KeyModifiers::NONE
+                    && c.is_ascii_lowercase() =>
+            {
+                self.capture_letter_to_compose(c);
+            }
+            _ => {}
+        }
+
         None
     }
     fn refresh_selected_branch(&mut self) {
@@ -2414,8 +2417,13 @@ impl HomeView {
             ActionId::ToggleView => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
-                    ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
+                    ViewMode::Terminal | ViewMode::Tool(_) | ViewMode::Archive => {
+                        ViewMode::Structured
+                    }
                 };
+                self.flat_items = self.build_flat_items();
+                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
+                self.update_selected();
             }
             ActionId::SendMessage => self.open_send_message_dialog(),
             ActionId::Stop => self.stop_selected(),
@@ -2568,6 +2576,10 @@ impl HomeView {
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
+        // Archive view does not support terminal attach.
+        if self.view_mode == ViewMode::Archive {
+            return None;
+        }
         // Quick-attach to paired terminal from any view.
         if let Some(id) = &self.selected_session {
             if let Some(inst) = self.get_instance(id) {
@@ -3118,6 +3130,7 @@ impl HomeView {
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
             ViewMode::Tool(ref tool_name) => Some(Action::AttachToolSession(id, tool_name.clone())),
+            ViewMode::Archive => Some(Action::AttachSession(id)),
         }
     }
 
@@ -3727,6 +3740,32 @@ impl HomeView {
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
+        self.open_delete_for_selected_with_archive(true);
+    }
+
+    pub(super) fn open_permanent_delete_for_selected(&mut self) {
+        self.open_delete_for_selected_with_archive(false);
+    }
+
+    fn open_delete_for_selected_with_archive(&mut self, allow_archive: bool) {
+        // In archive view, 'd' permanently deletes the archived session entry.
+        if self.view_mode == ViewMode::Archive {
+            if let Some(session_id) = &self.selected_session {
+                if let Some(entry) = self.get_archived_session(session_id) {
+                    let message = format!(
+                        "Permanently delete archived session '{}'?",
+                        entry.instance.title
+                    );
+                    self.pending_archive_delete_session = Some(session_id.clone());
+                    self.confirm_dialog = Some(ConfirmDialog::new(
+                        "Delete Archived Session",
+                        &message,
+                        "delete_archived_session",
+                    ));
+                }
+            }
+            return;
+        }
         // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
             let hint = if self.strict_hotkeys {
@@ -3770,18 +3809,31 @@ impl HomeView {
                 };
 
                 let profile = self.config_profile();
-                self.unified_delete_dialog = Some(UnifiedDeleteDialog::new(
-                    inst.title.clone(),
-                    config,
-                    &profile,
-                ));
+                let title = inst.title.clone();
+                let (archive_on_confirm, _) =
+                    self.archive_settings_for_instance(inst, allow_archive);
+                self.delete_dialog_allow_archive = archive_on_confirm;
+                self.unified_delete_dialog = Some(if archive_on_confirm {
+                    UnifiedDeleteDialog::new(title, config, &profile)
+                } else {
+                    UnifiedDeleteDialog::new_permanent(title, config, &profile)
+                });
             } else {
                 let profile = self.config_profile();
-                self.unified_delete_dialog = Some(UnifiedDeleteDialog::new(
-                    "Unknown Session".to_string(),
-                    DeleteDialogConfig::default(),
-                    &profile,
-                ));
+                self.delete_dialog_allow_archive = allow_archive;
+                self.unified_delete_dialog = Some(if allow_archive {
+                    UnifiedDeleteDialog::new(
+                        "Unknown Session".to_string(),
+                        DeleteDialogConfig::default(),
+                        &profile,
+                    )
+                } else {
+                    UnifiedDeleteDialog::new_permanent(
+                        "Unknown Session".to_string(),
+                        DeleteDialogConfig::default(),
+                        &profile,
+                    )
+                });
             }
         } else if let Some(group_path) = &self.selected_group {
             if self.group_by == GroupByMode::Project {
@@ -4229,7 +4281,7 @@ impl HomeView {
                     live_send::LiveSendTarget::Terminal
                 }
             }
-            ViewMode::Tool(_) => return None,
+            ViewMode::Tool(_) | ViewMode::Archive => return None,
         };
         Some(Action::EnterLiveSend(id))
     }
@@ -4479,7 +4531,7 @@ impl HomeView {
                 }
                 live_send::LiveSendTarget::Terminal
             }
-            ViewMode::Tool(_) => live_send::LiveSendTarget::Agent,
+            ViewMode::Tool(_) | ViewMode::Archive => live_send::LiveSendTarget::Agent,
         }
     }
 

@@ -410,6 +410,7 @@ pub struct Instance {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_at: Option<DateTime<Utc>>,
 
     /// Favorite marker; sibling of archive. When set AND the session is in
@@ -1040,6 +1041,12 @@ impl Instance {
         self.status = src.status;
         self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
         self.idle_entered_at = src.idle_entered_at;
+        if src.tool_session.is_some() {
+            self.tool_session = src.tool_session.clone();
+        }
+        if src.tool_session_probe.is_some() {
+            self.tool_session_probe = src.tool_session_probe.clone();
+        }
     }
 
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
@@ -2099,10 +2106,13 @@ impl Instance {
         }
 
         if let Some(cmd) = self.build_tool_session_command(agent) {
-            return Some(wrap_command_ignore_suspend(&format!(
-                "{}{}",
-                env_prefix, cmd
-            )));
+            return (
+                Some(wrap_command_ignore_suspend(&format!(
+                    "{}{}",
+                    env_prefix, cmd
+                ))),
+                true,
+            );
         }
 
         if self.command.is_empty() {
@@ -7684,6 +7694,9 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
         let quoted_pane_file =
             format!("'{}'", pane_file.to_string_lossy().replace('\'', r#"'\''"#));
         let launch = format!("cat {quoted_pane_file}; sleep 300");
+        // Pin pane-base-index 0 to match what aoe does in production;
+        // without this, users with `pane-base-index 1` in their tmux.conf
+        // cause the `^.0` capture target to miss.
         let created = std::process::Command::new("tmux")
             .args([
                 "new-session",
@@ -7695,6 +7708,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "-y",
                 "40",
                 &launch,
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("spawn tmux");

@@ -57,8 +57,15 @@ export function TopBar({
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenSettings, onOpenArchive, onOpenHelp, onOpenAbout, onLogout, loginRequired]);
-  }, [onOpenHelp, onStartTutorial, onOpenAbout, onLogout, loginRequired]);
+  }, [
+    onOpenSettings,
+    onOpenArchive,
+    onOpenHelp,
+    onStartTutorial,
+    onOpenAbout,
+    onLogout,
+    loginRequired,
+  ]);
 
   return (
     <header

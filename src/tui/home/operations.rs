@@ -662,10 +662,6 @@ impl HomeView {
         )
     }
 
-    /// Force-remove a session from storage without any cleanup.
-    /// Used for sessions stuck in the Deleting state where the background
-    /// deletion thread never returned a result.
-
     /// Force-remove a session from storage. Worktree, branch, and
     /// container cleanup are skipped (the original deletion already
     /// attempted them); tmux teardown is fired off-thread so a hung
@@ -723,7 +719,7 @@ impl HomeView {
             .ok_or_else(|| anyhow::anyhow!("Storage not found for profile '{}'", profile))?;
         storage.delete_archived_session(&session_id)?;
 
-        self.view_mode = super::ViewMode::Agent;
+        self.view_mode = super::ViewMode::Structured;
         self.reload()?;
         self.select_session_by_id(&session_id);
         Ok(())

@@ -38,16 +38,11 @@ pub use mcp::{drop_mcp_server, get_mcp_servers, keep_mcp_server, resolve_mcp_con
 pub use projects::{create_project, delete_project, list_projects, update_project};
 pub use sessions::{
     create_session, delete_archived_session, delete_session, ensure_container_terminal,
-    ensure_session, ensure_terminal, list_archive, list_sessions, read_output, rename_session,
-    restore_archived_session, send_message, session_diff_file, session_diff_files,
-    update_session_diff_base, update_session_notifications, CleanupDefaults, OutputQuery,
-    SendMessageRequest, SessionResponse,
-    create_session, delete_session, ensure_container_terminal, ensure_session, ensure_terminal,
-    list_sessions, preview_volume_ignores_globs, read_output, rename_session, send_message,
-    session_diff_file, session_diff_files, set_worktree_name, update_session_archive,
-    update_session_diff_base, update_session_group, update_session_notifications,
-    update_session_pin, update_session_snooze, update_workspace_ordering, CleanupDefaults,
-    OutputQuery, SendMessageRequest, SessionResponse,
+    ensure_session, ensure_terminal, list_archive, list_sessions, preview_volume_ignores_globs,
+    read_output, rename_session, restore_archived_session, send_message, session_diff_file,
+    session_diff_files, set_worktree_name, update_session_archive, update_session_diff_base,
+    update_session_group, update_session_notifications, update_session_pin, update_session_snooze,
+    update_workspace_ordering, CleanupDefaults, OutputQuery, SendMessageRequest, SessionResponse,
 };
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, docker_status,

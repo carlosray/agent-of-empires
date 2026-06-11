@@ -1476,6 +1476,7 @@ impl HomeView {
             ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
                 .session_name()
                 .to_string(),
+            ViewMode::Archive => crate::tmux::Session::generate_name(&inst.id, &inst.title),
         };
         Some(name)
     }
@@ -1797,6 +1798,7 @@ impl HomeView {
                     TerminalMode::Host => &self.terminal_preview_cache,
                 }
             }
+            ViewMode::Archive => &self.preview_cache,
         }
     }
 
@@ -1807,7 +1809,7 @@ impl HomeView {
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
-            ViewMode::Structured => (theme.border, theme.title),
+            ViewMode::Structured | ViewMode::Archive => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
                 (theme.terminal_border, theme.terminal_border)
             }
@@ -1885,7 +1887,7 @@ impl HomeView {
             block = block.title(line);
         } else {
             let title = match &self.view_mode {
-                ViewMode::Structured => " Preview ".to_string(),
+                ViewMode::Structured | ViewMode::Archive => " Preview ".to_string(),
                 ViewMode::Terminal => " Terminal Preview ".to_string(),
                 ViewMode::Tool(name) => format!(" {} Preview ", name),
             };
@@ -2891,7 +2893,7 @@ impl HomeView {
             }
         }
 
-        groups.push((4, mk(if strict { "A" } else { "a" }, "Archive")));
+        groups.push((4, mk(if strict { "A" } else { "a" }, "History")));
         groups.push((4, mk_key("/")));
         groups.push((4, mk(if strict { "^D" } else { "D" }, "Diff")));
         groups.push((1, mk("^K", "Cmds")));

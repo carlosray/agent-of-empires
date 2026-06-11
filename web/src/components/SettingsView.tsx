@@ -14,27 +14,13 @@ import {
   updateProfileSettings,
   updateTheme,
 } from "../lib/api";
-import type { ProfileInfo } from "../lib/types";
-import {
-  ListField,
-  NumberField,
-  SelectField,
-  TextField,
-  ToggleField,
-} from "./settings/FormFields";
-import { ThemeSettings } from "./settings/ThemeSettings";
-import { SoundSettings } from "./settings/SoundSettings";
-import { UpdateSettings } from "./settings/UpdateSettings";
-import { TmuxSettings } from "./settings/TmuxSettings";
-import { LoggingSettings } from "./settings/LoggingSettings";
-import { ProfileSelector } from "./settings/ProfileSelector";
-import { ArchiveSettings } from "./ArchiveSettings";
 import type { ProfileInfo, SettingsFieldDescriptor } from "../lib/types";
 import { SchemaSection } from "./settings/SchemaSection";
 import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
+import { ArchiveSettings } from "./ArchiveSettings";
 
 type TabId =
   | "session"
@@ -414,6 +400,7 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
                 advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
               />
             )}
+            <ArchiveSettings />
           </div>
         );
 

@@ -746,7 +746,11 @@ pub struct SessionConfig {
 
     /// Track underlying tool sessions for supported agents and reuse them on restore.
     #[serde(default)]
-    #[setting(label = "Tool Session Tracking", widget = "toggle", category = "Session")]
+    #[setting(
+        label = "Tool Session Tracking",
+        widget = "toggle",
+        category = "Session"
+    )]
     pub tool_session_tracking: bool,
 
     /// Archive sessions when deleting them instead of removing their metadata permanently.

@@ -146,6 +146,9 @@ fn snapshot(sessions: &[AttachedStatusHookSession]) -> Vec<StatusUpdate> {
             idle_entered_at: session.instance.idle_entered_at,
             last_accessed_at: session.instance.last_accessed_at,
             pane_dead: session.instance.pane_dead_observed,
+            tool_session: None,
+            tool_session_probe: None,
+            tool_session_changed: false,
         })
         .collect()
 }
@@ -181,6 +184,9 @@ mod tests {
                 idle_entered_at: None,
                 last_accessed_at: None,
                 pane_dead: false,
+                tool_session: None,
+                tool_session_probe: None,
+                tool_session_changed: false,
             }],
             true,
         );

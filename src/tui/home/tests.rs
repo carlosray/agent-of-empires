@@ -6,8 +6,9 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{HomeView, ViewMode};
-use crate::session::{save_config, ArchiveCleanupOptions, Config, Instance, Item, Storage};
-use crate::session::{GroupTree, Instance, Item, Storage};
+use crate::session::{
+    save_config, ArchiveCleanupOptions, Config, GroupTree, Instance, Item, Storage,
+};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
 use crate::tui::dialogs::{InfoDialog, NewSessionDialog};
@@ -1329,13 +1330,13 @@ fn test_a_toggles_archive_view() {
     let env = create_test_env_empty();
     let mut view = env.view;
 
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    assert_eq!(view.view_mode, ViewMode::Structured);
 
     view.handle_key(key(KeyCode::Char('a')), None);
     assert_eq!(view.view_mode, ViewMode::Archive);
 
     view.handle_key(key(KeyCode::Char('a')), None);
-    assert_eq!(view.view_mode, ViewMode::Agent);
+    assert_eq!(view.view_mode, ViewMode::Structured);
 }
 
 #[test]
@@ -1345,13 +1346,19 @@ fn test_archive_view_uses_same_grouping_and_sort_order() {
 
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
 
     let mut active_a = Instance::new("Alpha", "/tmp/active-alpha");
     active_a.group_path = "work".to_string();
     let mut active_b = Instance::new("Beta", "/tmp/active-beta");
     active_b.group_path = "work".to_string();
-    storage.save(&[active_b, active_a]).unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(active_b);
+            instances.push(active_a);
+            Ok(())
+        })
+        .unwrap();
 
     let mut archived_a = Instance::new("Alpha", "/tmp/archive-alpha");
     archived_a.group_path = "work".to_string();
@@ -1365,7 +1372,12 @@ fn test_archive_view_uses_same_grouping_and_sort_order() {
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = GroupByMode::Manual;
     view.sort_order = SortOrder::AZ;
 
@@ -1382,7 +1394,7 @@ fn test_archive_view_uses_same_grouping_and_sort_order() {
             .collect()
     }
 
-    view.view_mode = ViewMode::Agent;
+    view.view_mode = ViewMode::Structured;
     let active_items = view.build_flat_items();
     let active_labels = labels(&view, &active_items);
     view.view_mode = ViewMode::Archive;
@@ -1493,13 +1505,21 @@ fn test_d_respects_disabled_archive_setting() {
     config.session.archive_on_delete = false;
     save_config(&config).unwrap();
 
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     storage
-        .save(&[Instance::new("session", "/tmp/session")])
+        .update(|instances, _| {
+            instances.push(Instance::new("session", "/tmp/session"));
+            Ok(())
+        })
         .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1536,13 +1556,23 @@ fn test_uppercase_b_on_changed_branch_opens_confirm_dialog() {
     config.worktree.branch_command = Some("printf 'feature/new\\n'".to_string());
     save_config(&config).unwrap();
 
-    let storage = Storage::new("test").unwrap();
+    let storage = Storage::new_unwatched("test").unwrap();
     let mut instance = Instance::new("repo", repo_path.to_str().unwrap());
     instance.display_branch = Some("feature/old".to_string());
-    storage.save(std::slice::from_ref(&instance)).unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(instance);
+            Ok(())
+        })
+        .unwrap();
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     view.group_by = crate::session::config::GroupByMode::Manual;
     view.flat_items = view.build_flat_items();
     view.update_selected();
@@ -1598,7 +1628,12 @@ fn test_refresh_from_config_updates_show_branch_toggle() {
     setup_test_home(&temp);
 
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
     assert!(view.show_branch_in_tui);
 
     let mut config = Config::default();
@@ -5070,6 +5105,9 @@ fn apply_status_update_runs_status_hook_on_transition() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
     });
 
     let launches = take_recorded_launches();
@@ -5135,6 +5173,9 @@ fn apply_status_update_does_not_run_status_hook_for_same_status() {
         idle_entered_at: None,
         last_accessed_at: None,
         pane_dead: false,
+        tool_session: None,
+        tool_session_probe: None,
+        tool_session_changed: false,
     });
 
     assert!(take_recorded_launches().is_empty());
@@ -5168,6 +5209,9 @@ fn apply_status_updates_without_hooks_does_not_run_status_hook() {
             idle_entered_at: None,
             last_accessed_at: None,
             pane_dead: false,
+            tool_session: None,
+            tool_session_probe: None,
+            tool_session_changed: false,
         }]);
 
     assert_eq!(env.view.get_instance(&id).unwrap().status, Status::Waiting);
@@ -5448,6 +5492,75 @@ fn test_apply_status_updates_persists_tool_session_to_storage() {
     use crate::session::{ToolSession, ToolSessionProbe};
     use crate::tui::status_poller::StatusUpdate;
     use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let mut inst = Instance::new("persist-test", "/tmp/persist-test");
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    let inst_id = inst.id.clone();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _groups| {
+            instances.push(inst);
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let tool_session = ToolSession {
+        display_id: "sess-abc123".to_string(),
+        resume_target: "sess-abc123".to_string(),
+        source_ref: "ref-xyz".to_string(),
+        updated_at: Utc::now(),
+    };
+
+    let update = StatusUpdate {
+        id: inst_id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
+        tool_session: Some(tool_session.clone()),
+        tool_session_probe: Some(ToolSessionProbe {
+            launch_started_at: Utc::now(),
+            baseline_source_refs: vec!["ref-xyz".to_string()],
+            state: ToolSessionProbeState::Resolved,
+        }),
+        tool_session_changed: true,
+    };
+
+    let changed = view.apply_tool_session_update(&update);
+    assert!(
+        changed,
+        "helper should return true when tool_session actually changed"
+    );
+
+    let storage2 = Storage::new_unwatched("test").unwrap();
+    let (reloaded, _) = storage2.load_with_groups().unwrap();
+    let persisted = reloaded.iter().find(|i| i.id == inst_id).unwrap();
+    assert_eq!(
+        persisted
+            .tool_session
+            .as_ref()
+            .map(|ts| ts.display_id.as_str()),
+        Some("sess-abc123"),
+        "tool_session should be persisted to disk after apply_tool_session_update"
+    );
+}
+
+#[test]
+#[serial]
 fn pollable_instances_excludes_recovery_in_flight() {
     let mut env = create_test_env_with_sessions(3);
     let id_skipped = env.view.instances[1].id.clone();
@@ -6369,272 +6482,6 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     let temp = TempDir::new().unwrap();
     setup_test_home(&temp);
 
-    let mut inst = Instance::new("persist-test", "/tmp/persist-test");
-    inst.tool = "claude".to_string();
-    inst.source_profile = "test".to_string();
-    let inst_id = inst.id.clone();
-
-    let storage = Storage::new("test").unwrap();
-    storage.save(&[inst]).unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
-
-    let tool_session = ToolSession {
-        display_id: "sess-abc123".to_string(),
-        resume_target: "sess-abc123".to_string(),
-        source_ref: "ref-xyz".to_string(),
-        updated_at: Utc::now(),
-    };
-
-    let update = StatusUpdate {
-        id: inst_id.clone(),
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: None,
-        tool_session: Some(tool_session.clone()),
-        tool_session_probe: Some(ToolSessionProbe {
-            launch_started_at: Utc::now(),
-            baseline_source_refs: vec!["ref-xyz".to_string()],
-            state: ToolSessionProbeState::Resolved,
-        }),
-        tool_session_changed: true,
-    };
-
-    let changed = view.apply_tool_session_update(&update);
-    assert!(
-        changed,
-        "helper should return true when tool_session actually changed"
-    );
-
-    let storage2 = Storage::new("test").unwrap();
-    let (reloaded, _) = storage2.load_with_groups().unwrap();
-    let persisted = reloaded.iter().find(|i| i.id == inst_id).unwrap();
-    assert_eq!(
-        persisted
-            .tool_session
-            .as_ref()
-            .map(|ts| ts.display_id.as_str()),
-        Some("sess-abc123"),
-        "tool_session should be persisted to disk after apply_tool_session_update"
-    );
-}
-
-#[test]
-#[serial]
-fn test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_change() {
-    use crate::session::Status;
-    use crate::session::ToolSessionProbeState;
-    use crate::session::{ToolSession, ToolSessionProbe};
-    use crate::tui::status_poller::StatusUpdate;
-    use chrono::Utc;
-
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let existing = ToolSession {
-        display_id: "sess-existing".to_string(),
-        resume_target: "sess-existing".to_string(),
-        source_ref: "ref-existing".to_string(),
-        updated_at: Utc::now(),
-    };
-
-    let mut inst = Instance::new("probe-only", "/tmp/probe-only");
-    inst.tool = "claude".to_string();
-    inst.source_profile = "test".to_string();
-    inst.tool_session = Some(existing.clone());
-    let inst_id = inst.id.clone();
-
-    let storage = Storage::new("test").unwrap();
-    storage.save(&[inst]).unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
-
-    let update = StatusUpdate {
-        id: inst_id.clone(),
-        status: Status::Idle,
-        last_error: None,
-        idle_entered_at: None,
-        tool_session: None,
-        tool_session_probe: Some(ToolSessionProbe {
-            launch_started_at: Utc::now(),
-            baseline_source_refs: vec!["ref-a".to_string(), "ref-b".to_string()],
-            state: ToolSessionProbeState::Ambiguous,
-        }),
-        tool_session_changed: true,
-    };
-
-    let changed = view.apply_tool_session_update(&update);
-    assert!(
-        !changed,
-        "probe-only updates must not report a persisted tool_session change"
-    );
-
-    let in_memory = view.get_instance(&inst_id).unwrap();
-    assert_eq!(in_memory.tool_session, Some(existing.clone()));
-
-    let storage2 = Storage::new("test").unwrap();
-    let (reloaded, _) = storage2.load_with_groups().unwrap();
-    let persisted = reloaded.iter().find(|i| i.id == inst_id).unwrap();
-    assert_eq!(persisted.tool_session, Some(existing));
-}
-
-#[test]
-#[serial]
-fn test_reload_preserves_unsaved_runtime_tool_session() {
-    use crate::session::ToolSession;
-    use chrono::Utc;
-
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let mut inst = Instance::new("reload-runtime", "/tmp/reload-runtime");
-    inst.tool = "claude".to_string();
-    inst.source_profile = "test".to_string();
-    let inst_id = inst.id.clone();
-
-    let storage = Storage::new("test").unwrap();
-    storage.save(&[inst]).unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
-
-    let runtime_session = ToolSession {
-        display_id: "runtime-session".to_string(),
-        resume_target: "runtime-session".to_string(),
-        source_ref: "runtime-ref".to_string(),
-        updated_at: Utc::now(),
-    };
-    view.mutate_instance(&inst_id, |inst| {
-        inst.tool_session = Some(runtime_session.clone());
-    });
-
-    view.reload().unwrap();
-
-    let reloaded = view.get_instance(&inst_id).unwrap();
-    assert_eq!(
-        reloaded.tool_session,
-        Some(runtime_session),
-        "reload must not clobber an in-memory mapping with stale disk state"
-    );
-}
-
-#[test]
-#[serial]
-fn test_backfill_tool_sessions_is_noop_for_session_with_existing_mapping() {
-    use crate::session::{save_repo_config, RepoConfig, SessionConfigOverride, ToolSession};
-    use chrono::Utc;
-
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let project_path = temp.path().join("proj");
-    std::fs::create_dir_all(&project_path).unwrap();
-
-    // Enable tracking via repo config so is_eligible returns true.
-    save_repo_config(
-        &project_path,
-        &RepoConfig {
-            session: Some(SessionConfigOverride {
-                tool_session_tracking: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    let mut inst = Instance::new("already-mapped", project_path.to_str().unwrap());
-    inst.tool = "claude".to_string();
-    inst.source_profile = "test".to_string();
-    inst.tool_session = Some(ToolSession {
-        display_id: "existing-session".to_string(),
-        resume_target: "existing-session".to_string(),
-        source_ref: "existing-ref".to_string(),
-        updated_at: Utc::now(),
-    });
-
-    let storage = Storage::new("test").unwrap();
-    storage.save(&[inst]).unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
-
-    let result = view.backfill_tool_sessions().unwrap();
-    assert!(
-        !result,
-        "backfill should return false when all instances already have a tool_session"
-    );
-}
-
-#[test]
-#[serial]
-fn test_backfill_tool_sessions_is_noop_when_tracking_disabled() {
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let project_path = temp.path().join("proj");
-    std::fs::create_dir_all(&project_path).unwrap();
-
-    // Tracking is disabled by default (no repo config written).
-    let mut inst = Instance::new("no-tracking", project_path.to_str().unwrap());
-    inst.tool = "claude".to_string();
-    inst.source_profile = "test".to_string();
-    // tool_session is None, so it would be a candidate if eligible.
-
-    let storage = Storage::new("test").unwrap();
-    storage.save(&[inst]).unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
-
-    let result = view.backfill_tool_sessions().unwrap();
-    assert!(
-        !result,
-        "backfill should return false when tracking is disabled (is_eligible returns false)"
-    );
-}
-
-#[test]
-#[serial]
-fn test_backfill_tool_sessions_is_noop_for_unsupported_tool() {
-    use crate::session::{save_repo_config, RepoConfig, SessionConfigOverride};
-
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let project_path = temp.path().join("proj");
-    std::fs::create_dir_all(&project_path).unwrap();
-
-    // Enable tracking, but use an unsupported tool.
-    save_repo_config(
-        &project_path,
-        &RepoConfig {
-            session: Some(SessionConfigOverride {
-                tool_session_tracking: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-
-    let mut inst = Instance::new("vibe-session", project_path.to_str().unwrap());
-    inst.tool = "vibe".to_string();
-    inst.source_profile = "test".to_string();
-
-    let storage = Storage::new("test").unwrap();
-    storage.save(&[inst]).unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(Some("test".to_string()), tools).unwrap();
-
-    let result = view.backfill_tool_sessions().unwrap();
-    assert!(
-        !result,
-        "backfill should return false for unsupported tools (is_eligible returns false)"
-    );
     // Two discoverable profiles, each with a session.
     for (profile, title, path) in [
         ("alpha", "Alpha Session", "/tmp/a"),
@@ -6677,6 +6524,269 @@ fn test_backfill_tool_sessions_is_noop_for_unsupported_tool() {
         "beta's profile-scoped pin must show in all-profiles project view, got {names:?}"
     );
     assert!(view.is_project_label_pinned("lonely"));
+}
+
+#[test]
+#[serial]
+fn test_apply_tool_session_update_does_not_clear_existing_mapping_on_probe_only_change() {
+    use crate::session::Status;
+    use crate::session::ToolSessionProbeState;
+    use crate::session::{ToolSession, ToolSessionProbe};
+    use crate::tui::status_poller::StatusUpdate;
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let existing = ToolSession {
+        display_id: "sess-existing".to_string(),
+        resume_target: "sess-existing".to_string(),
+        source_ref: "ref-existing".to_string(),
+        updated_at: Utc::now(),
+    };
+
+    let mut inst = Instance::new("probe-only", "/tmp/probe-only");
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    inst.tool_session = Some(existing.clone());
+    let inst_id = inst.id.clone();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let update = StatusUpdate {
+        id: inst_id.clone(),
+        status: Status::Idle,
+        last_error: None,
+        idle_entered_at: None,
+        last_accessed_at: None,
+        pane_dead: false,
+        tool_session: None,
+        tool_session_probe: Some(ToolSessionProbe {
+            launch_started_at: Utc::now(),
+            baseline_source_refs: vec!["ref-a".to_string(), "ref-b".to_string()],
+            state: ToolSessionProbeState::Ambiguous,
+        }),
+        tool_session_changed: true,
+    };
+
+    let changed = view.apply_tool_session_update(&update);
+    assert!(
+        !changed,
+        "probe-only updates must not report a persisted tool_session change"
+    );
+
+    let in_memory = view.get_instance(&inst_id).unwrap();
+    assert_eq!(in_memory.tool_session, Some(existing.clone()));
+
+    let storage2 = Storage::new_unwatched("test").unwrap();
+    let (reloaded, _) = storage2.load_with_groups().unwrap();
+    let persisted = reloaded.iter().find(|i| i.id == inst_id).unwrap();
+    assert_eq!(persisted.tool_session, Some(existing));
+}
+
+#[test]
+#[serial]
+fn test_reload_preserves_unsaved_runtime_tool_session() {
+    use crate::session::ToolSession;
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let mut inst = Instance::new("reload-runtime", "/tmp/reload-runtime");
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    let inst_id = inst.id.clone();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let runtime_session = ToolSession {
+        display_id: "runtime-session".to_string(),
+        resume_target: "runtime-session".to_string(),
+        source_ref: "runtime-ref".to_string(),
+        updated_at: Utc::now(),
+    };
+    view.mutate_instance(&inst_id, |inst| {
+        inst.tool_session = Some(runtime_session.clone());
+    });
+
+    view.reload().unwrap();
+
+    let reloaded = view.get_instance(&inst_id).unwrap();
+    assert_eq!(
+        reloaded.tool_session,
+        Some(runtime_session),
+        "reload must not clobber an in-memory mapping with stale disk state"
+    );
+}
+
+#[test]
+#[serial]
+fn test_backfill_tool_sessions_is_noop_for_session_with_existing_mapping() {
+    use crate::session::{save_repo_config, RepoConfig, ToolSession};
+    use chrono::Utc;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let project_path = temp.path().join("proj");
+    std::fs::create_dir_all(&project_path).unwrap();
+
+    // Enable tracking via repo config so is_eligible returns true.
+    save_repo_config(
+        &project_path,
+        &serde_json::from_value::<RepoConfig>(
+            serde_json::json!({"session": {"tool_session_tracking": true}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut inst = Instance::new("already-mapped", project_path.to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    inst.tool_session = Some(ToolSession {
+        display_id: "existing-session".to_string(),
+        resume_target: "existing-session".to_string(),
+        source_ref: "existing-ref".to_string(),
+        updated_at: Utc::now(),
+    });
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let result = view.backfill_tool_sessions().unwrap();
+    assert!(
+        !result,
+        "backfill should return false when all instances already have a tool_session"
+    );
+}
+
+#[test]
+#[serial]
+fn test_backfill_tool_sessions_is_noop_when_tracking_disabled() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let project_path = temp.path().join("proj");
+    std::fs::create_dir_all(&project_path).unwrap();
+
+    // Tracking is disabled by default (no repo config written).
+    let mut inst = Instance::new("no-tracking", project_path.to_str().unwrap());
+    inst.tool = "claude".to_string();
+    inst.source_profile = "test".to_string();
+    // tool_session is None, so it would be a candidate if eligible.
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let result = view.backfill_tool_sessions().unwrap();
+    assert!(
+        !result,
+        "backfill should return false when tracking is disabled (is_eligible returns false)"
+    );
+}
+
+#[test]
+#[serial]
+fn test_backfill_tool_sessions_is_noop_for_unsupported_tool() {
+    use crate::session::{save_repo_config, RepoConfig};
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    let project_path = temp.path().join("proj");
+    std::fs::create_dir_all(&project_path).unwrap();
+
+    // Enable tracking, but use an unsupported tool.
+    save_repo_config(
+        &project_path,
+        &serde_json::from_value::<RepoConfig>(
+            serde_json::json!({"session": {"tool_session_tracking": true}}),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut inst = Instance::new("vibe-session", project_path.to_str().unwrap());
+    inst.tool = "vibe".to_string();
+    inst.source_profile = "test".to_string();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    storage
+        .update(|instances, _| {
+            instances.push(inst.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let result = view.backfill_tool_sessions().unwrap();
+    assert!(
+        !result,
+        "backfill should return false for unsupported tools (is_eligible returns false)"
+    );
 }
 
 /// Unpinning a PROFILE-scoped pin from all-profiles mode must actually clear

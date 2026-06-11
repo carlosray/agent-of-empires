@@ -204,18 +204,12 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const settingsTabMatch = useMatch("/settings/:tab");
   const projectsMatch = useMatch("/projects");
   const archiveMatch = useMatch("/archive");
-  const activeSessionId = sessionMatch?.params.sessionId ?? null;
-  const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
-  const showProjects = projectsMatch !== null;
-  const showArchive = archiveMatch !== null;
-  const settingsTab = settingsTabMatch?.params.tab ?? null;
-
-  const { sessions, error, refresh, injectSession, setSessionStatus } = useSessions();
   const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const showProjects = projectsMatch !== null;
   const showProfiles = profilesMatch !== null;
+  const showArchive = archiveMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -225,6 +219,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     markLocalOrderingUpdate,
     error,
     loaded: sessionsLoaded,
+    refresh,
     injectSession,
     setSessionStatus,
   } = useSessions();
@@ -567,7 +562,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         navigate("/");
       }
 
-      const result = await deleteSession(sessionId, options);
+      const result = await deleteSession(sessionId, {
+        ...options,
+        permanent: deletingPermanent,
+      });
       if (!result.ok) {
         // Revert status on failure
         setSessionStatus(sessionId, "Error");
@@ -590,10 +588,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       // Server returns `messages` from `perform_deletion` when there's something
       // user-facing to report (e.g. "Scratch directory kept at: <path>" when
       // `keep_scratch` is set). Surface the first one so the kept-path is visible.
-      const toast = result.messages?.[0] ?? "Session deleted";
+      const toast =
+        result.messages?.[0] ?? (deletingPermanent ? "Session deleted" : "Session archived");
       toastBus.handler?.info(toast);
     },
-    [deletingSession, activeSessionId, setSessionStatus, navigate],
+    [deletingSession, deletingPermanent, activeSessionId, setSessionStatus, navigate],
   );
 
   const handleCreateSession = useCallback(
@@ -1227,6 +1226,8 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onOpenPalette={() => setShowPalette(true)}
           onToggleDiff={toggleDiff}
           diffCollapsed={diffCollapsed}
+          onOpenSettings={handleOpenSettings}
+          onOpenArchive={handleOpenArchive}
           onOpenHelp={handleOpenHelp}
           onOpenAbout={handleOpenAbout}
           onStartTutorial={tour.startTour}
@@ -1263,7 +1264,9 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onSettings={handleOpenSettings}
               onProjects={handleOpenProjects}
               onProfiles={handleOpenProfiles}
-              onDeleteSession={handleDeleteSession}
+              onDeleteSession={handleArchiveSession}
+              onArchiveSession={handleArchiveSession}
+              onPermanentDeleteSession={handlePermanentDeleteSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={setSidebarSortMode}
@@ -1311,6 +1314,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             isSandboxed={deletingSession.is_sandboxed}
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}
+            permanent={deletingPermanent}
             onConfirm={handleConfirmDelete}
             onCancel={() => setDeletingWorkspaceId(null)}
           />

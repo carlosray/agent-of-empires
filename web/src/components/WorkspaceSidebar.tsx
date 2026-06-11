@@ -383,6 +383,8 @@ function SortableSessionRow({
   isSelected: boolean;
   onActivate: (e: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean }) => void;
   onDelete?: (workspaceId: string) => void;
+  onArchive?: (workspaceId: string) => void;
+  onPermanentDelete?: (workspaceId: string) => void;
   readOnly?: boolean;
   dragDisabled?: boolean;
   optimistic: OptimisticTriage;
@@ -1141,11 +1143,18 @@ export const SessionRow = memo(function SessionRow({
                 })()}
                 <div className="border-t border-surface-700/20 my-1" />
                 <button
-                  onClick={handleDelete}
+                  onClick={archiveSession}
+                  data-testid="sidebar-context-menu-archive-session"
+                  className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-text-secondary hover:bg-surface-700/50 cursor-pointer transition-colors"
+                >
+                  Archive
+                </button>
+                <button
+                  onClick={deleteSessionPermanently}
                   data-testid="sidebar-context-menu-delete"
                   className="w-full text-left px-3 py-2 md:py-2 max-md:py-3 text-sm text-status-error hover:bg-status-error/10 cursor-pointer transition-colors"
                 >
-                  Delete
+                  Delete permanently
                 </button>
               </>
             )}
@@ -2447,6 +2456,8 @@ export function WorkspaceSidebar({
                                     isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                     onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                     onDelete={onDeleteSession}
+                                    onArchive={onArchiveSession}
+                                    onPermanentDelete={onPermanentDeleteSession}
                                     readOnly={readOnly}
                                     optimistic={triage.optimisticFor(v.workspace.id)}
                                     onPinToggle={triage.pinToggle}
@@ -2548,6 +2559,8 @@ export function WorkspaceSidebar({
                                 isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
                                 onActivate={(e) => handleRowActivate(v.workspace.id, e)}
                                 onDelete={onDeleteSession}
+                                onArchive={onArchiveSession}
+                                onPermanentDelete={onPermanentDeleteSession}
                                 readOnly={readOnly}
                                 optimistic={triage.optimisticFor(v.workspace.id)}
                                 onPinToggle={triage.pinToggle}

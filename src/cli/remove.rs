@@ -83,6 +83,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             delete_branch,
             delete_sandbox,
             force_delete: args.force,
+            archive_on_success: false,
+            archive_max_entries: 0,
             detach_hooks: false,
             keep_scratch: args.keep_scratch,
         });

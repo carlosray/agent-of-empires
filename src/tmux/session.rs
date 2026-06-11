@@ -693,6 +693,9 @@ mod tests {
         // 5 columns, so the cursor lands at (5, 0). `sleep` keeps the pane
         // alive across the capture; generous so a test thread starved by
         // parallel suite load can't outlive the pane before capturing.
+        // Pin pane-base-index 0 to match what aoe does in production;
+        // without this, users with `pane-base-index 1` in their tmux.conf
+        // cause the `^.0` target to miss.
         let status = Command::new("tmux")
             .args([
                 "new-session",
@@ -704,6 +707,12 @@ mod tests {
                 "-y",
                 "10",
                 "sh -c 'printf hello; sleep 60'",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
             ])
             .status()
             .expect("tmux new-session");

@@ -436,8 +436,8 @@ pub fn detect_vibe_status(raw_content: &str) -> Status {
 ///   3. Within the current block we look for two shapes: a bullet-prefixed
 ///      live status line carrying an `esc to interrupt` hint (anywhere in the
 ///      block), or a bare activity verb / spinner+verb in the last ~10 lines.
-///   4. Waiting is detected from approval prompts, numbered `›`/`❯` choices,
-///      interrupted-turn `›`/`❯` prompts, and the `codex>` REPL prompt.
+///   4. Waiting is detected from approval prompts and numbered `›`/`❯`
+///      choices. A normal free-form prompt means the turn is done.
 ///
 /// All comparisons are case-insensitive (content is lowercased on entry).
 pub fn detect_codex_status(raw_content: &str) -> Status {
@@ -467,37 +467,11 @@ pub fn detect_codex_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "continue?",
-            "proceed?",
-            "execute?",
-            "run command?",
-            "enter to select",
-            "esc to cancel",
-        ],
-    ) {
+    if contains_codex_approval_prompt(&last_lines_lower) {
         return Status::Waiting;
     }
 
     if codex_has_recent_numbered_choice_prompt(&non_empty_lines) {
-        return Status::Waiting;
-    }
-
-    // Interrupted-turn prompts ask the user to tell Codex what to do
-    // differently. The pane shows the interruption message with an input
-    // prompt below it. Show Waiting so the user knows Codex needs a new
-    // direction, not just another task (which would be Idle).
-    if codex_has_interruption_prompt(&non_empty_lines)
-        && codex_has_non_numbered_cursor_prompt(&non_empty_lines)
-    {
-        return Status::Waiting;
-    }
-
-    // The `codex>` REPL prompt means Codex is at its input gate. Treat as
-    // Waiting so the session is visually distinct from a fully idle session.
-    if matches_input_prompt(&non_empty_lines, 10, &["codex>"]) {
         return Status::Waiting;
     }
 
@@ -872,10 +846,60 @@ fn activity_tail_has_completion_marker(rest: &str) -> bool {
         .any(|word| COMPLETED_ACTIVITY_MARKERS.contains(&word.as_str()))
 }
 
-fn codex_has_interruption_prompt(non_empty_lines: &[&str]) -> bool {
-    let text = non_empty_lines.join("\n").to_lowercase();
-    text.contains("conversation interrupted")
-        || text.contains("tell the model what to do differently")
+/// Codex-specific approval prompt check. Avoids the overly broad `"allow"` /
+/// `"approve"` terms from the generic `contains_approval_prompt` BASE set,
+/// which false-positives on Codex warning messages that say "allowed in this
+/// context" (skill loading warnings, YAML error messages, etc.).
+fn contains_codex_approval_prompt(recent_lower: &str) -> bool {
+    let direct_prompts = [
+        "(y/n)",
+        "[y/n]",
+        "continue?",
+        "proceed?",
+        "execute?",
+        "run command?",
+        "enter to select",
+        "esc to cancel",
+    ];
+    if direct_prompts
+        .iter()
+        .any(|prompt| recent_lower.contains(prompt))
+    {
+        return true;
+    }
+
+    // A `?` on a line together with "approve" or "allow" is an explicit
+    // question (e.g. "Allow command?"), not a passive log entry.
+    let has_questioned_approval = recent_lower
+        .lines()
+        .any(|line| line.contains('?') && (line.contains("approve") || line.contains("allow")));
+    if has_questioned_approval {
+        return true;
+    }
+
+    // Numbered-option approval menus ("1. Yes\n2. No") that mention relevant
+    // keywords in context.
+    let option_context = ["approve", "allow", "command", "execute", "run"]
+        .iter()
+        .any(|word| recent_lower.contains(word));
+    option_context && codex_approval_option_count(recent_lower) >= 2
+}
+
+fn codex_approval_option_count(text: &str) -> usize {
+    text.lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let mut chars = trimmed.chars();
+            let numbered = matches!(
+                (chars.next(), chars.next()),
+                (Some(first), Some('.')) if first.is_ascii_digit()
+            );
+            numbered
+                && ["yes", "no", "allow", "approve"]
+                    .iter()
+                    .any(|word| trimmed.contains(word))
+        })
+        .count()
 }
 
 /// Cursor agent status is detected via hooks first, but pane parsing is still
@@ -1947,8 +1971,8 @@ enter to select · esc to cancel";
             detect_codex_status("Allow command?\n  1. Yes\n  2. No\nEnter to select"),
             Status::Waiting
         );
-        assert_eq!(detect_codex_status("ready\ncodex>"), Status::Waiting);
-        assert_eq!(detect_codex_status("done\n>"), Status::Waiting);
+        assert_eq!(detect_codex_status("ready\ncodex>"), Status::Idle);
+        assert_eq!(detect_codex_status("done\n>"), Status::Idle);
     }
 
     #[test]

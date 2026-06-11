@@ -5,8 +5,6 @@ pub mod acp;
 pub mod add;
 pub mod agents;
 pub mod archive;
-#[cfg(feature = "serve")]
-pub mod cockpit;
 pub mod definition;
 pub mod extract_session_id;
 pub mod group;

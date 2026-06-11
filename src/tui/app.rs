@@ -94,6 +94,7 @@ fn tmux_config_for_instance(instance: &crate::session::Instance) -> crate::sessi
     crate::terminal::resolved_tmux_config(profile, std::path::Path::new(&instance.project_path))
 }
 
+#[cfg(test)]
 fn restore_runtime_session_state(
     current: &mut crate::session::Instance,
     previous: &crate::session::Instance,
@@ -101,6 +102,7 @@ fn restore_runtime_session_state(
     current.tool_session_probe = previous.tool_session_probe.clone();
 }
 
+#[cfg(test)]
 fn refresh_tool_session_state(current: &mut crate::session::Instance) -> anyhow::Result<bool> {
     let Some(change) = crate::session::tool_session::refresh(current)? else {
         return Ok(false);
@@ -109,6 +111,7 @@ fn refresh_tool_session_state(current: &mut crate::session::Instance) -> anyhow:
     Ok(apply_tool_session_state_change(current, change))
 }
 
+#[cfg(test)]
 fn apply_tool_session_state_change(
     current: &mut crate::session::Instance,
     change: crate::session::tool_session::ToolSessionStateChange,
@@ -500,7 +503,7 @@ impl App {
         F: FnOnce() -> R,
     {
         let watcher = AttachedStatusHookWatcher::start(self.home.attached_status_hook_sessions());
-        let result = self.with_raw_mode_disabled(terminal, f);
+        let result = self.with_raw_mode_disabled(terminal, |_backend| f());
         let mut attached_status_updates = Vec::new();
 
         if let Some(watcher) = watcher {
@@ -2744,8 +2747,27 @@ impl App {
             }
         };
 
+        let tmux_config = tmux_config_for_instance(&instance);
+        let session_tab_title =
+            crate::terminal::session_attach_title(&tmux_config, &instance.title);
+        let dashboard_tab_title = crate::terminal::dashboard_title(&tmux_config);
+
+        if let Some(title) = session_tab_title.as_deref() {
+            warn_if_title_update_fails(
+                "terminal attach",
+                crate::terminal::write_title_sequence(terminal.backend_mut(), title),
+            );
+        }
+
         let (attach_result, attached_status_updates) =
             self.with_attached_status_hooks(terminal, attach_fn)?;
+
+        if let Some(title) = dashboard_tab_title.as_deref() {
+            warn_if_title_update_fails(
+                "dashboard return",
+                crate::terminal::write_title_sequence(terminal.backend_mut(), title),
+            );
+        }
 
         self.needs_redraw = true;
         crate::tmux::refresh_session_cache();

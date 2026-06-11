@@ -52,8 +52,13 @@ fn repo_tracking_override(project_path: &Path) -> Option<bool> {
     super::load_repo_config(project_path)
         .ok()
         .flatten()
-        .and_then(|config| config.session)
-        .and_then(|session| session.tool_session_tracking)
+        .and_then(|config| {
+            config
+                .overrides
+                .get("session")
+                .and_then(|v| v.get("tool_session_tracking"))
+                .and_then(|v| v.as_bool())
+        })
 }
 
 pub fn is_supported_tool(tool: &str) -> bool {
@@ -836,20 +841,15 @@ mod tests {
         select_initial_tool_session, select_refreshed_tool_session, RefreshDecision,
         ToolSessionCandidate,
     };
-    use crate::session::{
-        save_repo_config, Instance, RepoConfig, SandboxInfo, SessionConfigOverride, ToolSession,
-    };
+    use crate::session::{save_repo_config, Instance, RepoConfig, SandboxInfo, ToolSession};
 
     fn write_tracking_repo_config(project_path: &Path, enabled: bool) {
         save_repo_config(
             project_path,
-            &RepoConfig {
-                session: Some(SessionConfigOverride {
-                    tool_session_tracking: Some(enabled),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
+            &serde_json::from_value::<RepoConfig>(
+                serde_json::json!({"session": {"tool_session_tracking": enabled}}),
+            )
+            .unwrap(),
         )
         .unwrap();
     }
@@ -1233,7 +1233,7 @@ mod tests {
         instance.tool = tool.to_string();
         instance.source_profile = "default".to_string();
 
-        instance.start_with_size_opts(Some((120, 40)), false)?;
+        let _ = instance.start_with_size_opts(Some((120, 40)), false)?;
 
         let result = (|| -> Result<String> {
             let mut probe_sent = false;

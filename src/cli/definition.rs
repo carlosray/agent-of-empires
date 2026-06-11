@@ -6,10 +6,10 @@
 use clap::{Parser, Subcommand};
 use clap_complete::Shell;
 
-use super::add::AddArgs;
-use super::archive::ArchiveCommands;
 #[cfg(feature = "serve")]
 use super::acp::AcpCommands;
+use super::add::AddArgs;
+use super::archive::ArchiveCommands;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
@@ -223,6 +223,7 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "list",
     "logs",
     "log_level",
+    "archive",
     "remove",
     "send",
     "status",
@@ -286,6 +287,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         #[cfg(feature = "serve")]
         Commands::AcpRunner(_) => return None,
         Commands::ExtractSessionId(_) => return None,
+        Commands::Archive { .. } => "archive",
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",
         Commands::Completion { .. } => "completion",

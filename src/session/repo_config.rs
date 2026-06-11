@@ -1448,13 +1448,9 @@ mod tests {
     #[test]
     fn test_merge_repo_config_tool_session_tracking() {
         let config = Config::default();
-        let repo = RepoConfig {
-            session: Some(SessionConfigOverride {
-                tool_session_tracking: Some(true),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
+        let repo: RepoConfig =
+            serde_json::from_value(serde_json::json!({"session": {"tool_session_tracking": true}}))
+                .unwrap();
 
         let merged = merge_repo_config(config, &repo);
         assert!(merged.session.tool_session_tracking);

@@ -75,7 +75,10 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 
-use super::{get_app_dir, get_profile_dir, ArchiveCleanupOptions, ArchivedSession, Group, GroupTree, Instance};
+use super::{
+    get_app_dir, get_profile_dir, ArchiveCleanupOptions, ArchivedSession, Group, GroupTree,
+    Instance,
+};
 
 /// Sidecar lock file name for per-profile storage. Lives next to
 /// `sessions.json` and `groups.json` and covers both: every code path that
@@ -506,7 +509,8 @@ impl Storage {
     }
 
     pub fn save_with_groups(&self, instances: &[Instance], group_tree: &GroupTree) -> Result<()> {
-        self.save(instances)?;
+        let instances_buf = serde_json::to_vec_pretty(instances)?;
+        atomic_write(&self.sessions_path, &instances_buf)?;
 
         // Save groups
         let groups_path = self.sessions_path.with_file_name("groups.json");

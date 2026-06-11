@@ -1426,6 +1426,14 @@ impl HomeView {
                     // freshness state when the user toggles a setting
                     // that triggers a reload mid-window.
                     inst.idle_entered_at = prev.idle_entered_at;
+                    // Preserve the live tool_session_probe across reloads so the
+                    // status poller's binding window is not reset every disk tick.
+                    inst.tool_session_probe = prev.tool_session_probe.clone();
+                    // Pick the more recent tool_session between disk and runtime so
+                    // a poller-resolved session is not silently lost on the next
+                    // heartbeat reload.
+                    inst.tool_session =
+                        newest_tool_session(inst.tool_session.clone(), prev.tool_session.clone());
                     // agent_session_id is disk-authoritative; writers persist
                     // synchronously through Storage::update before reload runs.
                     // Carry the resume-fallback exclusion set across
@@ -1743,11 +1751,9 @@ impl HomeView {
     /// Returns true if updates were applied.
     pub fn apply_status_updates(&mut self) -> bool {
         if let Some(updates) = self.status_poller.try_recv_updates() {
-            let mut any_change = false;
+            let mut any_change = !updates.is_empty();
             for update in updates {
-                if self.apply_one_status_update(update.clone()) {
-                    any_change = true;
-                }
+                self.apply_one_status_update(update.clone());
                 if self.apply_tool_session_update(&update) {
                     any_change = true;
                 }
@@ -3224,47 +3230,49 @@ impl HomeView {
         // project boundaries).
         if self.sort_order == SortOrder::Attention {
             let filtered: Vec<Instance> = if let Some(profile) = &self.active_profile {
-                self.instances
+                instances
                     .iter()
                     .filter(|i| i.source_profile == *profile)
                     .cloned()
                     .collect()
             } else {
-                self.instances.clone()
+                instances.clone()
             };
             let mut items = flatten_sessions_by_attention(&filtered);
-            append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
+            if self.view_mode != ViewMode::Archive {
+                append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
+            }
             return items;
         }
 
         let (mut items, archive_pool) = if let Some(profile) = &self.active_profile {
-            let filtered: Vec<Instance> = self
-                .instances
+            let filtered: Vec<Instance> = instances
                 .iter()
                 .filter(|i| i.source_profile == *profile)
                 .cloned()
                 .collect();
-            let items = match self.group_trees.get(profile) {
+            let items = match group_trees.get(profile) {
                 Some(tree) => flatten_tree(tree, &filtered, self.sort_order),
                 None => Vec::new(),
             };
             (items, filtered)
         } else if self.storages.len() <= 1 {
-            let items = match self.group_trees.values().next() {
-                Some(tree) => flatten_tree(tree, &self.instances, self.sort_order),
+            let items = match group_trees.values().next() {
+                Some(tree) => flatten_tree(tree, &instances, self.sort_order),
                 None => Vec::new(),
             };
-            (items, self.instances.clone())
+            (items, instances.clone())
         } else {
-            let items =
-                flatten_tree_all_profiles(&self.instances, &self.group_trees, self.sort_order);
-            (items, self.instances.clone())
+            let items = flatten_tree_all_profiles(&instances, group_trees, self.sort_order);
+            (items, instances.clone())
         };
 
-        // Pin the synthetic Archived section to the bottom regardless of
-        // sort order. Archived rows were filtered out of the natural flow
-        // inside `flatten_tree` / `flatten_tree_all_profiles`.
-        append_archived_section(&mut items, &archive_pool, self.archived_section_collapsed);
+        // Pin the synthetic Archived section to the bottom of the active view
+        // regardless of sort order. In Archive view mode the entire list is
+        // already archived entries, so no extra section is appended.
+        if self.view_mode != ViewMode::Archive {
+            append_archived_section(&mut items, &archive_pool, self.archived_section_collapsed);
+        }
         items
     }
 
