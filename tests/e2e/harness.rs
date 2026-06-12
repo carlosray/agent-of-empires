@@ -202,6 +202,8 @@ pub struct TuiTestHarness {
     /// before killing the tmux session, so a panicking assertion can't
     /// leak a daemon between serial tests.
     stop_daemon_on_drop: bool,
+    /// tmux window size for `spawn_tui` / `spawn`; see `set_spawn_size`.
+    spawn_size: (u16, u16),
 }
 
 #[allow(dead_code)]
@@ -294,7 +296,18 @@ last_seen_version = "{}"
             extra_env: Vec::new(),
             extra_path_dirs: Vec::new(),
             stop_daemon_on_drop: false,
+            spawn_size: (100, 30),
         }
+    }
+
+    /// Override the tmux window size used by `spawn_tui` / `spawn`. The
+    /// default 100x30 leaves the preview pane below the responsive
+    /// `STACKED_BREAKPOINT`, which hides the preview info header; tests
+    /// asserting on header lines (Session ID, Summary, ...) need a wider
+    /// window. Call before spawning.
+    pub fn set_spawn_size(&mut self, width: u16, height: u16) {
+        assert!(!self.spawned, "set_spawn_size must be called before spawn");
+        self.spawn_size = (width, height);
     }
 
     /// Build the PATH with structured view shim dirs (if any) and the stub
@@ -425,9 +438,9 @@ last_seen_version = "{}"
             .arg("-s")
             .arg(&self.session_name)
             .arg("-x")
-            .arg("100")
+            .arg(self.spawn_size.0.to_string())
             .arg("-y")
-            .arg("30")
+            .arg(self.spawn_size.1.to_string())
             .arg(&cmd_str)
             .env("HOME", self.home_dir.path())
             .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))

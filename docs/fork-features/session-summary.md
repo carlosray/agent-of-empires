@@ -17,6 +17,8 @@ Summary:    fix the login redirect loop
 
 The label is dimmed; the text uses normal foreground color, matching the surrounding info lines. The text is already capped at 120 characters and clipped to the panel width at render time.
 
+Fully stopped sessions (tmux session gone) replace the preview with a "Stopped" placeholder; the summary line renders inside that placeholder too, so a stopped row still says what the session was about.
+
 ## How Summaries Are Computed
 
 A summary is computed once per resolved tool session display ID and is never recomputed for the same ID. Once evaluated it persists on the instance record, so the summary survives AoE restarts and remains visible after the pane has died.

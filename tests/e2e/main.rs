@@ -35,6 +35,7 @@ mod profile_picker;
 mod project_registry;
 mod sandbox;
 mod serve;
+mod session_summary;
 mod settings;
 mod tool_sessions;
 mod tui_launch;

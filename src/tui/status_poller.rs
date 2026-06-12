@@ -362,6 +362,51 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn evaluate_summary_extracts_from_planted_claude_session() {
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", home.path());
+
+        let project = home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mangled = format!(
+            "-{}",
+            project
+                .to_string_lossy()
+                .trim_start_matches('/')
+                .replace(['/', '\\', ':'], "-")
+        );
+        let claude_dir = home.path().join(".claude").join("projects").join(mangled);
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("sid-e2e.jsonl"),
+            r#"{"type":"user","message":{"role":"user","content":"Fix the login bug"}}"#,
+        )
+        .unwrap();
+
+        let mut inst = Instance::new("t", &project.to_string_lossy());
+        inst.tool = "claude".to_string();
+        let ts = ToolSession {
+            display_id: "sid-e2e".to_string(),
+            resume_target: "sid-e2e".to_string(),
+            source_ref: "sid-e2e".to_string(),
+            updated_at: Utc::now(),
+        };
+
+        let (summary, llm) = evaluate_summary(&inst, Some(&ts));
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let summary = summary.expect("summary extracted");
+        assert_eq!(summary.text, "Fix the login bug");
+        assert!(llm.is_none(), "no LLM configured, no request expected");
+    }
+
+    #[test]
     fn test_polling_tier_hot() {
         assert_eq!(polling_tier(Status::Running), TIER_HOT);
         assert_eq!(polling_tier(Status::Waiting), TIER_HOT);

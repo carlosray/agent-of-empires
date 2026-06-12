@@ -2587,7 +2587,7 @@ impl HomeView {
     /// error with a "Stopped, enter to start" message; the row's real status
     /// icon still signals the state in the sidebar.
     fn render_stopped_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        let lines = vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Stopped",
@@ -2598,13 +2598,30 @@ impl HomeView {
                 "This session isn't running.",
                 Style::default().fg(theme.dimmed),
             )),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Press ", Style::default().fg(theme.dimmed)),
-                Span::styled("Enter", Style::default().fg(theme.hint).bold()),
-                Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
-            ]),
         ];
+        // The stopped placeholder replaces the whole preview, info header
+        // included, so the tool session summary surfaces here: a stopped row
+        // should still say what the session was about.
+        let summary = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|inst| crate::session::tool_session::tracking_enabled(inst))
+            .and_then(|inst| inst.tool_session_summary.as_ref())
+            .map(|summary| summary.text.clone());
+        if let Some(text) = summary {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Summary: ", Style::default().fg(theme.dimmed)),
+                Span::styled(text, Style::default().fg(theme.text)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::styled("Press ", Style::default().fg(theme.dimmed)),
+            Span::styled("Enter", Style::default().fg(theme.hint).bold()),
+            Span::styled(" to start it.", Style::default().fg(theme.dimmed)),
+        ]));
         let para = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(para, area);
     }

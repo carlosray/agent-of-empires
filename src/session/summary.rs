@@ -528,4 +528,138 @@ mod tests {
         assert!(s.starts_with(capped));
         assert!(capped.len() <= 3);
     }
+
+    /// Serve exactly one canned HTTP/1.1 response on a loopback port and return
+    /// the base URL plus a handle that yields the raw request bytes.
+    fn one_shot_http_server(
+        status_line: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            // Read headers, then the Content-Length-counted body.
+            let body_len = loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                let text = String::from_utf8_lossy(&request);
+                if let Some(header_end) = text.find("\r\n\r\n") {
+                    let content_length = text
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(str::to_string)
+                        })
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    break header_end + 4 + content_length;
+                }
+            };
+            while request.len() < body_len {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            let response = format!(
+                "{status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            String::from_utf8_lossy(&request).to_string()
+        });
+        (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    #[test]
+    fn summarize_via_llm_parses_chat_completion_and_sends_auth() {
+        let (base_url, server) = one_shot_http_server(
+            "HTTP/1.1 200 OK",
+            r#"{"choices":[{"message":{"role":"assistant","content":"  Fix login redirect loop  "}}]}"#,
+        );
+        let config = LlmConfig {
+            api_base_url: base_url,
+            api_token: "test-token".to_string(),
+            summary_model: "test-model".to_string(),
+        };
+
+        let summary = summarize_via_llm(&config, "please fix the login redirect loop").unwrap();
+        assert_eq!(summary, "Fix login redirect loop");
+
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("POST /v1/chat/completions"),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer test-token"),
+            "{request}"
+        );
+        assert!(request.contains("\"model\":\"test-model\""), "{request}");
+        assert!(request.contains("login redirect loop"), "{request}");
+    }
+
+    #[test]
+    fn summarize_via_llm_errors_on_http_failure_and_empty_content() {
+        let (base_url, server) =
+            one_shot_http_server("HTTP/1.1 401 Unauthorized", r#"{"error":"bad token"}"#);
+        let config = LlmConfig {
+            api_base_url: base_url,
+            api_token: String::new(),
+            summary_model: "m".to_string(),
+        };
+        assert!(summarize_via_llm(&config, "x").is_err());
+        server.join().unwrap();
+
+        let (base_url, server) = one_shot_http_server(
+            "HTTP/1.1 200 OK",
+            r#"{"choices":[{"message":{"content":""}}]}"#,
+        );
+        let config = LlmConfig {
+            api_base_url: base_url,
+            api_token: String::new(),
+            summary_model: "m".to_string(),
+        };
+        assert!(summarize_via_llm(&config, "x").is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn summary_service_dedupes_in_flight_and_drains_results() {
+        let (base_url, _server) = one_shot_http_server(
+            "HTTP/1.1 200 OK",
+            r#"{"choices":[{"message":{"content":"short summary"}}]}"#,
+        );
+        let mut service = SummaryService::new();
+        let request = SummaryLlmRequest {
+            display_id: "sid-1".to_string(),
+            input: "long first message".to_string(),
+            config: LlmConfig {
+                api_base_url: base_url,
+                api_token: String::new(),
+                summary_model: "m".to_string(),
+            },
+        };
+        service.spawn(request.clone());
+        // Second spawn for the same display_id is dropped: the one-shot server
+        // would panic on a second connection, and the drained results below
+        // must contain exactly one entry.
+        service.spawn(request);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut results = Vec::new();
+        while results.is_empty() && std::time::Instant::now() < deadline {
+            results = service.drain();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].display_id, "sid-1");
+        assert_eq!(results[0].text, "short summary");
+    }
 }

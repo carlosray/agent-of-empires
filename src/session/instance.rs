@@ -1072,6 +1072,9 @@ impl Instance {
         if src.tool_session.is_some() {
             self.tool_session = src.tool_session.clone();
         }
+        if src.tool_session_summary.is_some() {
+            self.tool_session_summary = src.tool_session_summary.clone();
+        }
         if src.tool_session_probe.is_some() {
             self.tool_session_probe = src.tool_session_probe.clone();
         }
