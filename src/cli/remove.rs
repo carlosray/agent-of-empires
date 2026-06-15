@@ -3,7 +3,7 @@
 use anyhow::Result;
 use clap::Args;
 
-use crate::session::{ArchiveCleanupOptions, Instance, Storage};
+use crate::session::{Instance, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -25,10 +25,6 @@ pub struct RemoveArgs {
     /// Keep container instead of deleting it (default: delete per config)
     #[arg(long = "keep-container")]
     keep_container: bool,
-
-    /// Permanently delete instead of archiving
-    #[arg(long = "permanent")]
-    permanent: bool,
 
     /// For scratch sessions, keep the scratch directory on disk instead of
     /// removing it. The session record is still deleted; the kept path is
@@ -83,8 +79,6 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             delete_branch,
             delete_sandbox,
             force_delete: args.force,
-            archive_on_success: false,
-            archive_max_entries: 0,
             detach_hooks: false,
             keep_scratch: args.keep_scratch,
         });
@@ -119,42 +113,14 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
     }
 
-    // Archive before removing from disk, if configured.
-    let should_archive = config.session.archive_on_delete && !args.permanent;
-    let archived = if should_archive {
-        storage.archive_instance(
-            &inst,
-            ArchiveCleanupOptions {
-                delete_worktree,
-                delete_branch,
-                delete_sandbox: inst.sandbox_info.as_ref().is_some_and(|sandbox| {
-                    sandbox.enabled && !args.keep_container && config.sandbox.auto_cleanup
-                }),
-                force_delete: args.force,
-            },
-            config.session.archive_max_entries,
-            None,
-        )?;
-        true
-    } else {
-        false
-    };
-
     // Phase 2 (locked): drop the entry by id from the latest disk state.
-    // No-op if a peer already removed it; that is the correct semantics.
     storage.update(|all_instances, _groups| {
         all_instances.retain(|i| i.id != removed_id);
         Ok(())
     })?;
 
-    let action = if archived {
-        "Archived session"
-    } else {
-        "Removed session permanently"
-    };
     println!(
-        "  {}: {} (from profile '{}')",
-        action,
+        "  Removed session: {} (from profile '{}')",
         removed_title,
         storage.profile()
     );

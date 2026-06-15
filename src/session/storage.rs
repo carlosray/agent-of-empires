@@ -75,10 +75,7 @@ use std::time::{Duration, Instant};
 
 use crate::file_watch::FileWatchService;
 
-use super::{
-    get_app_dir, get_profile_dir, ArchiveCleanupOptions, ArchivedSession, Group, GroupTree,
-    Instance,
-};
+use super::{get_app_dir, get_profile_dir, Group, GroupTree, Instance};
 
 /// Sidecar lock file name for per-profile storage. Lives next to
 /// `sessions.json` and `groups.json` and covers both: every code path that
@@ -243,7 +240,6 @@ fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlock> {
 pub struct Storage {
     profile: String,
     sessions_path: PathBuf,
-    archive_path: PathBuf,
     save_lock: Arc<Mutex<()>>,
     /// Used to surface in-process writes immediately to subscribers via the
     /// kernel-event-equivalent dispatcher path; see
@@ -274,13 +270,11 @@ impl Storage {
 
         let profile_dir = get_profile_dir(&profile_name)?;
         let sessions_path = profile_dir.join("sessions.json");
-        let archive_path = profile_dir.join("archive.json");
         let save_lock = save_lock_for(&profile_name);
 
         Ok(Self {
             profile: profile_name,
             sessions_path,
-            archive_path,
             save_lock,
             file_watch,
         })
@@ -317,27 +311,6 @@ impl Storage {
             inst.set_file_watch(self.file_watch.clone());
         }
         Ok(instances)
-    }
-
-    pub fn load_archive(&self) -> Result<Vec<ArchivedSession>> {
-        if !self.archive_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        let content = fs::read_to_string(&self.archive_path)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut archived: Vec<ArchivedSession> = serde_json::from_str(&content)?;
-        for entry in &mut archived {
-            if entry.source_profile.is_empty() {
-                entry.source_profile = self.profile.clone();
-            }
-            entry.instance.source_profile = entry.source_profile.clone();
-        }
-        archived.sort_by(|left, right| right.archived_at.cmp(&left.archived_at));
-        Ok(archived)
     }
 
     pub fn load_with_groups(&self) -> Result<(Vec<Instance>, Vec<Group>)> {
@@ -424,88 +397,6 @@ impl Storage {
         atomic_write(&self.sessions_path, &instances_buf)?;
         self.file_watch.notify_local_change(&self.sessions_path);
         Ok(result)
-    }
-
-    pub fn save_archive(&self, archived: &[ArchivedSession]) -> Result<()> {
-        if self.archive_path.exists() {
-            let backup_path = self.archive_path.with_extension("json.bak");
-            if let Err(e) = fs::copy(&self.archive_path, &backup_path) {
-                tracing::warn!("Failed to create archive backup: {}", e);
-            }
-        }
-
-        let content = serde_json::to_string_pretty(archived)?;
-        fs::write(&self.archive_path, content)?;
-        Ok(())
-    }
-
-    pub fn archive_instance(
-        &self,
-        instance: &Instance,
-        cleanup: ArchiveCleanupOptions,
-        max_entries: u64,
-        reason: Option<String>,
-    ) -> Result<ArchivedSession> {
-        let mut archived = self.load_archive()?;
-        archived.retain(|entry| entry.id != instance.id);
-
-        let entry = ArchivedSession::new(instance.clone(), self.profile.clone(), cleanup, reason);
-        archived.push(entry.clone());
-        Self::prune_archive_entries(&mut archived, max_entries);
-        self.save_archive(&archived)?;
-
-        Ok(entry)
-    }
-
-    pub fn restore_archived_session(
-        &self,
-        session_id: &str,
-        active: &[Instance],
-    ) -> Result<Instance> {
-        let mut archived = self.load_archive()?;
-        let index = archived
-            .iter()
-            .position(|entry| entry.id == session_id)
-            .ok_or_else(|| anyhow::anyhow!("Archived session not found: {}", session_id))?;
-        let entry = archived[index].clone();
-        entry.validate_restore(active)?;
-        let restored = entry.restore_instance()?;
-
-        archived.remove(index);
-        self.save_archive(&archived)?;
-
-        Ok(restored)
-    }
-
-    pub fn delete_archived_session(&self, session_id: &str) -> Result<bool> {
-        let mut archived = self.load_archive()?;
-        let before = archived.len();
-        archived.retain(|entry| entry.id != session_id);
-        let removed = before != archived.len();
-        if removed {
-            self.save_archive(&archived)?;
-        }
-        Ok(removed)
-    }
-
-    pub fn prune_archive(&self, max_entries: u64) -> Result<Vec<ArchivedSession>> {
-        let mut archived = self.load_archive()?;
-        Self::prune_archive_entries(&mut archived, max_entries);
-        self.save_archive(&archived)?;
-        Ok(archived)
-    }
-
-    fn prune_archive_entries(archived: &mut Vec<ArchivedSession>, max_entries: u64) {
-        let max_entries = max_entries.max(1) as usize;
-        if archived.len() <= max_entries {
-            archived.sort_by(|left, right| right.archived_at.cmp(&left.archived_at));
-            return;
-        }
-
-        archived.sort_by(|left, right| left.archived_at.cmp(&right.archived_at));
-        let remove_count = archived.len() - max_entries;
-        archived.drain(0..remove_count);
-        archived.sort_by(|left, right| right.archived_at.cmp(&left.archived_at));
     }
 
     pub fn save_with_groups(&self, instances: &[Instance], group_tree: &GroupTree) -> Result<()> {

@@ -756,21 +756,6 @@ pub struct SessionConfig {
     )]
     pub tool_session_tracking: bool,
 
-    /// Archive sessions when deleting them instead of removing their metadata permanently.
-    #[serde(default = "default_true")]
-    #[setting(label = "Archive on Delete", widget = "toggle", category = "Session")]
-    pub archive_on_delete: bool,
-
-    /// Maximum number of archived sessions to keep per profile.
-    #[serde(default = "default_archive_max_entries")]
-    #[setting(
-        label = "Archive Max Entries",
-        widget = "number",
-        min = 0,
-        category = "Session"
-    )]
-    pub archive_max_entries: u64,
-
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
     /// wheel and text selection back to the terminal, e.g. iOS Mosh +
@@ -1100,8 +1085,6 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             tool_session_tracking: false,
-            archive_on_delete: true,
-            archive_max_entries: default_archive_max_entries(),
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -1563,10 +1546,6 @@ impl Default for UpdatesConfig {
 
 fn default_true() -> bool {
     true
-}
-
-fn default_archive_max_entries() -> u64 {
-    100
 }
 
 fn default_check_interval() -> u64 {

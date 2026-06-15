@@ -78,3 +78,4 @@ Rules:
 - TUI only; the web dashboard does not display summaries.
 - Supports `claude`, `codex`, `opencode`, and `pi`. Sessions with command overrides or tools outside this set show no summary line.
 - Summaries are evaluated once per tool session display ID. Re-summarization as the session evolves is out of scope by design.
+- Archived sessions (toggled with `z`) show a truncated summary (up to 40 characters) directly in the session list row, so the context is visible without opening the preview panel.

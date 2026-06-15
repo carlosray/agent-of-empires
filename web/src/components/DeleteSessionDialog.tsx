@@ -9,7 +9,6 @@ interface Props {
   isSandboxed: boolean;
   isScratch: boolean;
   cleanupDefaults: CleanupDefaults;
-  permanent?: boolean;
   onConfirm: (options: DeleteSessionOptions) => Promise<void>;
   onCancel: () => void;
 }
@@ -21,7 +20,6 @@ export function DeleteSessionDialog({
   isSandboxed,
   isScratch,
   cleanupDefaults,
-  permanent = false,
   onConfirm,
   onCancel,
 }: Props) {
@@ -199,7 +197,7 @@ export function DeleteSessionDialog({
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             )}
-            {deleting ? (permanent ? "Deleting..." : "Archiving...") : (permanent ? "Delete" : "Archive")}
+            {deleting ? "Deleting..." : "Delete"}
           </button>
         </div>
       </div>

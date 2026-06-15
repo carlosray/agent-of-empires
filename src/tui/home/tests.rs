@@ -6,19 +6,13 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{HomeView, ViewMode};
-use crate::session::{
-    save_config, ArchiveCleanupOptions, Config, GroupTree, Instance, Item, Storage,
-};
+use crate::session::{save_config, Config, GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
 use crate::tui::dialogs::{InfoDialog, NewSessionDialog};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
-}
-
-fn key_with_modifiers(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-    KeyEvent::new(code, modifiers)
 }
 
 fn setup_test_home(temp: &TempDir) {
@@ -1326,86 +1320,6 @@ fn switching_view_retargets_capture_worker_pane() {
 
 #[test]
 #[serial]
-fn test_a_toggles_archive_view() {
-    let env = create_test_env_empty();
-    let mut view = env.view;
-
-    assert_eq!(view.view_mode, ViewMode::Structured);
-
-    view.handle_key(key(KeyCode::Char('a')), None);
-    assert_eq!(view.view_mode, ViewMode::Archive);
-
-    view.handle_key(key(KeyCode::Char('a')), None);
-    assert_eq!(view.view_mode, ViewMode::Structured);
-}
-
-#[test]
-#[serial]
-fn test_archive_view_uses_same_grouping_and_sort_order() {
-    use crate::session::config::{GroupByMode, SortOrder};
-
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-    let storage = Storage::new_unwatched("test").unwrap();
-
-    let mut active_a = Instance::new("Alpha", "/tmp/active-alpha");
-    active_a.group_path = "work".to_string();
-    let mut active_b = Instance::new("Beta", "/tmp/active-beta");
-    active_b.group_path = "work".to_string();
-    storage
-        .update(|instances, _| {
-            instances.push(active_b);
-            instances.push(active_a);
-            Ok(())
-        })
-        .unwrap();
-
-    let mut archived_a = Instance::new("Alpha", "/tmp/archive-alpha");
-    archived_a.group_path = "work".to_string();
-    let mut archived_b = Instance::new("Beta", "/tmp/archive-beta");
-    archived_b.group_path = "work".to_string();
-    storage
-        .archive_instance(&archived_b, ArchiveCleanupOptions::default(), 100, None)
-        .unwrap();
-    storage
-        .archive_instance(&archived_a, ArchiveCleanupOptions::default(), 100, None)
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = GroupByMode::Manual;
-    view.sort_order = SortOrder::AZ;
-
-    fn labels(view: &HomeView, items: &[Item]) -> Vec<String> {
-        items
-            .iter()
-            .map(|item| match item {
-                Item::Group { name, .. } => format!("group:{name}"),
-                Item::Session { id, .. } => view
-                    .get_display_instance(id)
-                    .map(|instance| format!("session:{}", instance.title))
-                    .unwrap_or_else(|| "session:?".to_string()),
-            })
-            .collect()
-    }
-
-    view.view_mode = ViewMode::Structured;
-    let active_items = view.build_flat_items();
-    let active_labels = labels(&view, &active_items);
-    view.view_mode = ViewMode::Archive;
-    let archive_items = view.build_flat_items();
-    let archive_labels = labels(&view, &archive_items);
-
-    assert_eq!(active_labels, archive_labels);
-}
-
-#[test]
-#[serial]
 fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
@@ -1478,56 +1392,6 @@ fn test_d_shows_info_dialog_in_terminal_view() {
     view.handle_key(key(KeyCode::Char('d')), None);
     assert!(view.info_dialog.is_some());
     assert!(view.unified_delete_dialog.is_none());
-}
-
-#[test]
-#[serial]
-fn test_ctrl_d_opens_permanent_delete_dialog() {
-    let env = create_test_env_with_sessions(1);
-    let mut view = env.view;
-
-    view.handle_key(
-        key_with_modifiers(KeyCode::Char('d'), KeyModifiers::CONTROL),
-        None,
-    );
-
-    assert!(view.unified_delete_dialog.is_some());
-    assert!(!view.delete_dialog_allow_archive);
-}
-
-#[test]
-#[serial]
-fn test_d_respects_disabled_archive_setting() {
-    let temp = TempDir::new().unwrap();
-    setup_test_home(&temp);
-
-    let mut config = Config::default();
-    config.session.archive_on_delete = false;
-    save_config(&config).unwrap();
-
-    let storage = Storage::new_unwatched("test").unwrap();
-    storage
-        .update(|instances, _| {
-            instances.push(Instance::new("session", "/tmp/session"));
-            Ok(())
-        })
-        .unwrap();
-
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(
-        Some("test".to_string()),
-        tools,
-        crate::file_watch::FileWatchService::noop(),
-    )
-    .unwrap();
-    view.group_by = crate::session::config::GroupByMode::Manual;
-    view.flat_items = view.build_flat_items();
-    view.update_selected();
-
-    view.handle_key(key(KeyCode::Char('d')), None);
-
-    assert!(view.unified_delete_dialog.is_some());
-    assert!(!view.delete_dialog_allow_archive);
 }
 
 #[test]
@@ -12386,6 +12250,281 @@ mod live_send_boot_size_tests {
         assert!(
             !matches!(seed, Some((0, _)) | Some((_, 0))),
             "empty preview rect must fall back, not seed a 0-dimension size; got {seed:?}"
+        );
+    }
+}
+
+// Tests for the display_branch suffix in the session list row.
+// Exercises the fork feature "Git Branch Labels for All Git Sessions".
+mod display_branch_row_suffix {
+    use super::*;
+    use crate::session::{Instance, Storage, WorkspaceInfo, WorkspaceRepo, WorktreeInfo};
+
+    fn make_storage_with_instance(inst: Instance) -> TempDir {
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = crate::session::GroupTree::new_with_groups(&[inst], &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        temp
+    }
+
+    fn build_view(temp: &TempDir, show_branch: bool) -> HomeView {
+        let _ = temp; // keep TempDir alive via caller
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            tools,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        view.group_by = crate::session::config::GroupByMode::Manual;
+        view.show_branch_in_tui = show_branch;
+        view.flat_items = view.build_flat_items();
+        view.update_selected();
+        view
+    }
+
+    fn first_session_item(view: &HomeView) -> Item {
+        view.flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { .. }))
+            .cloned()
+            .expect("no session item found")
+    }
+
+    /// display_branch suffix appears when show_branch_in_tui is true and the
+    /// session has no workspace_info or worktree_info.
+    #[test]
+    #[serial]
+    fn suffix_present_when_flag_on_and_display_branch_set() {
+        let mut inst = Instance::new("my-session", "/tmp/work");
+        inst.display_branch = Some("feature/cool".to_string());
+        let temp = make_storage_with_instance(inst);
+        let view = build_view(&temp, true);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            text.contains("feature/cool"),
+            "row must show display_branch when show_branch_in_tui=true; got: {text:?}"
+        );
+    }
+
+    /// display_branch suffix is absent when show_branch_in_tui is false, even
+    /// if display_branch is set.
+    #[test]
+    #[serial]
+    fn suffix_absent_when_flag_off() {
+        let mut inst = Instance::new("my-session", "/tmp/work");
+        inst.display_branch = Some("feature/cool".to_string());
+        let temp = make_storage_with_instance(inst);
+        let view = build_view(&temp, false);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            !text.contains("feature/cool"),
+            "row must not show display_branch when show_branch_in_tui=false; got: {text:?}"
+        );
+    }
+
+    /// When worktree_info is present and the branch differs from the title,
+    /// the worktree branch is shown and display_branch is suppressed (worktree
+    /// wins).
+    #[test]
+    #[serial]
+    fn worktree_branch_wins_over_display_branch() {
+        let mut inst = Instance::new("my-session", "/tmp/work");
+        inst.display_branch = Some("stale/label".to_string());
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "feature/actual".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let temp = make_storage_with_instance(inst);
+        let view = build_view(&temp, true);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            text.contains("feature/actual"),
+            "worktree branch must appear in row; got: {text:?}"
+        );
+        assert!(
+            !text.contains("stale/label"),
+            "display_branch must be suppressed when worktree branch diverges; got: {text:?}"
+        );
+    }
+
+    /// When worktree_info is present and the branch matches the session title,
+    /// no worktree suffix is rendered, so display_branch fills in (when flag on).
+    #[test]
+    #[serial]
+    fn display_branch_fills_in_when_worktree_branch_matches_title() {
+        let mut inst = Instance::new("feature-branch", "/tmp/work");
+        inst.display_branch = Some("feature-branch".to_string());
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "feature-branch".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let temp = make_storage_with_instance(inst);
+        let view = build_view(&temp, true);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        // The branch appears once (as the display_branch suffix); it also
+        // appears as part of the title, so we only check there is exactly one
+        // "  feature-branch" (with leading spaces, i.e. the suffix).
+        assert!(
+            text.contains("  feature-branch"),
+            "display_branch suffix must appear when worktree branch equals title; got: {text:?}"
+        );
+    }
+
+    /// When workspace_info is present and show_branch_in_tui is true,
+    /// display_branch is used in place of ws_info.branch in the repos suffix.
+    #[test]
+    #[serial]
+    fn workspace_row_uses_display_branch_when_flag_on() {
+        let mut inst = Instance::new("my-workspace", "/tmp/ws");
+        inst.display_branch = Some("ws/feature".to_string());
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "ws/old-branch".to_string(),
+            workspace_dir: "/tmp/ws".to_string(),
+            repos: vec![WorkspaceRepo {
+                name: "repo1".to_string(),
+                source_path: "/tmp/repo1".to_string(),
+                branch: "main".to_string(),
+                worktree_path: "/tmp/ws/repo1".to_string(),
+                main_repo_path: "/tmp/repo1".to_string(),
+                managed_by_aoe: true,
+            }],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        let temp = make_storage_with_instance(inst);
+        let view = build_view(&temp, true);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            text.contains("ws/feature"),
+            "workspace row must use display_branch when show_branch_in_tui=true; got: {text:?}"
+        );
+        assert!(
+            !text.contains("ws/old-branch"),
+            "workspace row must not show ws_info.branch when display_branch overrides; got: {text:?}"
+        );
+        assert!(
+            text.contains("[1 repos]"),
+            "workspace row must still show repo count; got: {text:?}"
+        );
+    }
+}
+
+mod archived_row_summary {
+    use super::*;
+    use crate::session::{Instance, Storage, SummaryState, ToolSessionSummary};
+
+    fn make_view_with_instance(inst: Instance) -> (HomeView, TempDir) {
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+        let storage = Storage::new_unwatched("test").unwrap();
+        storage
+            .update(|i, g| {
+                *i = vec![inst.clone()];
+                *g = crate::session::GroupTree::new_with_groups(&[inst], &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view = HomeView::new(
+            Some("test".to_string()),
+            tools,
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+        view.group_by = crate::session::config::GroupByMode::Manual;
+        view.archived_section_collapsed = false;
+        view.flat_items = view.build_flat_items();
+        view.update_selected();
+        (view, temp)
+    }
+
+    fn first_session_item(view: &HomeView) -> Item {
+        view.flat_items
+            .iter()
+            .find(|i| matches!(i, Item::Session { .. }))
+            .cloned()
+            .expect("no session item found")
+    }
+
+    /// Archived rows with a tool_session_summary show the summary text.
+    #[test]
+    #[serial]
+    fn archived_row_shows_summary_text() {
+        let mut inst = Instance::new("my-session", "/tmp/work");
+        inst.archived_at = Some(chrono::Utc::now());
+        inst.tool_session_summary = Some(ToolSessionSummary {
+            display_id: "disp".to_string(),
+            text: "Implemented the feature".to_string(),
+            state: SummaryState::Final,
+        });
+        let (view, _temp) = make_view_with_instance(inst);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            text.contains("Implemented the feature"),
+            "archived row must show summary text; got: {text:?}"
+        );
+    }
+
+    /// Non-archived rows do not show summary even if summary is set.
+    #[test]
+    #[serial]
+    fn non_archived_row_does_not_show_summary() {
+        let mut inst = Instance::new("my-session", "/tmp/work");
+        inst.tool_session_summary = Some(ToolSessionSummary {
+            display_id: "disp".to_string(),
+            text: "Implemented the feature".to_string(),
+            state: SummaryState::Final,
+        });
+        let (view, _temp) = make_view_with_instance(inst);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            !text.contains("Implemented the feature"),
+            "non-archived row must not show summary; got: {text:?}"
+        );
+    }
+
+    /// Long summary texts are truncated with an ellipsis at 40 chars.
+    #[test]
+    #[serial]
+    fn long_summary_is_truncated() {
+        let mut inst = Instance::new("my-session", "/tmp/work");
+        inst.archived_at = Some(chrono::Utc::now());
+        inst.tool_session_summary = Some(ToolSessionSummary {
+            display_id: "disp".to_string(),
+            text: "A".repeat(60),
+            state: SummaryState::Final,
+        });
+        let (view, _temp) = make_view_with_instance(inst);
+        let item = first_session_item(&view);
+        let text = rendered_row_text(&view, &item);
+        assert!(
+            text.contains('…'),
+            "long summary must be truncated with ellipsis; got: {text:?}"
+        );
+        assert!(
+            !text.contains(&"A".repeat(60)),
+            "full long summary must not appear untruncated; got: {text:?}"
         );
     }
 }

@@ -1,6 +1,5 @@
 //! Session management module
 
-mod archive;
 pub mod builder;
 pub(crate) mod capture;
 pub mod civilizations;
@@ -31,7 +30,6 @@ pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
-pub use archive::{ArchiveCleanupOptions, ArchivedSession};
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, save_config,

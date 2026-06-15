@@ -58,3 +58,4 @@ These settings are also editable in the TUI settings screen.
 - The label is captured on session start and refreshed only when you explicitly ask for it.
 - The tmux status bar still uses worktree and workspace metadata only. This fork does not broaden tmux status bar branch display to every git session.
 - Non-git sessions remain unchanged.
+- Archived sessions (those toggled with `z`) also display their branch label in the list row alongside their session summary.

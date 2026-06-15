@@ -20,7 +20,6 @@ import { SelectField } from "./settings/FormFields";
 import { DiffSettings } from "./settings/DiffSettings";
 import { TelemetrySettings } from "./settings/TelemetrySettings";
 import { SettingsHeader } from "./settings/SettingsHeader";
-import { ArchiveSettings } from "./ArchiveSettings";
 
 type TabId =
   | "session"
@@ -400,7 +399,6 @@ export function SettingsView({ onClose, tab, onSelectTab, onServerAboutRefresh, 
                 advancedSubtitle="Idle auto-stop, attach modes, live-send, and other session tuning."
               />
             )}
-            <ArchiveSettings />
           </div>
         );
 

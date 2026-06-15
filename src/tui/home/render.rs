@@ -721,16 +721,12 @@ impl HomeView {
                 self.group_by,
                 self.sort_order,
             ),
-            ViewMode::Archive => {
-                compose_list_title("Archive", profile, self.group_by, self.sort_order)
-            }
         };
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
                 (theme.terminal_border, theme.terminal_border)
             }
-            ViewMode::Archive => (theme.border, theme.dimmed),
         };
         // Current sort indicator on the bottom-right of the list block. Uses
         // ratatui's `title_bottom` so it renders on the existing border and
@@ -755,28 +751,15 @@ impl HomeView {
         self.list_inner_area = inner;
         frame.render_widget(block, area);
 
-        let visible_count = if self.view_mode == ViewMode::Archive {
-            self.archived_sessions.len()
-        } else {
-            self.instances().len()
-        };
+        let visible_count = self.instances().len();
         if visible_count == 0 && !self.has_any_groups_for_view() {
-            let empty_text = if self.view_mode == ViewMode::Archive {
-                vec![
-                    Line::from(""),
-                    Line::from("No archived sessions").style(Style::default().fg(theme.dimmed)),
-                    Line::from(""),
-                    Line::from("Press 'a' to return").style(Style::default().fg(theme.hint)),
-                ]
-            } else {
-                vec![
-                    Line::from(""),
-                    Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
-                    Line::from(""),
-                    Line::from("Press 'n' to create one").style(Style::default().fg(theme.hint)),
-                    Line::from("or 'aoe add .'").style(Style::default().fg(theme.hint)),
-                ]
-            };
+            let empty_text = vec![
+                Line::from(""),
+                Line::from("No sessions yet").style(Style::default().fg(theme.dimmed)),
+                Line::from(""),
+                Line::from("Press 'n' to create one").style(Style::default().fg(theme.hint)),
+                Line::from("or 'aoe add .'").style(Style::default().fg(theme.hint)),
+            ];
             let para = Paragraph::new(empty_text).alignment(Alignment::Center);
             frame.render_widget(para, inner);
             return;
@@ -1175,10 +1158,6 @@ impl HomeView {
                             let style = Style::default().fg(color);
                             (icon, Cow::Owned(inst.title.clone()), style)
                         }
-                        ViewMode::Archive => {
-                            let style = Style::default().fg(theme.dimmed);
-                            (ICON_STOPPED, Cow::Owned(inst.title.clone()), style)
-                        }
                     }
                 } else {
                     (
@@ -1210,17 +1189,41 @@ impl HomeView {
         if let Item::Session { id, .. } = item {
             if let Some(inst) = self.get_display_instance(id) {
                 if let Some(ws_info) = &inst.workspace_info {
-                    let branch_style = Style::default().fg(theme.branch);
-                    line_spans.push(Span::styled(
-                        format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
-                        if is_selected {
-                            selected_row_style(branch_style, theme)
+                    // When show_branch_in_tui is on and display_branch is set,
+                    // substitute display_branch for the workspace branch name so
+                    // the row reflects the persisted branch label; otherwise fall
+                    // back to the workspace's own branch field. Style follows:
+                    // theme.branch when using display_branch, theme.dimmed
+                    // otherwise (workspace-only row with no explicit label).
+                    let (suffix, suffix_color) = if self.show_branch_in_tui {
+                        if let Some(branch) = &inst.display_branch {
+                            (
+                                format!("  {} [{} repos]", branch, ws_info.repos.len()),
+                                theme.branch,
+                            )
                         } else {
-                            branch_style
+                            (
+                                format!("  {} [{} repos]", ws_info.branch, ws_info.repos.len()),
+                                theme.dimmed,
+                            )
+                        }
+                    } else {
+                        (format!("  [{} repos]", ws_info.repos.len()), theme.dimmed)
+                    };
+                    let suffix_style = Style::default().fg(suffix_color);
+                    line_spans.push(Span::styled(
+                        suffix,
+                        if is_selected {
+                            selected_row_style(suffix_style, theme)
+                        } else {
+                            suffix_style
                         },
                     ));
                 } else if let Some(wt_info) = &inst.worktree_info {
                     if wt_info.branch != inst.title {
+                        // Worktree branch diverges from the session title: show
+                        // it. Worktree/workspace info wins over display_branch
+                        // so we do not append display_branch here.
                         let branch_style = Style::default().fg(theme.branch);
                         line_spans.push(Span::styled(
                             format!("  {}", wt_info.branch),
@@ -1230,6 +1233,58 @@ impl HomeView {
                                 branch_style
                             },
                         ));
+                    } else if self.show_branch_in_tui {
+                        // Worktree branch matches the title so the worktree
+                        // path shows no suffix; fall through to display_branch.
+                        if let Some(branch) = &inst.display_branch {
+                            let branch_style = Style::default().fg(theme.branch);
+                            line_spans.push(Span::styled(
+                                format!("  {}", branch),
+                                if is_selected {
+                                    selected_row_style(branch_style, theme)
+                                } else {
+                                    branch_style
+                                },
+                            ));
+                        }
+                    }
+                } else if self.show_branch_in_tui {
+                    if let Some(branch) = &inst.display_branch {
+                        let branch_style = Style::default().fg(theme.branch);
+                        line_spans.push(Span::styled(
+                            format!("  {}", branch),
+                            if is_selected {
+                                selected_row_style(branch_style, theme)
+                            } else {
+                                branch_style
+                            },
+                        ));
+                    }
+                }
+
+                // Archived rows show a dim one-line summary from the
+                // last tool session, giving context about what the
+                // session was working on without opening the preview.
+                if inst.is_archived() {
+                    if let Some(summary) = &inst.tool_session_summary {
+                        if !summary.text.is_empty() {
+                            let max_summary = 40usize;
+                            let text: String = summary.text.chars().take(max_summary).collect();
+                            let text = if summary.text.chars().count() > max_summary {
+                                format!("  {}…", text)
+                            } else {
+                                format!("  {}", text)
+                            };
+                            let summary_style = Style::default().fg(theme.dimmed);
+                            line_spans.push(Span::styled(
+                                text,
+                                if is_selected {
+                                    selected_row_style(summary_style, theme)
+                                } else {
+                                    summary_style
+                                },
+                            ));
+                        }
                     }
                 }
 
@@ -1476,7 +1531,6 @@ impl HomeView {
             ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
                 .session_name()
                 .to_string(),
-            ViewMode::Archive => crate::tmux::Session::generate_name(&inst.id, &inst.title),
         };
         Some(name)
     }
@@ -1798,7 +1852,6 @@ impl HomeView {
                     TerminalMode::Host => &self.terminal_preview_cache,
                 }
             }
-            ViewMode::Archive => &self.preview_cache,
         }
     }
 
@@ -1809,7 +1862,7 @@ impl HomeView {
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
-            ViewMode::Structured | ViewMode::Archive => (theme.border, theme.title),
+            ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
                 (theme.terminal_border, theme.terminal_border)
             }
@@ -1887,7 +1940,7 @@ impl HomeView {
             block = block.title(line);
         } else {
             let title = match &self.view_mode {
-                ViewMode::Structured | ViewMode::Archive => " Preview ".to_string(),
+                ViewMode::Structured => " Preview ".to_string(),
                 ViewMode::Terminal => " Terminal Preview ".to_string(),
                 ViewMode::Tool(name) => format!(" {} Preview ", name),
             };
@@ -2201,75 +2254,6 @@ impl HomeView {
                     }
                 } else {
                     let hint = Paragraph::new("Select a session to preview terminal")
-                        .style(Style::default().fg(theme.dimmed))
-                        .alignment(Alignment::Center);
-                    frame.render_widget(hint, inner);
-                }
-            }
-            ViewMode::Archive => {
-                if let Some(id) = &self.selected_session {
-                    if let Some(entry) = self.get_archived_session(id) {
-                        let project_exists =
-                            std::path::Path::new(&entry.instance.project_path).exists();
-                        let lines = vec![
-                            Line::from(vec![
-                                Span::styled("Title:   ", Style::default().fg(theme.dimmed)),
-                                Span::styled(
-                                    &entry.instance.title,
-                                    Style::default().fg(theme.text).bold(),
-                                ),
-                            ]),
-                            Line::from(vec![
-                                Span::styled("Path:    ", Style::default().fg(theme.dimmed)),
-                                Span::styled(
-                                    &entry.instance.project_path,
-                                    Style::default().fg(theme.text),
-                                ),
-                            ]),
-                            Line::from(vec![
-                                Span::styled("Profile: ", Style::default().fg(theme.dimmed)),
-                                Span::styled(
-                                    &entry.source_profile,
-                                    Style::default().fg(theme.text),
-                                ),
-                            ]),
-                            Line::from(vec![
-                                Span::styled("Status:  ", Style::default().fg(theme.dimmed)),
-                                Span::styled(
-                                    format!("{:?}", entry.last_status),
-                                    Style::default().fg(theme.text),
-                                ),
-                            ]),
-                            Line::from(vec![
-                                Span::styled("Saved:   ", Style::default().fg(theme.dimmed)),
-                                Span::styled(
-                                    entry
-                                        .archived_at
-                                        .format("%Y-%m-%d %H:%M:%S UTC")
-                                        .to_string(),
-                                    Style::default().fg(theme.text),
-                                ),
-                            ]),
-                            Line::from(vec![
-                                Span::styled("Restore: ", Style::default().fg(theme.dimmed)),
-                                Span::styled(
-                                    if project_exists {
-                                        "available"
-                                    } else {
-                                        "path missing"
-                                    },
-                                    Style::default().fg(if project_exists {
-                                        theme.running
-                                    } else {
-                                        theme.error
-                                    }),
-                                ),
-                            ]),
-                        ];
-                        frame.render_widget(Paragraph::new(lines), inner);
-                    }
-                } else {
-                    let hint = Paragraph::new("Select an archived session")
                         .style(Style::default().fg(theme.dimmed))
                         .alignment(Alignment::Center);
                     frame.render_widget(hint, inner);
@@ -2876,25 +2860,11 @@ impl HomeView {
         // reaches for most often. Del stays at p3, less frequent,
         // OK to drop first.
         if self.selected_session.is_some() {
-            if self.view_mode == ViewMode::Archive {
-                groups.push((3, mk(if strict { "R" } else { "r" }, "Restore")));
-            } else {
-                groups.push((3, mk(if strict { "M" } else { "m" }, "Msg")));
-            }
+            groups.push((3, mk(if strict { "M" } else { "m" }, "Msg")));
             groups.push((1, mk(if strict { "M" } else { "m" }, "Msg")));
         }
         if !self.flat_items.is_empty() {
-            groups.push((
-                3,
-                mk(
-                    if strict { "D" } else { "d" },
-                    if self.view_mode == ViewMode::Archive {
-                        "Delete"
-                    } else {
-                        "Del"
-                    },
-                ),
-            ));
+            groups.push((3, mk(if strict { "D" } else { "d" }, "Del")));
         }
         // Attention-workflow shortcuts (Archive / Fav / Snooze) only render
         // when the user is in Attention sort. They are only useful for

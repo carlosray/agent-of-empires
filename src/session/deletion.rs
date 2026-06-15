@@ -6,7 +6,7 @@ use crate::containers::DockerContainer;
 use crate::git::cleanup::remove_managed_worktree;
 use crate::git::GitWorktree;
 use crate::session::repo_config;
-use crate::session::{ArchiveCleanupOptions, Instance};
+use crate::session::Instance;
 
 pub struct DeletionRequest {
     pub session_id: String,
@@ -15,8 +15,6 @@ pub struct DeletionRequest {
     pub delete_branch: bool,
     pub delete_sandbox: bool,
     pub force_delete: bool,
-    pub archive_on_success: bool,
-    pub archive_max_entries: u64,
     /// When `true`, on_destroy hooks run detached from the controlling
     /// terminal (TUI/web). When `false`, hooks inherit stdin/stdout so
     /// interactive prompts work (CLI).
@@ -32,9 +30,6 @@ pub struct DeletionRequest {
 pub struct DeletionResult {
     pub session_id: String,
     pub instance: Instance,
-    pub cleanup: ArchiveCleanupOptions,
-    pub archive_on_success: bool,
-    pub archive_max_entries: u64,
     pub success: bool,
     pub messages: Vec<String>,
     pub errors: Vec<String>,
@@ -419,14 +414,6 @@ pub fn perform_deletion(request: &DeletionRequest) -> DeletionResult {
     DeletionResult {
         session_id: request.session_id.clone(),
         instance: request.instance.clone(),
-        cleanup: ArchiveCleanupOptions {
-            delete_worktree: request.delete_worktree,
-            delete_branch: request.delete_branch,
-            delete_sandbox: request.delete_sandbox,
-            force_delete: request.force_delete,
-        },
-        archive_on_success: request.archive_on_success,
-        archive_max_entries: request.archive_max_entries,
         success: errors.is_empty(),
         messages,
         errors,
@@ -529,8 +516,6 @@ mod tests {
             delete_branch: false,
             delete_sandbox: false,
             force_delete: false,
-            archive_on_success: false,
-            archive_max_entries: 100,
             detach_hooks: true,
             keep_scratch: false,
         };
@@ -552,8 +537,6 @@ mod tests {
             delete_branch: false,
             delete_sandbox: false,
             force_delete: false,
-            archive_on_success: false,
-            archive_max_entries: 100,
             detach_hooks: true,
             keep_scratch: false,
         };
@@ -576,8 +559,6 @@ mod tests {
             delete_branch: false,
             delete_sandbox: false,
             force_delete: false,
-            archive_on_success: false,
-            archive_max_entries: 100,
             detach_hooks: true,
             keep_scratch: false,
         };
@@ -725,8 +706,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: true,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -835,8 +814,6 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -932,8 +909,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -955,8 +930,6 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: false,
                 force_delete: true,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1055,8 +1028,6 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: true,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1128,8 +1099,6 @@ mod tests {
                 delete_branch: true,
                 delete_sandbox: false,
                 force_delete: true,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1168,8 +1137,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 100,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1225,8 +1192,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 0,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1263,8 +1228,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 0,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1298,8 +1261,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 0,
                 detach_hooks: true,
                 keep_scratch: false,
             };
@@ -1340,8 +1301,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 0,
                 detach_hooks: true,
                 keep_scratch: true,
             };
@@ -1395,8 +1354,6 @@ mod tests {
                 delete_branch: false,
                 delete_sandbox: false,
                 force_delete: false,
-                archive_on_success: false,
-                archive_max_entries: 0,
                 detach_hooks: true,
                 keep_scratch: false,
             };

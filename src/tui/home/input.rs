@@ -1716,7 +1716,6 @@ impl HomeView {
                     self.confirm_dialog = None;
                     self.pending_stop_session = None;
                     self.pending_force_remove_session = None;
-                    self.pending_archive_delete_session = None;
                     self.pending_branch_refresh = None;
                     self.pending_image_pull = None;
                 }
@@ -1736,15 +1735,6 @@ impl HomeView {
                         if let Some(session_id) = self.pending_force_remove_session.take() {
                             if let Err(e) = self.force_remove_session(&session_id) {
                                 tracing::error!("Failed to force remove session: {}", e);
-                            }
-                        }
-                    } else if action == "delete_archived_session" {
-                        if let Some(session_id) = self.pending_archive_delete_session.take() {
-                            if let Err(e) = self.delete_archived_session(&session_id) {
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Archive Delete",
-                                    &format!("Failed to delete archived session: {}", e),
-                                ));
                             }
                         }
                     } else if action == "quit_during_creation" {
@@ -1785,20 +1775,12 @@ impl HomeView {
                 DialogResult::Continue => {}
                 DialogResult::Cancel => {
                     self.unified_delete_dialog = None;
-                    self.delete_dialog_allow_archive = true;
                 }
                 DialogResult::Submit(options) => {
-                    let allow_archive = self.delete_dialog_allow_archive;
                     self.unified_delete_dialog = None;
-                    let result = if allow_archive {
-                        self.delete_selected(&options)
-                    } else {
-                        self.delete_selected_permanently(&options)
-                    };
-                    if let Err(e) = result {
+                    if let Err(e) = self.delete_selected(&options) {
                         tracing::error!(target: "tui.input", "Failed to delete session: {}", e);
                     }
-                    self.delete_dialog_allow_archive = true;
                 }
             }
             return None;
@@ -2151,17 +2133,6 @@ impl HomeView {
                 self.view_mode = ViewMode::Structured;
                 return None;
             }
-            // Toggle archive view (fork-only; not in bindings registry).
-            KeyCode::Char('a') => {
-                self.view_mode = if self.view_mode == ViewMode::Archive {
-                    ViewMode::Structured
-                } else {
-                    ViewMode::Archive
-                };
-                self.flat_items = self.build_flat_items();
-                self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
-                self.update_selected();
-            }
             // List-width adjustments with capital H/L (fork-only; not in bindings).
             KeyCode::Char('H') => {
                 self.shrink_list();
@@ -2187,25 +2158,6 @@ impl HomeView {
                     }
                 } else if let Some(action) = self.start_live_send() {
                     return Some(action);
-                }
-            }
-            // Ctrl+D in non-strict mode forces permanent deletion (skip archive).
-            // In strict mode, Ctrl+D is bound to Diff via the registry; the guard
-            // below only fires when Ctrl is held but it's non-strict mode and the
-            // registry won't consume this chord.
-            KeyCode::Char('d')
-                if key.modifiers.contains(KeyModifiers::CONTROL) && !self.strict_hotkeys =>
-            {
-                self.open_permanent_delete_for_selected();
-                return None;
-            }
-            // Restore archived session (fork-only; only fires in Archive view).
-            KeyCode::Char('r') if self.view_mode == ViewMode::Archive => {
-                if let Err(e) = self.restore_selected_archive() {
-                    self.info_dialog = Some(InfoDialog::new(
-                        "Restore Archived Session",
-                        &format!("Failed to restore archived session: {}", e),
-                    ));
                 }
             }
             // Refresh branch display for selected session (fork-only, non-strict only).
@@ -2417,9 +2369,7 @@ impl HomeView {
             ActionId::ToggleView => {
                 self.view_mode = match self.view_mode {
                     ViewMode::Structured => ViewMode::Terminal,
-                    ViewMode::Terminal | ViewMode::Tool(_) | ViewMode::Archive => {
-                        ViewMode::Structured
-                    }
+                    ViewMode::Terminal | ViewMode::Tool(_) => ViewMode::Structured,
                 };
                 self.flat_items = self.build_flat_items();
                 self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
@@ -2576,10 +2526,6 @@ impl HomeView {
     }
 
     fn attach_terminal_for_selected(&mut self) -> Option<Action> {
-        // Archive view does not support terminal attach.
-        if self.view_mode == ViewMode::Archive {
-            return None;
-        }
         // Quick-attach to paired terminal from any view.
         if let Some(id) = &self.selected_session {
             if let Some(inst) = self.get_instance(id) {
@@ -3086,7 +3032,6 @@ impl HomeView {
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
             ViewMode::Tool(ref tool_name) => Some(Action::AttachToolSession(id, tool_name.clone())),
-            ViewMode::Archive => None,
         }
     }
 
@@ -3130,7 +3075,6 @@ impl HomeView {
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
             ViewMode::Tool(ref tool_name) => Some(Action::AttachToolSession(id, tool_name.clone())),
-            ViewMode::Archive => Some(Action::AttachSession(id)),
         }
     }
 
@@ -3253,12 +3197,7 @@ impl HomeView {
         // Route to the correct profile's GroupTree
         let profile = self.profile_for_cursor(self.cursor);
         if let Some(profile) = profile {
-            let trees = if self.view_mode == ViewMode::Archive {
-                &mut self.archive_group_trees
-            } else {
-                &mut self.group_trees
-            };
-            if let Some(tree) = trees.get_mut(&profile) {
+            if let Some(tree) = self.group_trees.get_mut(&profile) {
                 tree.toggle_collapsed(path);
             }
         }
@@ -3330,7 +3269,6 @@ impl HomeView {
                     TerminalMode::Host => &self.terminal_preview_cache,
                 }
             }
-            ViewMode::Archive => return false,
             ViewMode::Tool(_) => &self.tool_preview_cache,
         };
 
@@ -3737,35 +3675,12 @@ impl HomeView {
     ///   - Stuck-Deleting sessions get a force-remove confirm,
     ///   - Project-mode groups can't be deleted (info dialog).
     ///
-    /// Shared by the `'d'` / `'D'` key handlers and the right-click
-    /// context menu.
+    /// Shared by the `'d'` keybind and the right-click context menu.
     pub(super) fn open_delete_for_selected(&mut self) {
-        self.open_delete_for_selected_with_archive(true);
+        self.open_delete_dialog_for_selected();
     }
 
-    pub(super) fn open_permanent_delete_for_selected(&mut self) {
-        self.open_delete_for_selected_with_archive(false);
-    }
-
-    fn open_delete_for_selected_with_archive(&mut self, allow_archive: bool) {
-        // In archive view, 'd' permanently deletes the archived session entry.
-        if self.view_mode == ViewMode::Archive {
-            if let Some(session_id) = &self.selected_session {
-                if let Some(entry) = self.get_archived_session(session_id) {
-                    let message = format!(
-                        "Permanently delete archived session '{}'?",
-                        entry.instance.title
-                    );
-                    self.pending_archive_delete_session = Some(session_id.clone());
-                    self.confirm_dialog = Some(ConfirmDialog::new(
-                        "Delete Archived Session",
-                        &message,
-                        "delete_archived_session",
-                    ));
-                }
-            }
-            return;
-        }
+    fn open_delete_dialog_for_selected(&mut self) {
         // Deletion only allowed in Structured View.
         if self.view_mode == ViewMode::Terminal {
             let hint = if self.strict_hotkeys {
@@ -3810,30 +3725,15 @@ impl HomeView {
 
                 let profile = self.config_profile();
                 let title = inst.title.clone();
-                let (archive_on_confirm, _) =
-                    self.archive_settings_for_instance(inst, allow_archive);
-                self.delete_dialog_allow_archive = archive_on_confirm;
-                self.unified_delete_dialog = Some(if archive_on_confirm {
-                    UnifiedDeleteDialog::new(title, config, &profile)
-                } else {
-                    UnifiedDeleteDialog::new_permanent(title, config, &profile)
-                });
+                self.unified_delete_dialog =
+                    Some(UnifiedDeleteDialog::new_permanent(title, config, &profile));
             } else {
                 let profile = self.config_profile();
-                self.delete_dialog_allow_archive = allow_archive;
-                self.unified_delete_dialog = Some(if allow_archive {
-                    UnifiedDeleteDialog::new(
-                        "Unknown Session".to_string(),
-                        DeleteDialogConfig::default(),
-                        &profile,
-                    )
-                } else {
-                    UnifiedDeleteDialog::new_permanent(
-                        "Unknown Session".to_string(),
-                        DeleteDialogConfig::default(),
-                        &profile,
-                    )
-                });
+                self.unified_delete_dialog = Some(UnifiedDeleteDialog::new_permanent(
+                    "Unknown Session".to_string(),
+                    DeleteDialogConfig::default(),
+                    &profile,
+                ));
             }
         } else if let Some(group_path) = &self.selected_group {
             if self.group_by == GroupByMode::Project {
@@ -4281,7 +4181,7 @@ impl HomeView {
                     live_send::LiveSendTarget::Terminal
                 }
             }
-            ViewMode::Tool(_) | ViewMode::Archive => return None,
+            ViewMode::Tool(_) => return None,
         };
         Some(Action::EnterLiveSend(id))
     }
@@ -4531,7 +4431,7 @@ impl HomeView {
                 }
                 live_send::LiveSendTarget::Terminal
             }
-            ViewMode::Tool(_) | ViewMode::Archive => live_send::LiveSendTarget::Agent,
+            ViewMode::Tool(_) => live_send::LiveSendTarget::Agent,
         }
     }
 

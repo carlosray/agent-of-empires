@@ -11,7 +11,6 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
-  ArchivedSessionResponse,
   SettingsFieldDescriptor,
 } from "./types";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
@@ -51,31 +50,6 @@ export async function updateWorkspaceOrdering(order: string[]): Promise<boolean>
   }
 }
 
-export async function fetchArchive(): Promise<ArchivedSessionResponse[] | null> {
-  return fetchJson<ArchivedSessionResponse[]>("/api/archive");
-}
-
-export async function restoreArchivedSession(id: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/archive/${id}/restore`, {
-      method: "POST",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
-
-export async function deleteArchivedSession(id: string): Promise<boolean> {
-  try {
-    const res = await fetch(`/api/archive/${id}`, {
-      method: "DELETE",
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 
 export interface EnsureSessionResult {
   ok: boolean;
@@ -1271,8 +1245,6 @@ export interface DeleteSessionOptions {
   delete_branch?: boolean;
   delete_sandbox?: boolean;
   force_delete?: boolean;
-  permanent?: boolean;
-  archive?: boolean;
   /** For scratch sessions, keep the scratch directory on disk instead of
    *  removing it. The session record is still deleted. No effect on
    *  non-scratch sessions. */

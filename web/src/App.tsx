@@ -85,7 +85,6 @@ import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
 import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
-import { ArchiveView } from "./components/ArchiveView";
 import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
@@ -203,13 +202,11 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const settingsRootMatch = useMatch("/settings");
   const settingsTabMatch = useMatch("/settings/:tab");
   const projectsMatch = useMatch("/projects");
-  const archiveMatch = useMatch("/archive");
   const profilesMatch = useMatch("/profiles");
   const activeSessionId = sessionMatch?.params.sessionId ?? null;
   const showSettings = settingsRootMatch !== null || settingsTabMatch !== null;
   const showProjects = projectsMatch !== null;
   const showProfiles = profilesMatch !== null;
-  const showArchive = archiveMatch !== null;
   const settingsTab = settingsTabMatch?.params.tab ?? null;
 
   const {
@@ -219,7 +216,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     markLocalOrderingUpdate,
     error,
     loaded: sessionsLoaded,
-    refresh,
     injectSession,
     setSessionStatus,
   } = useSessions();
@@ -478,7 +474,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
 
   const [wizardPrefill, setWizardPrefill] = useState<WizardPrefill | undefined>(undefined);
   const [deletingWorkspaceId, setDeletingWorkspaceId] = useState<string | null>(null);
-  const [deletingPermanent, setDeletingPermanent] = useState(false);
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // `serverAbout === null` conflates "not fetched yet" with "fetch failed", so
   // the tour gates auto-launch on an explicit loaded flag instead.
@@ -538,13 +533,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   const deletingWorkspace = deletingWorkspaceId ? workspaces.find((w) => w.id === deletingWorkspaceId) : null;
   const deletingSession = deletingWorkspace?.sessions[0] ?? null;
 
-  const handleArchiveSession = useCallback((workspaceId: string) => {
-    setDeletingPermanent(false);
-    setDeletingWorkspaceId(workspaceId);
-  }, []);
-
-  const handlePermanentDeleteSession = useCallback((workspaceId: string) => {
-    setDeletingPermanent(true);
+  const handleDeleteSession = useCallback((workspaceId: string) => {
     setDeletingWorkspaceId(workspaceId);
   }, []);
 
@@ -562,10 +551,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
         navigate("/");
       }
 
-      const result = await deleteSession(sessionId, {
-        ...options,
-        permanent: deletingPermanent,
-      });
+      const result = await deleteSession(sessionId, options);
       if (!result.ok) {
         // Revert status on failure
         setSessionStatus(sessionId, "Error");
@@ -588,11 +574,10 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
       // Server returns `messages` from `perform_deletion` when there's something
       // user-facing to report (e.g. "Scratch directory kept at: <path>" when
       // `keep_scratch` is set). Surface the first one so the kept-path is visible.
-      const toast =
-        result.messages?.[0] ?? (deletingPermanent ? "Session deleted" : "Session archived");
+      const toast = result.messages?.[0] ?? "Session deleted";
       toastBus.handler?.info(toast);
     },
-    [deletingSession, deletingPermanent, activeSessionId, setSessionStatus, navigate],
+    [deletingSession, activeSessionId, setSessionStatus, navigate],
   );
 
   const handleCreateSession = useCallback(
@@ -669,11 +654,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     if (window.innerWidth < 768) setSidebarOpen(false);
   }, [navigate]);
 
-  const handleOpenArchive = useCallback(() => {
-    navigate("/archive");
-    if (window.innerWidth < 768) setSidebarOpen(false);
-  }, [navigate]);
-
   const handleOpenProjects = useCallback(() => {
     navigate("/projects");
     if (window.innerWidth < 768) setSidebarOpen(false);
@@ -701,14 +681,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
   }, [navigate, activeSessionId]);
 
   const handleCloseSettings = useCallback(() => {
-    if (activeSessionId) {
-      navigate(`/session/${encodeURIComponent(activeSessionId)}`);
-    } else {
-      navigate("/");
-    }
-  }, [navigate, activeSessionId]);
-
-  const handleCloseArchive = useCallback(() => {
     if (activeSessionId) {
       navigate(`/session/${encodeURIComponent(activeSessionId)}`);
     } else {
@@ -849,10 +821,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             handleCloseSettings();
             return;
           }
-          if (showArchive) {
-            handleCloseArchive();
-            return;
-          }
           setShowAbout(false);
           setSelectedFile(null);
         },
@@ -888,7 +856,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     onSelectSession: handleSelectSession,
     onToggleDiff: toggleDiff,
     onOpenSettings: handleOpenSettings,
-    onOpenArchive: handleOpenArchive,
     onOpenHelp: handleOpenHelp,
     onOpenAbout: handleOpenAbout,
     onGoDashboard: handleGoDashboard,
@@ -933,15 +900,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
     // See #1351.
     if (activeSessionId && !sessionsLoaded) {
       return <div className="h-dvh bg-surface-900 safe-area-inset" />;
-    }
-
-    if (showArchive) {
-      return (
-        <ArchiveView
-          onClose={handleCloseArchive}
-          onRestored={() => void refresh()}
-        />
-      );
     }
 
     if (!activeWorkspace || !activeSession) {
@@ -1226,8 +1184,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
           onOpenPalette={() => setShowPalette(true)}
           onToggleDiff={toggleDiff}
           diffCollapsed={diffCollapsed}
-          onOpenSettings={handleOpenSettings}
-          onOpenArchive={handleOpenArchive}
           onOpenHelp={handleOpenHelp}
           onOpenAbout={handleOpenAbout}
           onStartTutorial={tour.startTour}
@@ -1264,9 +1220,7 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
               onSettings={handleOpenSettings}
               onProjects={handleOpenProjects}
               onProfiles={handleOpenProfiles}
-              onDeleteSession={handleArchiveSession}
-              onArchiveSession={handleArchiveSession}
-              onPermanentDeleteSession={handlePermanentDeleteSession}
+              onDeleteSession={handleDeleteSession}
               readOnly={serverAbout?.read_only}
               sortMode={sidebarSortMode}
               onSortModeChange={setSidebarSortMode}
@@ -1314,7 +1268,6 @@ function AppContent({ loginRequired, onLogout }: { loginRequired: boolean; onLog
             isSandboxed={deletingSession.is_sandboxed}
             isScratch={deletingSession.scratch}
             cleanupDefaults={deletingSession.cleanup_defaults}
-            permanent={deletingPermanent}
             onConfirm={handleConfirmDelete}
             onCancel={() => setDeletingWorkspaceId(null)}
           />
