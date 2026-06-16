@@ -12465,31 +12465,13 @@ mod archived_row_summary {
             .expect("no session item found")
     }
 
-    /// Archived rows with a tool_session_summary show the summary text.
+    /// The tool session summary is a preview-panel-only detail; it must not
+    /// leak into the session list row, even for archived sessions.
     #[test]
     #[serial]
-    fn archived_row_shows_summary_text() {
+    fn archived_row_does_not_show_summary_inline() {
         let mut inst = Instance::new("my-session", "/tmp/work");
         inst.archived_at = Some(chrono::Utc::now());
-        inst.tool_session_summary = Some(ToolSessionSummary {
-            display_id: "disp".to_string(),
-            text: "Implemented the feature".to_string(),
-            state: SummaryState::Final,
-        });
-        let (view, _temp) = make_view_with_instance(inst);
-        let item = first_session_item(&view);
-        let text = rendered_row_text(&view, &item);
-        assert!(
-            text.contains("Implemented the feature"),
-            "archived row must show summary text; got: {text:?}"
-        );
-    }
-
-    /// Non-archived rows do not show summary even if summary is set.
-    #[test]
-    #[serial]
-    fn non_archived_row_does_not_show_summary() {
-        let mut inst = Instance::new("my-session", "/tmp/work");
         inst.tool_session_summary = Some(ToolSessionSummary {
             display_id: "disp".to_string(),
             text: "Implemented the feature".to_string(),
@@ -12500,31 +12482,7 @@ mod archived_row_summary {
         let text = rendered_row_text(&view, &item);
         assert!(
             !text.contains("Implemented the feature"),
-            "non-archived row must not show summary; got: {text:?}"
-        );
-    }
-
-    /// Long summary texts are truncated with an ellipsis at 40 chars.
-    #[test]
-    #[serial]
-    fn long_summary_is_truncated() {
-        let mut inst = Instance::new("my-session", "/tmp/work");
-        inst.archived_at = Some(chrono::Utc::now());
-        inst.tool_session_summary = Some(ToolSessionSummary {
-            display_id: "disp".to_string(),
-            text: "A".repeat(60),
-            state: SummaryState::Final,
-        });
-        let (view, _temp) = make_view_with_instance(inst);
-        let item = first_session_item(&view);
-        let text = rendered_row_text(&view, &item);
-        assert!(
-            text.contains('…'),
-            "long summary must be truncated with ellipsis; got: {text:?}"
-        );
-        assert!(
-            !text.contains(&"A".repeat(60)),
-            "full long summary must not appear untruncated; got: {text:?}"
+            "archived row must not show summary inline; got: {text:?}"
         );
     }
 }

@@ -1262,32 +1262,6 @@ impl HomeView {
                     }
                 }
 
-                // Archived rows show a dim one-line summary from the
-                // last tool session, giving context about what the
-                // session was working on without opening the preview.
-                if inst.is_archived() {
-                    if let Some(summary) = &inst.tool_session_summary {
-                        if !summary.text.is_empty() {
-                            let max_summary = 40usize;
-                            let text: String = summary.text.chars().take(max_summary).collect();
-                            let text = if summary.text.chars().count() > max_summary {
-                                format!("  {}…", text)
-                            } else {
-                                format!("  {}", text)
-                            };
-                            let summary_style = Style::default().fg(theme.dimmed);
-                            line_spans.push(Span::styled(
-                                text,
-                                if is_selected {
-                                    selected_row_style(summary_style, theme)
-                                } else {
-                                    summary_style
-                                },
-                            ));
-                        }
-                    }
-                }
-
                 // Per-row tag. The mode is config-driven (see
                 // `SessionConfig.row_tag` and the Settings UI "Row Tag"
                 // field). Default is `None` so existing users see no
@@ -2860,7 +2834,6 @@ impl HomeView {
         // reaches for most often. Del stays at p3, less frequent,
         // OK to drop first.
         if self.selected_session.is_some() {
-            groups.push((3, mk(if strict { "M" } else { "m" }, "Msg")));
             groups.push((1, mk(if strict { "M" } else { "m" }, "Msg")));
         }
         if !self.flat_items.is_empty() {
@@ -2880,7 +2853,6 @@ impl HomeView {
             }
         }
 
-        groups.push((4, mk(if strict { "A" } else { "a" }, "History")));
         groups.push((4, mk_key("/")));
         groups.push((4, mk(if strict { "^D" } else { "D" }, "Diff")));
         groups.push((1, mk("^K", "Cmds")));
