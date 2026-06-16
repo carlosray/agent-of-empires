@@ -21,11 +21,15 @@ use super::instance::{Instance, SummaryState, ToolSession, ToolSessionSummary};
 
 /// Max stored summary length, in characters. The preview clips further to the
 /// panel width at render time.
-const MAX_SUMMARY_LEN: usize = 120;
+pub const MAX_SUMMARY_LEN: usize = 120;
 /// Upper bound on the first-message text sent to the LLM, in bytes.
 const LLM_INPUT_CAP_BYTES: usize = 4096;
-/// Per-request timeout for the LLM call.
+/// Per-request timeout for the background LLM upgrade.
 const LLM_TIMEOUT_SECS: u64 = 15;
+/// Per-request timeout for a user-initiated manual regenerate. More generous
+/// than the background timeout since the user is actively waiting and may be
+/// pointing at a slow self-hosted model.
+pub const LLM_MANUAL_TIMEOUT_SECS: u64 = 60;
 
 const SYSTEM_PROMPT: &str = "Summarize in at most 10 words what this coding session is about. \
      Reply with only the summary, no preamble or quotes.";
@@ -82,6 +86,7 @@ pub fn compute_summary_update(
         display_id: tool_session.display_id.clone(),
         text,
         state,
+        updated_at: Some(chrono::Utc::now()),
     })
 }
 
@@ -264,10 +269,21 @@ fn is_opencode_placeholder(title: &str) -> bool {
     title.starts_with("New session - ")
 }
 
-/// Call the configured OpenAI-compatible endpoint to summarize `input`. Runs a
-/// single blocking request on a private current-thread runtime, so it must be
-/// invoked from a detached thread (see [`SummaryService::spawn`]).
+/// Call the configured OpenAI-compatible endpoint to summarize `input`, using
+/// the background-upgrade timeout. Runs a single blocking request on a private
+/// current-thread runtime, so it must be invoked from a detached thread (see
+/// [`SummaryService::spawn`]).
 pub fn summarize_via_llm(config: &LlmConfig, input: &str) -> anyhow::Result<String> {
+    summarize_via_llm_with_timeout(config, input, Duration::from_secs(LLM_TIMEOUT_SECS))
+}
+
+/// Like [`summarize_via_llm`] but with a caller-chosen request timeout. The
+/// manual-regenerate path passes [`LLM_MANUAL_TIMEOUT_SECS`].
+pub fn summarize_via_llm_with_timeout(
+    config: &LlmConfig,
+    input: &str,
+    timeout: Duration,
+) -> anyhow::Result<String> {
     let base = config.api_base_url.trim().trim_end_matches('/');
     let url = format!("{base}/chat/completions");
     let capped = cap_bytes(input, LLM_INPUT_CAP_BYTES);
@@ -286,9 +302,7 @@ pub fn summarize_via_llm(config: &LlmConfig, input: &str) -> anyhow::Result<Stri
         .enable_all()
         .build()?;
     runtime.block_on(async move {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(LLM_TIMEOUT_SECS))
-            .build()?;
+        let client = reqwest::Client::builder().timeout(timeout).build()?;
         let mut request = client.post(&url).json(&body);
         if !token.is_empty() {
             request = request.bearer_auth(token);
@@ -504,6 +518,7 @@ mod tests {
             display_id: "sid-1".to_string(),
             text: "existing".to_string(),
             state: SummaryState::Final,
+            updated_at: None,
         });
         assert!(!needs_eval(&inst, &ts));
         assert!(compute_summary_update(&inst, &ts, false).is_none());
@@ -516,6 +531,7 @@ mod tests {
             display_id: "old".to_string(),
             text: "stale".to_string(),
             state: SummaryState::Final,
+            updated_at: None,
         });
         let ts = tool_session("new", "new");
         assert!(needs_eval(&inst, &ts));

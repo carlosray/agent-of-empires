@@ -729,6 +729,7 @@ mod tests {
             display_id: "session-123".to_string(),
             text: "Fix the login bug".to_string(),
             state: crate::session::SummaryState::Final,
+            updated_at: None,
         });
 
         let rendered = render_preview(&instance);
@@ -760,6 +761,7 @@ mod tests {
             display_id: "session-123".to_string(),
             text: "Fix the login bug".to_string(),
             state: crate::session::SummaryState::Final,
+            updated_at: None,
         });
 
         let rendered = render_preview(&instance);

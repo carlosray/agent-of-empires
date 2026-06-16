@@ -908,6 +908,24 @@ impl HomeView {
             // open so the underlying list / preview don't react.
             return true;
         }
+        if self.regenerate_summary_dialog.is_some() {
+            let input = self
+                .regenerate_summary_dialog
+                .as_ref()
+                .map(|d| d.handle_click(col, row))
+                .unwrap_or(crate::tui::dialogs::RegenInput::Continue);
+            match input {
+                crate::tui::dialogs::RegenInput::Continue => {}
+                crate::tui::dialogs::RegenInput::Cancel => {
+                    self.regenerate_summary_dialog = None;
+                }
+                crate::tui::dialogs::RegenInput::Confirm => {
+                    self.confirm_regenerate_summary();
+                }
+            }
+            // Swallow every click while the modal is open.
+            return true;
+        }
         // Confirm dialog floats over settings (e.g., the unsaved-changes
         // discard prompt), so it has to win over the settings-view
         // takeover for click routing the same way the keyboard path
@@ -1479,6 +1497,19 @@ impl HomeView {
                     if let Some(session_id) = self.pending_attach_after_warning.take() {
                         return Some(Action::AttachSession(session_id));
                     }
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.regenerate_summary_dialog {
+            match dialog.handle_key(key) {
+                crate::tui::dialogs::RegenInput::Continue => {}
+                crate::tui::dialogs::RegenInput::Cancel => {
+                    self.regenerate_summary_dialog = None;
+                }
+                crate::tui::dialogs::RegenInput::Confirm => {
+                    self.confirm_regenerate_summary();
                 }
             }
             return None;
@@ -2413,6 +2444,7 @@ impl HomeView {
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
+            ActionId::RegenerateSummary => self.open_regenerate_summary_dialog(),
         }
         None
     }
@@ -3386,12 +3418,18 @@ impl HomeView {
             } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let (is_archived, is_snoozed) = match &self.flat_items[idx] {
+                let (is_archived, is_snoozed, can_regen) = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self
                         .get_instance(id)
-                        .map(|inst| (inst.is_archived(), inst.is_snoozed()))
-                        .unwrap_or((false, false)),
-                    super::Item::Group { .. } => (false, false),
+                        .map(|inst| {
+                            (
+                                inst.is_archived(),
+                                inst.is_snoozed(),
+                                crate::session::tool_session::tracking_enabled(inst),
+                            )
+                        })
+                        .unwrap_or((false, false, false)),
+                    super::Item::Group { .. } => (false, false, false),
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -3399,7 +3437,7 @@ impl HomeView {
                 // paths in step.
                 let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
                     .then_some(is_snoozed);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze)
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, can_regen)
             });
             return true;
         }
@@ -3489,6 +3527,11 @@ impl HomeView {
                 // header, so the toggle acts on the same project the menu was
                 // opened for.
                 self.toggle_project_pin_at_cursor();
+            }
+            ContextMenuAction::RegenerateSummary => {
+                // The right-click already moved the cursor onto the row, so the
+                // dialog opens for the same session the menu was opened for.
+                self.open_regenerate_summary_dialog();
             }
         }
     }

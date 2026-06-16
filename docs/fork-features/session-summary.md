@@ -49,7 +49,7 @@ When an OpenAI-compatible LLM endpoint is configured, AoE fires a single chat co
 
 The request fires in a detached thread so the poller is never blocked. An in-memory set of in-flight display IDs prevents duplicate concurrent calls.
 
-Summary state is tracked as `Extracted` (baseline set, LLM call may follow) or `Final` (evaluation complete, either LLM finished or no LLM is configured). Once `Final`, the summary is not re-evaluated.
+Summary state is tracked as `Extracted` (baseline set, LLM call may follow) or `Final` (evaluation complete, either LLM finished or no LLM is configured). Once `Final`, the summary is not re-evaluated automatically. To recompute it on demand, see [Regenerate Session Summary](summary-regenerate.md).
 
 ## Configuration
 

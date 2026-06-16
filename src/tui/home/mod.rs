@@ -38,9 +38,9 @@ use super::dialogs::{
     ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
     GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
     NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
-    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
-    SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
-    WorktreeNameDialog,
+    ProjectSessionPickerDialog, ProjectsDialog, RegenPoll, RegenerateSummaryDialog, RenameDialog,
+    RepoTrustDialog, RestartDialog, SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog,
+    UpdateConfirmDialog, WorktreeNameDialog,
 };
 use super::diff::DiffView;
 use super::settings::SettingsView;
@@ -458,6 +458,7 @@ pub struct HomeView {
     pub(super) help_scroll: u16,
     pub(super) new_dialog: Option<NewSessionDialog>,
     pub(super) confirm_dialog: Option<ConfirmDialog>,
+    pub(super) regenerate_summary_dialog: Option<RegenerateSummaryDialog>,
     pub(super) unified_delete_dialog: Option<UnifiedDeleteDialog>,
     pub(super) group_delete_options_dialog: Option<GroupDeleteOptionsDialog>,
     pub(super) rename_dialog: Option<RenameDialog>,
@@ -1107,6 +1108,7 @@ impl HomeView {
             help_scroll: 0,
             new_dialog: None,
             confirm_dialog: None,
+            regenerate_summary_dialog: None,
             unified_delete_dialog: None,
             group_delete_options_dialog: None,
             rename_dialog: None,
@@ -1762,6 +1764,7 @@ impl HomeView {
                 if let Some(summary) = inst.tool_session_summary.as_mut() {
                     if !result.text.is_empty() {
                         summary.text = result.text.clone();
+                        summary.updated_at = Some(chrono::Utc::now());
                     }
                     summary.state = crate::session::SummaryState::Final;
                 }
@@ -1775,6 +1778,185 @@ impl HomeView {
             }
         }
         any_change
+    }
+
+    /// Open the manual "regenerate summary" confirm modal for the selected
+    /// session. Validates up front (tracking on, `[llm]` configured, an
+    /// extractable session message exists) and shows an info dialog explaining
+    /// the blocker instead of opening the modal when a regenerate can't happen.
+    pub(super) fn open_regenerate_summary_dialog(&mut self) {
+        let Some(id) = self.selected_session.clone() else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Regenerate Summary",
+                "Select a session first.",
+            ));
+            return;
+        };
+        // Gather everything from an immutable borrow, then act, so the
+        // info-dialog write below doesn't collide with the `&Instance` borrow.
+        let prepared: Result<(String, Option<chrono::DateTime<chrono::Utc>>), &'static str> =
+            (|| {
+                let inst = self
+                    .get_instance(&id)
+                    .ok_or("Could not find session data.")?;
+                if !crate::session::tool_session::tracking_enabled(inst) {
+                    return Err(
+                    "Tool session tracking is off for this session, so there is no summary to regenerate.",
+                );
+                }
+                let config = crate::session::tool_session::effective_config(inst)
+                    .map_err(|_| "Could not load this session's configuration.")?;
+                if !config.llm.summary_enabled() {
+                    return Err(
+                    "Configure the [llm] section (api_base_url + summary_model) to generate summaries with an LLM.",
+                );
+                }
+                let tool_session = inst
+                    .tool_session
+                    .as_ref()
+                    .ok_or("No active tool session to summarize yet.")?;
+                if crate::session::summary::extract_first_message(inst, tool_session).is_none() {
+                    return Err("No session message to summarize yet.");
+                }
+                Ok((
+                    inst.title.clone(),
+                    inst.tool_session_summary
+                        .as_ref()
+                        .and_then(|s| s.updated_at),
+                ))
+            })();
+
+        match prepared {
+            Ok((title, last_updated)) => {
+                self.regenerate_summary_dialog =
+                    Some(RegenerateSummaryDialog::new(id, title, last_updated));
+            }
+            Err(message) => {
+                self.info_dialog = Some(InfoDialog::new("Regenerate Summary", message));
+            }
+        }
+    }
+
+    /// Kick off the LLM request for the open regenerate modal. Spawns a
+    /// detached worker (so the UI never blocks on the network) and moves the
+    /// dialog into its loading state. On a resolution failure the modal is
+    /// replaced with an info dialog.
+    pub(super) fn confirm_regenerate_summary(&mut self) {
+        let id = match &self.regenerate_summary_dialog {
+            Some(d) => d.session_id().to_string(),
+            None => return,
+        };
+        let resolved: Result<(crate::session::config::LlmConfig, String), String> = (|| {
+            let inst = self
+                .get_instance(&id)
+                .ok_or_else(|| "Could not find session data.".to_string())?;
+            let config =
+                crate::session::tool_session::effective_config(inst).map_err(|e| e.to_string())?;
+            if !config.llm.summary_enabled() {
+                return Err("LLM is not configured.".to_string());
+            }
+            let tool_session = inst
+                .tool_session
+                .clone()
+                .ok_or_else(|| "No active tool session to summarize.".to_string())?;
+            let input = crate::session::summary::extract_first_message(inst, &tool_session)
+                .ok_or_else(|| "No session message to summarize.".to_string())?;
+            Ok((config.llm.clone(), input))
+        })();
+
+        match resolved {
+            Ok((llm, input)) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let res = crate::session::summary::summarize_via_llm_with_timeout(
+                        &llm,
+                        &input,
+                        std::time::Duration::from_secs(
+                            crate::session::summary::LLM_MANUAL_TIMEOUT_SECS,
+                        ),
+                    )
+                    .map(|text| {
+                        crate::session::summary::collapse_single_line(
+                            &text,
+                            crate::session::summary::MAX_SUMMARY_LEN,
+                        )
+                    })
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(res);
+                });
+                // Wall-clock guard a little past the request timeout, in case
+                // the worker never reports.
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(
+                        crate::session::summary::LLM_MANUAL_TIMEOUT_SECS + 5,
+                    );
+                if let Some(d) = self.regenerate_summary_dialog.as_mut() {
+                    d.begin_loading(rx, deadline);
+                }
+            }
+            Err(message) => {
+                self.regenerate_summary_dialog = None;
+                self.info_dialog = Some(InfoDialog::new("Regenerate Summary", &message));
+            }
+        }
+    }
+
+    /// Drain the regenerate modal's worker on a tick. Applies a successful
+    /// summary to the instance and closes the modal; a failure is surfaced by
+    /// the dialog itself (it switches to its error state). Returns true if the
+    /// instance changed.
+    pub fn poll_regenerate_summary(&mut self) -> bool {
+        let poll = match self.regenerate_summary_dialog.as_mut() {
+            Some(d) => d.poll(),
+            None => return false,
+        };
+        match poll {
+            RegenPoll::Pending => false,
+            RegenPoll::Done(text) => {
+                let id = self
+                    .regenerate_summary_dialog
+                    .as_ref()
+                    .map(|d| d.session_id().to_string());
+                self.regenerate_summary_dialog = None;
+                if let Some(id) = id {
+                    self.apply_manual_summary(&id, text);
+                }
+                true
+            }
+        }
+    }
+
+    /// Write a manually regenerated summary onto the instance and persist it.
+    fn apply_manual_summary(&mut self, id: &str, text: String) {
+        let now = chrono::Utc::now();
+        let display_id = self
+            .get_instance(id)
+            .and_then(|i| i.tool_session.as_ref().map(|ts| ts.display_id.clone()));
+        self.mutate_instance(id, |inst| {
+            if let Some(summary) = inst.tool_session_summary.as_mut() {
+                summary.text = text.clone();
+                summary.state = crate::session::SummaryState::Final;
+                summary.updated_at = Some(now);
+            } else if let Some(did) = &display_id {
+                inst.tool_session_summary = Some(crate::session::ToolSessionSummary {
+                    display_id: did.clone(),
+                    text: text.clone(),
+                    state: crate::session::SummaryState::Final,
+                    updated_at: Some(now),
+                });
+            }
+        });
+        if let Err(e) = self.save() {
+            tracing::error!("Failed to save after manual summary regenerate: {e}");
+        }
+    }
+
+    /// Whether the regenerate modal is mid-request, so the main loop keeps
+    /// repainting at the spinner frame rate while the user waits.
+    pub fn regenerate_summary_loading(&self) -> bool {
+        self.regenerate_summary_dialog
+            .as_ref()
+            .is_some_and(|d| d.is_loading())
     }
 
     /// Apply a single status update from the poller. Extracted from the
@@ -2911,6 +3093,7 @@ impl HomeView {
             || self.search_active
             || self.new_dialog.is_some()
             || self.confirm_dialog.is_some()
+            || self.regenerate_summary_dialog.is_some()
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()
@@ -2949,6 +3132,7 @@ impl HomeView {
             || self.search_active
             || self.new_dialog.is_some()
             || self.confirm_dialog.is_some()
+            || self.regenerate_summary_dialog.is_some()
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()

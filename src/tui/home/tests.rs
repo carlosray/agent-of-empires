@@ -12476,6 +12476,7 @@ mod archived_row_summary {
             display_id: "disp".to_string(),
             text: "Implemented the feature".to_string(),
             state: SummaryState::Final,
+            updated_at: None,
         });
         let (view, _temp) = make_view_with_instance(inst);
         let item = first_session_item(&view);
@@ -12483,6 +12484,121 @@ mod archived_row_summary {
         assert!(
             !text.contains("Implemented the feature"),
             "archived row must not show summary inline; got: {text:?}"
+        );
+    }
+}
+
+mod regenerate_summary {
+    use super::*;
+    use crate::session::{SummaryState, ToolSessionSummary};
+    use crate::tui::dialogs::RegenerateSummaryDialog;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// With no session selected, opening the dialog surfaces an info message
+    /// rather than a confirm modal.
+    #[test]
+    #[serial]
+    fn open_with_no_selection_shows_info() {
+        let env = create_test_env_empty();
+        let mut view = env.view;
+        assert!(view.selected_session.is_none());
+
+        view.open_regenerate_summary_dialog();
+
+        assert!(view.regenerate_summary_dialog.is_none());
+        assert!(view.info_dialog.is_some());
+    }
+
+    /// A successful LLM result is written onto the instance (text + Final +
+    /// fresh `updated_at`) and the modal closes.
+    #[test]
+    #[serial]
+    fn applies_summary_on_success_and_closes() {
+        let env = create_test_env_with_sessions(1);
+        let mut view = env.view;
+        let id = view.selected_session.clone().unwrap();
+
+        // Seed an existing summary so the update branch (not the create branch)
+        // runs, and so we can prove the text changed.
+        view.mutate_instance(&id, |inst| {
+            inst.tool_session_summary = Some(ToolSessionSummary {
+                display_id: "disp-1".to_string(),
+                text: "old summary".to_string(),
+                state: SummaryState::Final,
+                updated_at: None,
+            });
+        });
+
+        // Stand up a loading dialog with a primed result channel.
+        let (tx, rx) = mpsc::channel();
+        let mut dialog = RegenerateSummaryDialog::new(id.clone(), "session0".to_string(), None);
+        dialog.begin_loading(rx, Instant::now() + Duration::from_secs(60));
+        tx.send(Ok("a shiny new summary".to_string())).unwrap();
+        view.regenerate_summary_dialog = Some(dialog);
+
+        assert!(
+            view.poll_regenerate_summary(),
+            "poll should report a change"
+        );
+
+        assert!(
+            view.regenerate_summary_dialog.is_none(),
+            "modal closes after success"
+        );
+        let summary = view
+            .get_instance(&id)
+            .unwrap()
+            .tool_session_summary
+            .as_ref()
+            .unwrap();
+        assert_eq!(summary.text, "a shiny new summary");
+        assert_eq!(summary.state, SummaryState::Final);
+        assert!(
+            summary.updated_at.is_some(),
+            "manual regenerate must stamp updated_at"
+        );
+    }
+
+    /// An LLM failure keeps the modal open (in its error state) and leaves the
+    /// existing summary untouched.
+    #[test]
+    #[serial]
+    fn failure_keeps_modal_open_and_summary_unchanged() {
+        let env = create_test_env_with_sessions(1);
+        let mut view = env.view;
+        let id = view.selected_session.clone().unwrap();
+        view.mutate_instance(&id, |inst| {
+            inst.tool_session_summary = Some(ToolSessionSummary {
+                display_id: "disp-1".to_string(),
+                text: "keep me".to_string(),
+                state: SummaryState::Final,
+                updated_at: None,
+            });
+        });
+
+        let (tx, rx) = mpsc::channel();
+        let mut dialog = RegenerateSummaryDialog::new(id.clone(), "session0".to_string(), None);
+        dialog.begin_loading(rx, Instant::now() + Duration::from_secs(60));
+        tx.send(Err("endpoint returned 500".to_string())).unwrap();
+        view.regenerate_summary_dialog = Some(dialog);
+
+        assert!(
+            !view.poll_regenerate_summary(),
+            "a failure is not an instance change"
+        );
+        assert!(
+            view.regenerate_summary_dialog.is_some(),
+            "modal stays open to show the error"
+        );
+        assert_eq!(
+            view.get_instance(&id)
+                .unwrap()
+                .tool_session_summary
+                .as_ref()
+                .unwrap()
+                .text,
+            "keep me"
         );
     }
 }

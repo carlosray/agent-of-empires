@@ -647,6 +647,7 @@ impl HomeView {
         render_dialogs!(
             new_dialog,
             confirm_dialog,
+            regenerate_summary_dialog,
             unified_delete_dialog,
             group_delete_options_dialog,
             rename_dialog,
@@ -886,6 +887,7 @@ impl HomeView {
         self.show_help
             || self.new_dialog.is_some()
             || self.confirm_dialog.is_some()
+            || self.regenerate_summary_dialog.is_some()
             || self.unified_delete_dialog.is_some()
             || self.group_delete_options_dialog.is_some()
             || self.rename_dialog.is_some()

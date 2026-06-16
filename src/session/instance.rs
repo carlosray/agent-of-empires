@@ -344,6 +344,11 @@ pub struct ToolSessionSummary {
     pub display_id: String,
     pub text: String,
     pub state: SummaryState,
+    /// When the summary text was last written (extraction, background LLM
+    /// upgrade, or a manual regenerate). `None` for summaries persisted before
+    /// this field existed. Surfaced in the manual-regenerate confirm modal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

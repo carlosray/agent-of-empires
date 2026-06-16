@@ -61,6 +61,10 @@ pub enum ActionId {
     SortPicker,
     GroupBy,
     NextWaiting,
+    /// Manually regenerate the selected session's tool summary via the LLM.
+    /// Palette/context-menu only (no dedicated chord), so it has empty key
+    /// lists in [`BINDINGS`].
+    RegenerateSummary,
     /// Pin or unpin the selected project header (project view only). Pinning
     /// registers the repo so the project persists in the view without any
     /// sessions; unpinning removes the registry entry.
@@ -634,6 +638,28 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Palette/context-menu only: no dedicated chord (empty key lists), and
+    // `help: None` so it never appears in the footer hint bar or help overlay.
+    Binding {
+        id: ActionId::RegenerateSummary,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Regenerate session summary",
+            keywords: &[
+                "summary",
+                "regenerate",
+                "regen",
+                "llm",
+                "describe",
+                "refresh",
+            ],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
     Binding {
         id: ActionId::SortPicker,
         // Shift+O sorts in both modes; bare `o` only outside strict.
@@ -711,6 +737,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::TogglePreviewInfo => "toggle-preview-info",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
+        ActionId::RegenerateSummary => "regenerate-summary",
         ActionId::Help => "help",
         ActionId::NextWaiting => "next-waiting",
         ActionId::Quit => "quit",

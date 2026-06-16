@@ -1241,6 +1241,12 @@ impl App {
                 needs_full_refresh = true;
             }
 
+            // Land a completed manual summary regenerate (or its error state).
+            if self.home.poll_regenerate_summary() {
+                refresh_needed = true;
+                needs_full_refresh = true;
+            }
+
             if self.home.apply_deletion_results() {
                 refresh_needed = true;
                 needs_full_refresh = true;
@@ -1400,7 +1406,7 @@ impl App {
             // user can't see, which only adds load on top of the
             // already-busy preview refresh.
             if last_spinner_redraw.elapsed() >= SPINNER_REDRAW_INTERVAL
-                && self.home.has_animated_sessions()
+                && (self.home.has_animated_sessions() || self.home.regenerate_summary_loading())
                 && self.home.live_send.is_none()
             {
                 last_spinner_redraw = std::time::Instant::now();

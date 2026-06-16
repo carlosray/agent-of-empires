@@ -378,6 +378,13 @@ const PAGES = [
       "Show a one-line summary of what each agent session is about, extracted from tool artifacts and optionally upgraded by an LLM.",
   },
   {
+    source: "docs/fork-features/summary-regenerate.md",
+    dest: "docs/fork-features/summary-regenerate.md",
+    title: "Regenerate Session Summary",
+    description:
+      "Manually regenerate a session's summary from the command palette or context menu, with a confirm modal, loading spinner, and error handling.",
+  },
+  {
     source: "docs/telemetry.md",
     dest: "docs/telemetry.md",
     title: "Telemetry",
@@ -419,6 +426,7 @@ const URL_MAP = {
   "docs/fork-features/tool-session-tracking.md": "/docs/fork-features/tool-session-tracking/",
   "docs/fork-features/terminal-tab-title.md": "/docs/fork-features/terminal-tab-title/",
   "docs/fork-features/session-summary.md": "/docs/fork-features/session-summary/",
+  "docs/fork-features/summary-regenerate.md": "/docs/fork-features/summary-regenerate/",
   "docs/telemetry.md": "/docs/telemetry/",
   // Guides
   "docs/guides/shell-completions.md": "/guides/shell-completions/",
