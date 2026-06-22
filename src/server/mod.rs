@@ -2930,6 +2930,52 @@ async fn status_poll_loop(state: Arc<AppState>) {
 
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
 
+            // Drain poller observations into sessions.json so daemon-only
+            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
+            // Snapshot + spawn_blocking + reapply, never holding AppState
+            // across the flock or tmux exec, per storage.rs:46.
+            let snapshot = state.instances.read().await.clone();
+            let drain_state = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut snapshot = snapshot;
+                let outcome = crate::session::sync::drain_and_persist_session_ids(
+                    &mut snapshot,
+                    &drain_state.file_watch,
+                );
+                (outcome, snapshot)
+            })
+            .await
+            {
+                Ok((outcome, mutated)) if outcome.touched() => {
+                    // Reapply only for ids the helper actually touched, so a
+                    // peer that wrote `agent_session_id` (e.g. the restart-
+                    // completion path) on the live state during the
+                    // spawn_blocking window is not silently reverted.
+                    let touched: std::collections::HashSet<&str> = outcome
+                        .applied
+                        .iter()
+                        .chain(outcome.rolled_back.iter())
+                        .map(String::as_str)
+                        .collect();
+                    if !touched.is_empty() {
+                        let mut guard = state.instances.write().await;
+                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                                dst.agent_session_id = src.agent_session_id.clone();
+                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        target: "session.sync",
+                        "drain_and_persist task failed: {e}",
+                    );
+                }
+            }
+
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
                 &state,
