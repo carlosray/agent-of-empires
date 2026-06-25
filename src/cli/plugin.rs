@@ -132,6 +132,21 @@ fn run_info(id: &str) -> Result<()> {
     if !m.description.is_empty() {
         println!("  about:      {}", m.description);
     }
+    if !m.keybinds.is_empty() {
+        println!("  keybinds:");
+        for kb in &m.keybinds {
+            // A core binding on the same chord always wins; flag the conflict so
+            // the author knows the plugin keybind will never fire (#2094).
+            // An unparseable key is skipped by the TUI resolver, so flag it
+            // here rather than print it as if it were usable.
+            let note = match crate::tui::home::bindings::parse_chord(&kb.key) {
+                Some(c) if crate::tui::home::bindings::core_shadows(&c) => "  (shadowed by core)",
+                Some(_) => "",
+                None => "  (invalid key, ignored)",
+            };
+            println!("    {} -> {}{note}", kb.key, kb.command);
+        }
+    }
     Ok(())
 }
 

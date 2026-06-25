@@ -11,7 +11,8 @@ use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedSession;
 use crate::session::settings_schema::{
-    clear_path, strip_local_only, validate_patch, PatchRejection, Scope,
+    clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
+    validate_patch_with, PatchRejection, Scope,
 };
 
 // --- Agents ---
@@ -232,13 +233,16 @@ pub async fn update_settings(
     // or echoed-back patch keeps its safe leaves and silently drops the
     // local-only ones (#1692). They can never reach disk from the web.
     strip_local_only(&mut body);
-    // Validate every remaining leaf against the schema (single source of
-    // truth): unknown section/field -> 400, bad value -> 400. `PATCH
-    // /api/settings` is already elevation-gated by the auth middleware, so any
-    // field reaching here is treated as elevated.
-    if let Err(rej) = validate_patch(&body, Scope::Global, true) {
+    // Validate every remaining leaf against the runtime schema (core plus
+    // active-plugin `plugin:<id>` sections): unknown section/field -> 400, bad
+    // value -> 400. `PATCH /api/settings` is already elevation-gated by the
+    // auth middleware, so any field reaching here is treated as elevated.
+    if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
         return reject_response(rej);
     }
+    // Fold validated `plugin:<id>` sections into their on-disk storage path
+    // (`plugins.<id>.settings.*`) before the generic merge.
+    rewrite_plugin_sections(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load_or_warn();
@@ -300,7 +304,21 @@ pub async fn update_settings(
 /// secrets: descriptors are pure metadata (labels, widgets, validation, write
 /// policy), so this needs no elevation, only normal authentication.
 pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
-    Json(crate::session::settings_schema::schema())
+    Json(runtime_schema())
+}
+
+/// `GET /api/settings/resolved` returns every setting's effective value plus
+/// its provenance chain (user value > highest-priority plugin default > schema
+/// default for core; stored value > manifest default for plugin settings). The
+/// dashboard uses it to show where a value comes from. Pure metadata derived
+/// from the same schema the surfaces render, so only normal authentication.
+pub async fn get_settings_resolved() -> Json<Vec<crate::session::settings_schema::ResolvedSetting>>
+{
+    Json(
+        tokio::task::spawn_blocking(crate::session::settings_schema::resolve_all)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Body of `PATCH /api/theme`. Either field may be omitted to leave it
@@ -1566,6 +1584,14 @@ pub async fn get_profile_settings(
             obj.insert(
                 "logging".to_string(),
                 serde_json::to_value(&global.logging)?,
+            );
+            // Plugin settings live in the global config (global-only at Tier 0),
+            // not the profile override. Splice them in so the dashboard's plugin
+            // settings render their persisted values instead of reverting to the
+            // manifest default on every profile-view load (#2094).
+            obj.insert(
+                "plugins".to_string(),
+                serde_json::to_value(&global.plugins)?,
             );
         }
         Ok::<_, anyhow::Error>(val)
