@@ -130,6 +130,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "containers",
     "git",
     "migrations",
+    "plugin",
     "web",
     // `log` is the meta-target prefix for filter-swap audit events
     // (`log.runtime`). Without this, `log.runtime` would be dropped
@@ -168,6 +169,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "acp.supervisor",
     "acp.event_store",
     "acp.runner",
+    "plugin.host",
     "terminal.ws",
     "terminal.ws.bytes",
     "auth.token",
