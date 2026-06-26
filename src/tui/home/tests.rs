@@ -1527,6 +1527,88 @@ fn b_refresh_persists_branch_when_initially_unset() {
     );
 }
 
+/// The archived-session preview placeholder must surface the tool session
+/// summary (when tracking is on), the same way the stopped placeholder does.
+/// Regression: `render_archived_preview` previously omitted it.
+#[test]
+#[serial]
+fn archived_preview_shows_summary() {
+    use crate::session::{SummaryState, ToolSessionSummary};
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // Tracking defaults to false; the summary line is gated on it.
+    let mut config = Config::default();
+    config.session.tool_session_tracking = true;
+    save_config(&config).unwrap();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut instance = Instance::new("session0", "/tmp/archived-preview");
+    instance.tool = "claude".to_string();
+    instance.tool_session_summary = Some(ToolSessionSummary {
+        display_id: "disp-1".to_string(),
+        text: "Refactor the auth module".to_string(),
+        state: SummaryState::Final,
+        updated_at: None,
+    });
+    instance.archive(); // sets archived_at -> routes to render_archived_preview
+    let id = instance.id.clone();
+    assert!(instance.is_archived());
+    storage
+        .update(|i, _| {
+            i.push(instance);
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.archived_section_collapsed = false;
+    view.flat_items = view.build_flat_items();
+    view.select_session_by_id(&id);
+    view.view_mode = ViewMode::Structured;
+
+    let theme = load_theme("empire");
+    let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("Archived"),
+        "archived preview placeholder should render.\n{out}"
+    );
+    assert!(
+        out.contains("Summary:"),
+        "archived preview must show the Summary label.\n{out}"
+    );
+    assert!(
+        out.contains("Refactor the auth module"),
+        "archived preview must show the summary text.\n{out}"
+    );
+}
+
 #[test]
 #[serial]
 fn test_has_dialog_includes_info_dialog() {

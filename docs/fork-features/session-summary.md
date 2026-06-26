@@ -19,6 +19,8 @@ The label is dimmed; the text uses normal foreground color, matching the surroun
 
 Fully stopped sessions (tmux session gone) replace the preview with a "Stopped" placeholder; the summary line renders inside that placeholder too, so a stopped row still says what the session was about.
 
+Archived sessions (sunk with `z`) get their own "Archived" placeholder, and the summary line renders inside it as well, so an archived row still says what the session was about without unarchiving it.
+
 ## How Summaries Are Computed
 
 A summary is computed once per resolved tool session display ID and is never recomputed for the same ID. Once evaluated it persists on the instance record, so the summary survives AoE restarts and remains visible after the pane has died.
