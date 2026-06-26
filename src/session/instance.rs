@@ -1083,6 +1083,14 @@ impl Instance {
         if src.tool_session_probe.is_some() {
             self.tool_session_probe = src.tool_session_probe.clone();
         }
+        // The `B` branch-refresh is a TUI-only writer of `display_branch`;
+        // without carrying it here, `save()` would reconcile the TUI row onto
+        // the disk row and silently drop the refreshed branch. Conditional on
+        // `is_some()` (like `tool_session`) so the TUI persists a branch it has
+        // resolved but never nulls a peer-written value with its own `None`.
+        if src.display_branch.is_some() {
+            self.display_branch = src.display_branch.clone();
+        }
     }
 
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when

@@ -1450,6 +1450,83 @@ fn test_uppercase_b_on_changed_branch_opens_confirm_dialog() {
     assert_eq!(dialog.action(), "refresh_branch");
 }
 
+/// Regression: pressing `B` on a git-backed session whose `display_branch` is
+/// unset must resolve, confirm, and PERSIST the branch. Previously `save()`
+/// reconciled rows with `merge_from_tui`, which did not carry `display_branch`,
+/// so the refresh was silently dropped on disk and the row stayed blank.
+#[test]
+#[serial]
+fn b_refresh_persists_branch_when_initially_unset() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+    init_git_repo(&repo_path);
+
+    let mut config = Config::default();
+    config.worktree.show_branch_in_tui = true;
+    config.worktree.branch_command = Some("printf 'mybranch\\n'".to_string());
+    save_config(&config).unwrap();
+
+    let storage = Storage::new_unwatched("test").unwrap();
+    let mut instance = Instance::new("repo", repo_path.to_str().unwrap());
+    instance.display_branch = None;
+    let id = instance.id.clone();
+    storage
+        .update(|i, _| {
+            i.push(instance);
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // B resolves "mybranch" and opens the confirm ("Old: (not set) -> New: ...").
+    view.handle_key(key(KeyCode::Char('B')), None);
+    assert_eq!(
+        view.confirm_dialog.as_ref().map(|d| d.action()),
+        Some("refresh_branch"),
+        "B should open the refresh confirm dialog"
+    );
+
+    // Confirm.
+    view.handle_key(key(KeyCode::Char('y')), None);
+
+    // Must be persisted to disk (the bug: save() dropped it).
+    let disk = Storage::new_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap()
+        .0;
+    let disk_branch = disk
+        .iter()
+        .find(|i| i.id == id)
+        .and_then(|i| i.display_branch.clone());
+    assert_eq!(
+        disk_branch.as_deref(),
+        Some("mybranch"),
+        "B-refresh must persist display_branch to disk"
+    );
+
+    // And live in the view.
+    assert_eq!(
+        view.get_instance(&id)
+            .and_then(|i| i.display_branch.clone())
+            .as_deref(),
+        Some("mybranch"),
+        "B-refresh must keep display_branch in the in-memory mirror"
+    );
+}
+
 #[test]
 #[serial]
 fn test_has_dialog_includes_info_dialog() {
