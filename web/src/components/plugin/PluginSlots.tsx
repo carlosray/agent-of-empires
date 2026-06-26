@@ -2,27 +2,18 @@
 // typed display state; these components draw it. No plugin code runs here.
 // Each reads the shared snapshot via context and the pure selectors in
 // `pluginUi.ts`. Slots shipped here: status-bar, row-badge, row-column, card,
-// detail-panel, detail-badge. Notifications surface as toasts via the hook;
+// pane, detail-badge. Notifications surface as toasts via the hook;
 // sort-key and filter-facet are deferred (see #2366 follow-ups).
 
-import { createElement } from "react";
-import {
-  CircleAlert,
-  CircleCheck,
-  CircleDot,
-  Clock,
-  GitMerge,
-  GitPullRequestArrow,
-  GitPullRequestClosed,
-  GitPullRequestDraft,
-  type LucideIcon,
-} from "lucide-react";
+import { createElement, useState } from "react";
 
+import { invokePluginAction } from "../../lib/api";
 import { usePluginUiEntries } from "../../lib/pluginUiContext";
 import {
   entryText,
   entryTone,
   globalEntries,
+  lucideIcon,
   payloadStr,
   sessionEntries,
   toneClasses,
@@ -30,24 +21,6 @@ import {
   validTone,
 } from "../../lib/pluginUi";
 import type { PluginUiEntry, PluginUiTone } from "../../lib/api";
-
-// Plugins name an icon by its lucide kebab name. The set is an explicit
-// allowlist, not the whole lucide barrel: that keeps the bundle small and means
-// a plugin can never name an arbitrary import. An unknown name renders nothing.
-const ICONS: Record<string, LucideIcon> = {
-  "git-pull-request-arrow": GitPullRequestArrow,
-  "git-pull-request-draft": GitPullRequestDraft,
-  "git-pull-request-closed": GitPullRequestClosed,
-  "git-merge": GitMerge,
-  "circle-alert": CircleAlert,
-  "circle-check": CircleCheck,
-  "circle-dot": CircleDot,
-  clock: Clock,
-};
-
-function lucideIcon(name: string | undefined): LucideIcon | undefined {
-  return name ? ICONS[name] : undefined;
-}
 
 // Plugin strings are untrusted: only follow http/https hrefs, never
 // javascript:/data: and friends. Returns undefined for anything else, so the
@@ -94,7 +67,11 @@ function BadgeChip({
   const iconComp = lucideIcon(icon);
   if (!iconComp && !text) return null;
   const safe = safeHref(href);
-  const className = `inline-flex max-w-48 min-w-0 items-center gap-1 truncate font-mono text-[11px] px-1.5 py-0.5 rounded-full ${toneClasses(tone)}`;
+  // Truncation is only for text badges; an icon-only badge must size to its
+  // icon. Without this guard `truncate` (overflow-hidden) + `min-w-0` let the
+  // row's flex squeeze the chip and clip the icon (it overflowed to the right).
+  const fit = text ? "max-w-48 min-w-0 truncate" : "shrink-0";
+  const className = `inline-flex items-center gap-1 font-mono text-[11px] px-1.5 py-0.5 rounded-full ${fit} ${toneClasses(tone)}`;
   const inner = (
     <>
       {iconComp && createElement(iconComp, { className: "size-3 shrink-0", "aria-hidden": true })}
@@ -287,7 +264,40 @@ function BlockRow({ block }: { block: Record<string, unknown> }) {
   );
 }
 
-/** Render one detail-panel block. The block vocabulary is forward-compatible:
+/** An `action` pane block: a button that forwards a worker method (named by the
+ *  plugin) to that plugin's worker. Fire-and-forget; the worker re-pushes its
+ *  UI state, which the next poll renders. Disabled briefly so a double-click
+ *  does not double-fire. An icon is optional. */
+function BlockAction({ block, pluginId }: { block: Record<string, unknown>; pluginId: string }) {
+  const label = str(block, "label");
+  const method = str(block, "method");
+  const iconComp = lucideIcon(str(block, "icon"));
+  const [busy, setBusy] = useState(false);
+  if (!label || !method) return null;
+  const onClick = async () => {
+    if (busy) return;
+    setBusy(true);
+    try {
+      await invokePluginAction(pluginId, method);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      data-testid="plugin-pane-action"
+      className="self-start inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs cursor-pointer bg-surface-700/50 text-text-secondary hover:text-text-primary hover:bg-surface-700 disabled:opacity-50 disabled:cursor-default transition-colors"
+    >
+      {iconComp && createElement(iconComp, { className: "size-3.5", "aria-hidden": true })}
+      {label}
+    </button>
+  );
+}
+
+/** Render one pane block. The block vocabulary is forward-compatible:
  *  an unknown `kind` (or a known kind missing its required field) renders
  *  nothing rather than throwing, so a newer plugin can push kinds an older host
  *  has never heard of. */
@@ -305,6 +315,8 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
     }
     case "divider":
       return <hr className="border-surface-700/60" />;
+    case "action":
+      return <BlockAction block={block} pluginId={pluginId} />;
     case "section": {
       const title = str(block, "title");
       const children = Array.isArray(block.children) ? block.children.filter(isObject) : [];
@@ -323,39 +335,28 @@ function DetailBlock({ block, pluginId }: { block: Record<string, unknown>; plug
   }
 }
 
-/** detail-panel: per-session panels in the session detail view. An entry is
- *  either a `blocks` list (the flexible, forward-compatible pane) or the simple
- *  `{ title, body }` form. */
-export function PluginDetailPanels({ sessionId }: { sessionId: string }) {
-  const entries = sessionEntries(usePluginUiEntries(), "detail-panel", sessionId);
-  if (entries.length === 0) return null;
+/** pane: the body of one dockable plugin pane. An entry is either a `blocks`
+ *  list (the flexible, forward-compatible form) or the simple `{ title, body }`
+ *  form. The dock supplies the frame (title bar, move, close) and the
+ *  `default_location`; this renders only the scrollable content. */
+export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
+  const blocks = objectList(entry.payload, "blocks");
+  const title = payloadStr(entry, "title");
+  const body = payloadStr(entry, "body");
   return (
-    <div className="flex flex-col gap-2" data-testid="plugin-detail-panels">
-      {entries.map((e) => {
-        const blocks = objectList(e.payload, "blocks");
-        const title = payloadStr(e, "title");
-        const body = payloadStr(e, "body");
-        return (
-          <section
-            key={`${e.plugin_id}:${e.id}`}
-            className="rounded-lg p-3 ring-1 ring-surface-700/60 bg-surface-800/40"
-            data-plugin-id={e.plugin_id}
-          >
-            {blocks ? (
-              <div className="flex flex-col gap-1.5">
-                {blocks.map((b, i) => (
-                  <DetailBlock key={i} block={b} pluginId={e.plugin_id} />
-                ))}
-              </div>
-            ) : (
-              <>
-                {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
-                {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
-              </>
-            )}
-          </section>
-        );
-      })}
+    <div className="flex-1 min-h-0 overflow-auto p-3" data-testid="plugin-pane-body" data-plugin-id={entry.plugin_id}>
+      {blocks ? (
+        <div className="flex flex-col gap-1.5">
+          {blocks.map((b, i) => (
+            <DetailBlock key={i} block={b} pluginId={entry.plugin_id} />
+          ))}
+        </div>
+      ) : (
+        <>
+          {title && <div className="font-semibold text-sm text-text-primary">{title}</div>}
+          {body && <div className="mt-1 text-xs text-text-secondary whitespace-pre-wrap">{body}</div>}
+        </>
+      )}
     </div>
   );
 }

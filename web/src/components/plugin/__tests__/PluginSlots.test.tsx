@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { PluginUiEntry } from "../../../lib/api";
-import { PluginCards, PluginDetailPanels, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
+import { PluginCards, PluginPaneBody, PluginRowBadges, PluginStatusBarSegments } from "../PluginSlots";
 
 // The slot components read entries from context; mock that hook so each test
 // drives a fixed snapshot.
@@ -11,6 +11,10 @@ const { entriesRef } = vi.hoisted(() => ({ entriesRef: { current: [] as PluginUi
 vi.mock("../../../lib/pluginUiContext", () => ({
   usePluginUiEntries: () => entriesRef.current,
 }));
+
+// The action block forwards to the worker via this; stub it.
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn(async () => true) }));
+vi.mock("../../../lib/api", () => ({ invokePluginAction: invokeMock }));
 
 function set(entries: PluginUiEntry[]) {
   entriesRef.current = entries;
@@ -37,7 +41,7 @@ describe("plugin slot renderers", () => {
     expect(screen.queryByText("other")).toBeNull();
   });
 
-  it("row-badge with href renders a clickable link with a lucide icon", () => {
+  it("row-badge with href renders a clickable link with a lucide icon", async () => {
     set([
       {
         plugin_id: "acme.kit",
@@ -56,8 +60,8 @@ describe("plugin slot renderers", () => {
     expect(link.getAttribute("href")).toBe("https://github.com/o/r/pull/12");
     expect(link.getAttribute("target")).toBe("_blank");
     expect(link.getAttribute("rel")).toContain("noopener");
-    // The lucide icon renders as an inline svg.
-    expect(container.querySelector("svg")).toBeTruthy();
+    // The lucide icon lazy-loads (DynamicIcon) and renders as an inline svg.
+    await waitFor(() => expect(container.querySelector("svg")).toBeTruthy());
   });
 
   it("row-badge with an unknown icon name renders text and no svg", () => {
@@ -82,22 +86,47 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("92%")).toBeTruthy();
   });
 
-  it("detail-panel renders for its session", () => {
-    set([
-      {
-        plugin_id: "acme.kit",
-        slot: "detail-panel",
-        id: "p",
-        session_id: "s1",
-        payload: { title: "Logs", body: "tail..." },
-      },
-    ]);
-    render(<PluginDetailPanels sessionId="s1" />);
+  it("pane action button forwards the named worker method", async () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { title: "GitHub", blocks: [{ kind: "action", label: "Refresh", method: "github.refresh" }] },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    const btn = screen.getByTestId("plugin-pane-action");
+    expect(btn.textContent).toContain("Refresh");
+    fireEvent.click(btn);
+    await waitFor(() => expect(invokeMock).toHaveBeenCalledWith("acme.kit", "github.refresh"));
+  });
+
+  it("pane action block without a method renders nothing", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { blocks: [{ kind: "action", label: "Refresh" }] },
+    };
+    render(<PluginPaneBody entry={entry} />);
+    expect(screen.queryByTestId("plugin-pane-action")).toBeNull();
+  });
+
+  it("pane renders its title/body", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: { title: "Logs", body: "tail..." },
+    };
+    render(<PluginPaneBody entry={entry} />);
     expect(screen.getByText("Logs")).toBeTruthy();
     expect(screen.getByText("tail...")).toBeTruthy();
   });
 
-  it("row-badge items render one clickable icon per item", () => {
+  it("row-badge items render one clickable icon per item", async () => {
     set([
       {
         plugin_id: "acme.kit",
@@ -117,9 +146,15 @@ describe("plugin slot renderers", () => {
     expect(links).toHaveLength(2);
     expect(links[0]!.getAttribute("href")).toBe("https://x/pr/1");
     expect(links[1]!.getAttribute("rel")).toContain("noopener");
-    expect(container.querySelectorAll("svg")).toHaveLength(2);
+    await waitFor(() => expect(container.querySelectorAll("svg")).toHaveLength(2));
     // Icon-only links must carry an accessible name from the tooltip.
     expect(screen.getByRole("link", { name: "PR #1" })).toBeTruthy();
+    // Icon-only badges size to the icon: no text truncation (which clipped the
+    // icon), and shrink-0 so the row's flex cannot squeeze them.
+    for (const link of links) {
+      expect(link.className).not.toContain("truncate");
+      expect(link.className).toContain("shrink-0");
+    }
   });
 
   it("row-badge empty items clears the row (renders nothing)", () => {
@@ -143,33 +178,31 @@ describe("plugin slot renderers", () => {
     expect(screen.getByText("evil")).toBeTruthy();
   });
 
-  it("detail-panel blocks render heading, row, note, divider and skip unknown kinds", () => {
-    set([
-      {
-        plugin_id: "acme.kit",
-        slot: "detail-panel",
-        id: "gh",
-        session_id: "s1",
-        payload: {
-          blocks: [
-            { kind: "heading", text: "GitHub" },
-            {
-              kind: "row",
-              icon: "git-pull-request-arrow",
-              tone: "success",
-              label: "nexus",
-              value: "PR #12",
-              sublabel: "o/nexus",
-              href: "https://github.com/o/nexus/pull/12",
-            },
-            { kind: "note", text: "3 repos have no open PR", tone: "neutral" },
-            { kind: "divider" },
-            { kind: "some-future-kind", payload: { nested: true } },
-          ],
-        },
+  it("pane blocks render heading, row, note, divider and skip unknown kinds", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.kit",
+      slot: "pane",
+      id: "gh",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          { kind: "heading", text: "GitHub" },
+          {
+            kind: "row",
+            icon: "git-pull-request-arrow",
+            tone: "success",
+            label: "nexus",
+            value: "PR #12",
+            sublabel: "o/nexus",
+            href: "https://github.com/o/nexus/pull/12",
+          },
+          { kind: "note", text: "3 repos have no open PR", tone: "neutral" },
+          { kind: "divider" },
+          { kind: "some-future-kind", payload: { nested: true } },
+        ],
       },
-    ]);
-    const { container } = render(<PluginDetailPanels sessionId="s1" />);
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
     expect(screen.getByText("GitHub")).toBeTruthy();
     expect(screen.getByText("nexus")).toBeTruthy();
     expect(screen.getByText("3 repos have no open PR")).toBeTruthy();
