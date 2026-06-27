@@ -3181,12 +3181,29 @@ impl HomeView {
                 .filter(|i| i.source_profile == data.profile)
                 .map(|i| i.title.as_str())
                 .collect();
-            data.title = crate::session::builder::resolve_title(
+            let existing_branches: Vec<&str> = self
+                .instances()
+                .iter()
+                .filter(|i| i.source_profile == data.profile)
+                .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
+                .collect();
+            let taken_branches = crate::session::builder::collect_taken_branches_for_derived_dedupe(
+                &existing_branches,
+                &data.path,
+                &data.extra_repo_paths,
+                data.worktree_enabled,
+                data.create_new_branch,
+                data.scratch,
+            );
+            if let Ok(title) = crate::session::builder::resolve_title(
                 &data.title,
                 data.worktree_branch.as_deref(),
                 data.worktree_enabled,
                 &existing_titles,
-            );
+                &taken_branches,
+            ) {
+                data.title = title;
+            }
         }
         let stub_title = data.title.clone();
         let mut stub = Instance::new(&stub_title, &data.path);
