@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::approvals::{Approval, ApprovalDecision, Nonce};
+use super::elicitations::{Elicitation, ElicitationAnswer, ElicitationOutcome};
 
 /// Identifier for a structured view session. Distinct from `SessionId` in
 /// `src/session/` because structured view sessions are a separate `SessionBackend`.
@@ -318,26 +319,108 @@ pub enum StartupErrorDetail {
         installed: String,
         required: String,
         install_command: String,
+        /// True when the web "Update & restart" action can install this
+        /// agent via `npm install -g`; false means the manual hint only.
+        #[serde(default)]
+        auto_install: bool,
     },
     MissingAgentInfo {
         expected_package: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     MismatchedAgentName {
         expected: String,
         received: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     UnparseableAgentVersion {
         package_name: String,
         raw_version: String,
         required: String,
         install_command: String,
+        #[serde(default)]
+        auto_install: bool,
     },
     UnsupportedProtocolVersion {
         expected: String,
         received: String,
     },
+}
+
+/// Lifecycle status of an async background sub-agent. `Completed` is the
+/// only "finished cleanly" state and is set ONLY on an `end_turn` in the
+/// transcript; idle/missing-file/parse states are reported honestly
+/// rather than faked as done. See the background-agent tailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundAgentStatus {
+    /// Transcript is being written; the agent is working.
+    Running,
+    /// No transcript growth for the idle window; the agent may be
+    /// blocked, rate-limited, or wedged. Never flips to `Completed`.
+    Stalled,
+    /// Saw the terminal `end_turn` assistant message. The work is done.
+    Completed,
+    /// The parent session ended before the agent finished; we stopped
+    /// tracking it. Not a success, not a failure.
+    Detached,
+    /// Transcript could not be read or its format was unrecognized.
+    Error,
+}
+
+/// One tool call a background sub-agent made, parsed from its transcript
+/// so the panel can list individual reads / bashes / greps like the main
+/// output. Mirrors the web wire type in `web/src/lib/acpTypes.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundAgentTool {
+    /// Tool name, e.g. "Read", "Bash", "Grep".
+    pub name: String,
+    /// Short label from the tool input (command / file path / pattern).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Outcome from the matching tool_result: `None` while running,
+    /// `Some(true)` succeeded, `Some(false)` errored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ok: Option<bool>,
+}
+
+/// One async background sub-agent, built up from `BackgroundAgent*`
+/// events. Mirrors the web wire type in `web/src/lib/acpTypes.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundAgentRecord {
+    pub agent_id: String,
+    /// The parent `Task` tool call that launched this agent, so the
+    /// inline tool card can link to the panel entry.
+    pub tool_call_id: String,
+    pub description: String,
+    pub prompt: String,
+    pub model: String,
+    pub status: BackgroundAgentStatus,
+    pub started_at: DateTime<Utc>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<DateTime<Utc>>,
+    /// Number of tool calls the agent has made so far (from its transcript).
+    #[serde(default)]
+    pub tool_count: u32,
+    /// The agent's individual tool calls, in order, so the panel can show
+    /// each read / bash / grep like the main output.
+    #[serde(default)]
+    pub tools: Vec<BackgroundAgentTool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_tool: Option<String>,
+    /// Short preview of the agent's most recent assistant text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_text: Option<String>,
+    /// Final result text (the terminal assistant message), set on completion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
+    /// Non-fatal note shown in the panel, e.g. transcript format not recognized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +434,11 @@ pub struct AcpState {
     pub todos: Vec<Todo>,
     pub in_flight_tool: Option<ToolCall>,
     pub pending_approvals: Vec<Approval>,
+    /// Pending `AskUserQuestion` elicitations awaiting a user answer.
+    /// Parallel to `pending_approvals`; cleared on resolution, session
+    /// reset, or clear. See `Event::ElicitationRequested`.
+    #[serde(default)]
+    pub pending_elicitations: Vec<Elicitation>,
     pub recent_diffs: Vec<DiffPreview>,
     pub thinking: Option<ThinkingSignal>,
     pub rate_limit: Option<RateLimitInfo>,
@@ -390,6 +478,13 @@ pub struct AcpState {
     /// on `AgentSwitched`. Mirrors `ModeSwitchFailed` (#1233).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_option_switch_failed: Option<ConfigOptionSwitchFailure>,
+    /// Async sub-agents (Claude `Task` with isAsync) launched this
+    /// session. The parent ACP stream only carries each launch; the
+    /// daemon tails each agent's on-disk transcript and emits
+    /// `BackgroundAgent*` events that build this list. Drives the web
+    /// "Background agents" panel and the inline Task-card linkage.
+    #[serde(default)]
+    pub background_agents: Vec<BackgroundAgentRecord>,
 
     pub last_seq: u64,
     pub updated_at: DateTime<Utc>,
@@ -410,6 +505,7 @@ impl AcpState {
             todos: Vec::new(),
             in_flight_tool: None,
             pending_approvals: Vec::new(),
+            pending_elicitations: Vec::new(),
             recent_diffs: Vec::new(),
             thinking: None,
             rate_limit: None,
@@ -419,6 +515,7 @@ impl AcpState {
             startup_error: None,
             config_options: Vec::new(),
             config_option_switch_failed: None,
+            background_agents: Vec::new(),
             last_seq: 0,
             updated_at: Utc::now(),
         }
@@ -517,6 +614,13 @@ pub enum Event {
     TodoListUpdated {
         todos: Vec<Todo>,
     },
+    /// Legacy event for agent-pushed ACP `session_info_update` titles. Kept so
+    /// persisted event logs from versions that emitted it still deserialize.
+    /// New Claude ACP title pushes are ignored; AoE owns automatic renaming via
+    /// `session::smart_rename`.
+    SessionTitleSuggested {
+        title: String,
+    },
     ToolCallStarted {
         tool_call: ToolCall,
     },
@@ -550,6 +654,18 @@ pub enum Event {
         /// events stay imprecise; new events are accurate end-to-end.
         #[serde(default = "chrono::Utc::now")]
         completed_at: DateTime<Utc>,
+        /// True when this completion is the synchronous launch of an
+        /// asynchronous sub-agent (Claude's `Task` tool with
+        /// `isAsync: true`): the visible tool call completes immediately
+        /// with the SDK marker `Async agent launched successfully` while
+        /// the real sub-agent runs off-protocol and never reports back on
+        /// this stream. Renderers use this to draw a neutral "runs in
+        /// background" sub-agent card instead of a finished tool card, and
+        /// to suppress the marker body (which carries an internal agent id
+        /// the SDK tells us not to surface). Defaults false for events
+        /// persisted before this field landed. See `OffProtocolWorkKind`.
+        #[serde(default)]
+        async_subagent: bool,
     },
     /// Streaming tool output. Some agents emit `ToolCallUpdate` notifications
     /// with `status != Completed` but populated `fields.content` to stream
@@ -601,6 +717,25 @@ pub enum Event {
     ApprovalResolved {
         nonce: Nonce,
         decision: ApprovalDecision,
+    },
+    /// Agent asked the user a structured question (the ACP
+    /// `AskUserQuestion` tool, surfaced as a form-mode
+    /// `elicitation/create`). The card stays until an
+    /// `ElicitationResolved` with the same nonce arrives.
+    ElicitationRequested {
+        elicitation: Elicitation,
+    },
+    /// An elicitation was answered, skipped, cancelled, or torn down. The
+    /// reducer drops the matching pending card. `outcome` records how it
+    /// ended for replay/debugging. `answers` carries the user's submitted
+    /// answers (display-ready, in form order) so the transcript can show
+    /// what was picked after the card closes; empty for skip/cancel/teardown
+    /// and for events stored before #2209.
+    ElicitationResolved {
+        nonce: Nonce,
+        outcome: ElicitationOutcome,
+        #[serde(default)]
+        answers: Vec<ElicitationAnswer>,
     },
     DiffEmitted {
         diff: DiffPreview,
@@ -689,6 +824,61 @@ pub enum Event {
     /// Carries the raw JSON so UI clients can render best-effort.
     RawAgentUpdate {
         payload: serde_json::Value,
+    },
+    /// An async sub-agent (Claude `Task` with isAsync) was launched. The
+    /// parent ACP stream carries only this launch; the daemon then tails
+    /// the agent's on-disk transcript and emits `BackgroundAgentProgress`
+    /// / `BackgroundAgentCompleted`. See the background-agent tailer.
+    BackgroundAgentLaunched {
+        agent_id: String,
+        tool_call_id: String,
+        description: String,
+        prompt: String,
+        model: String,
+        /// Local transcript path the daemon tails. Never serialized (a
+        /// host fs path, useless and mildly sensitive to clients); read
+        /// by the notification handler to spawn the tailer, then dropped.
+        #[serde(default, skip_serializing)]
+        output_file: String,
+        started_at: DateTime<Utc>,
+    },
+    /// Throttled snapshot of a running background sub-agent's transcript
+    /// (tool count + last action). Persisted so a mid-run reload still
+    /// sees in-flight agents, but coalesced so the event log stays bounded.
+    BackgroundAgentProgress {
+        agent_id: String,
+        status: BackgroundAgentStatus,
+        tool_count: u32,
+        /// Full ordered tool list so far (coalesced into the snapshot, not
+        /// one event per tool). Replaces the record's list wholesale.
+        #[serde(default)]
+        tools: Vec<BackgroundAgentTool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_tool: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        last_text: Option<String>,
+        at: DateTime<Utc>,
+    },
+    /// Terminal state for a background sub-agent: `Completed` (saw
+    /// `end_turn`), `Stalled`, `Detached`, or `Error`.
+    BackgroundAgentCompleted {
+        agent_id: String,
+        status: BackgroundAgentStatus,
+        /// Final ordered tool list. Replaces the record's list.
+        #[serde(default)]
+        tools: Vec<BackgroundAgentTool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        warning: Option<String>,
+        ended_at: DateTime<Utc>,
+    },
+    /// A prompt reached the adapter, but the adapter-side runtime failed
+    /// before any assistant transcript or tool event was emitted. Used
+    /// for recoverable turn failures, distinct from startup/handshake
+    /// errors that block the whole structured-view session. See #2426.
+    PromptRuntimeError {
+        message: String,
     },
     /// An assistant message chunk (text). In ACP this comes as an
     /// `agent_message_chunk` session update.
@@ -821,6 +1011,21 @@ pub enum Event {
         at: DateTime<Utc>,
         reason: Option<String>,
     },
+    /// The agent armed the Claude SDK's `Monitor` tool: a background watch
+    /// that streams events and re-invokes the agent off-protocol. Unlike
+    /// `ScheduleWakeup` it has no fixed wake time, so there is no countdown,
+    /// just a "monitoring" badge. The tool call is fire-and-forget (it
+    /// completes immediately while the watch keeps running), so the turn
+    /// ends and the session sits Idle while the monitor is still armed.
+    /// Emitted from `acp_client::map_update_to_events` so the sidebar can
+    /// flag the session without subscribing to the structured view WS.
+    /// Considered active until the next `UserPromptSent`: a monitor firing
+    /// re-invokes the agent with activity but never a `UserPromptSent`, so
+    /// the badge persists across re-fires and clears only when the user
+    /// takes over.
+    MonitorArmed {
+        description: Option<String>,
+    },
     /// User invoked `/clear` (claude-agent-acp's reset-conversation
     /// slash command). The adapter rotates its internal session so the
     /// model truly forgets earlier turns; aoe's transcript is now a
@@ -863,6 +1068,9 @@ impl AcpState {
         match event {
             Event::PlanUpdated { plan } => self.current_plan = Some(plan),
             Event::TodoListUpdated { todos } => self.todos = todos,
+            // Session title lives on `Instance`, not `AcpState`; the daemon's
+            // `acp_event_listener` applies it. No transcript state to mutate.
+            Event::SessionTitleSuggested { .. } => {}
             Event::ToolCallStarted { tool_call } => self.in_flight_tool = Some(tool_call),
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
@@ -910,6 +1118,15 @@ impl AcpState {
                 if resolved.resolved.is_some() {
                     return Err(StateError::ApprovalAlreadyResolved(nonce.clone()));
                 }
+            }
+            Event::ElicitationRequested { elicitation } => {
+                self.pending_elicitations.push(elicitation)
+            }
+            // Lenient on the nonce: a resolved/torn-down elicitation can be
+            // re-broadcast (cancel-on-teardown racing a user POST), so a
+            // missing nonce is a harmless no-op rather than a hard error.
+            Event::ElicitationResolved { ref nonce, .. } => {
+                self.pending_elicitations.retain(|e| e.nonce != *nonce);
             }
             Event::DiffEmitted { diff } => {
                 self.recent_diffs.push(diff);
@@ -975,6 +1192,7 @@ impl AcpState {
             // clients see them in the replay buffer and know the session
             // made progress.
             Event::RawAgentUpdate { .. } => {}
+            Event::PromptRuntimeError { .. } => {}
             Event::AgentMessageChunk { .. } => {}
             // No in-memory mutation: the turn is still active (turnActive
             // stays true until a real `Stopped`). The reducer/UI derive the
@@ -1021,6 +1239,7 @@ impl AcpState {
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
+                self.pending_elicitations = Vec::new();
             }
             Event::ConversationCompacted => {
                 // /compact replaces the model's context with a summary
@@ -1036,6 +1255,10 @@ impl AcpState {
             // in-memory mirror needed yet. Bumps seq so the WS replay
             // surfaces it to live clients.
             Event::WakeupScheduled { .. } => {}
+            // Like WakeupScheduled, the "monitor armed" state lives in the
+            // event log (queried by the REST endpoint); no in-memory mirror.
+            // Bumps seq so the WS replay surfaces it to live clients.
+            Event::MonitorArmed { .. } => {}
             // Rejected follow-up prompt while another prompt was in flight.
             // No durable in-memory mutation; the reducer surfaces a Retry
             // pill from the broadcast frame and the event_store entry
@@ -1054,6 +1277,7 @@ impl AcpState {
                 self.in_flight_tool = None;
                 self.thinking = None;
                 self.pending_approvals = Vec::new();
+                self.pending_elicitations = Vec::new();
                 self.usage = None;
                 self.available_commands = Vec::new();
                 self.current_plan = None;
@@ -1069,6 +1293,104 @@ impl AcpState {
                     reason,
                     switched_at: Utc::now(),
                 });
+            }
+            Event::BackgroundAgentLaunched {
+                agent_id,
+                tool_call_id,
+                description,
+                prompt,
+                model,
+                output_file: _,
+                started_at,
+            } => {
+                let record = BackgroundAgentRecord {
+                    agent_id: agent_id.clone(),
+                    tool_call_id,
+                    description,
+                    prompt,
+                    model,
+                    status: BackgroundAgentStatus::Running,
+                    started_at,
+                    ended_at: None,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    last_tool: None,
+                    last_text: None,
+                    result: None,
+                    warning: None,
+                };
+                // Idempotent on replay / duplicate launch: replace any
+                // existing record for the same agent id.
+                if let Some(existing) = self
+                    .background_agents
+                    .iter_mut()
+                    .find(|a| a.agent_id == agent_id)
+                {
+                    *existing = record;
+                } else {
+                    self.background_agents.push(record);
+                }
+            }
+            Event::BackgroundAgentProgress {
+                agent_id,
+                status,
+                tool_count,
+                tools,
+                last_tool,
+                last_text,
+                ..
+            } => {
+                if let Some(a) = self
+                    .background_agents
+                    .iter_mut()
+                    .find(|a| a.agent_id == agent_id)
+                {
+                    // A terminal record never reopens to running.
+                    if !matches!(
+                        a.status,
+                        BackgroundAgentStatus::Completed
+                            | BackgroundAgentStatus::Detached
+                            | BackgroundAgentStatus::Error
+                    ) {
+                        a.status = status;
+                        a.tool_count = tool_count;
+                        if !tools.is_empty() {
+                            a.tools = tools;
+                        }
+                        if last_tool.is_some() {
+                            a.last_tool = last_tool;
+                        }
+                        if last_text.is_some() {
+                            a.last_text = last_text;
+                        }
+                    }
+                }
+            }
+            Event::BackgroundAgentCompleted {
+                agent_id,
+                status,
+                tools,
+                result,
+                warning,
+                ended_at,
+            } => {
+                if let Some(a) = self
+                    .background_agents
+                    .iter_mut()
+                    .find(|a| a.agent_id == agent_id)
+                {
+                    a.status = status;
+                    a.ended_at = Some(ended_at);
+                    if !tools.is_empty() {
+                        a.tools = tools;
+                    }
+                    if result.is_some() {
+                        a.result = result;
+                    }
+                    if warning.is_some() {
+                        a.warning = warning;
+                    }
+                }
             }
         }
         self.last_seq = self.last_seq.saturating_add(1);
@@ -1087,6 +1409,78 @@ mod tests {
             AgentName("aoe-agent".into()),
             Some("claude-opus-4-7".into()),
         )
+    }
+
+    #[test]
+    fn background_agent_lifecycle_builds_record() {
+        let mut s = fresh_state();
+        s.apply_event(Event::BackgroundAgentLaunched {
+            agent_id: "a1".into(),
+            tool_call_id: "tc1".into(),
+            description: "map backend".into(),
+            prompt: "do the thing".into(),
+            model: "claude-opus-4-8".into(),
+            output_file: "/tmp/a1.output".into(),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(s.background_agents.len(), 1);
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Running
+        );
+        assert_eq!(s.background_agents[0].tool_call_id, "tc1");
+
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 3,
+            tools: vec![BackgroundAgentTool {
+                name: "Read".into(),
+                title: Some("x.rs".into()),
+                ok: Some(true),
+            }],
+            last_tool: Some("Read".into()),
+            last_text: Some("scanning".into()),
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(s.background_agents[0].tool_count, 3);
+        assert_eq!(s.background_agents[0].last_tool.as_deref(), Some("Read"));
+        assert_eq!(s.background_agents[0].tools.len(), 1);
+        assert_eq!(s.background_agents[0].tools[0].name, "Read");
+
+        s.apply_event(Event::BackgroundAgentCompleted {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Completed,
+            tools: vec![],
+            result: Some("done".into()),
+            warning: None,
+            ended_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Completed
+        );
+        assert_eq!(s.background_agents[0].result.as_deref(), Some("done"));
+
+        // A late progress event must not reopen a completed record.
+        s.apply_event(Event::BackgroundAgentProgress {
+            agent_id: "a1".into(),
+            status: BackgroundAgentStatus::Running,
+            tool_count: 9,
+            tools: vec![],
+            last_tool: None,
+            last_text: None,
+            at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(
+            s.background_agents[0].status,
+            BackgroundAgentStatus::Completed
+        );
+        assert_eq!(s.background_agents[0].tool_count, 3, "must not overwrite");
     }
 
     #[test]
@@ -1166,6 +1560,7 @@ mod tests {
             content: String::new(),
             output: Vec::new(),
             completed_at: Utc::now(),
+            async_subagent: false,
         })
         .unwrap();
         assert!(s.in_flight_tool.is_none());

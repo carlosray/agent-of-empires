@@ -697,6 +697,8 @@ mod tests {
                 container_name: "aoe-sandbox-doesnotexist".to_string(),
                 extra_env: None,
                 custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
             });
 
             let request = DeletionRequest {
@@ -1001,6 +1003,8 @@ mod tests {
                 container_name: "aoe-dirty-test-doesnotexist".to_string(),
                 extra_env: None,
                 custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
             });
 
             (tmp, main_repo, worktree_path, instance)

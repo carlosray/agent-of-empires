@@ -33,8 +33,8 @@ pub struct BuiltinTheme {
 
 pub const BUILTIN_THEMES: &[BuiltinTheme] = &[
     BuiltinTheme {
-        name: "default",
-        source: include_str!("../../../themes/builtin/default.toml"),
+        name: "zinc",
+        source: include_str!("../../../themes/builtin/zinc.toml"),
     },
     BuiltinTheme {
         name: "empire",
@@ -111,10 +111,35 @@ pub fn discover_custom_themes() -> Vec<(String, PathBuf)> {
     themes
 }
 
-/// Return the full list of available theme names: built-in themes first, then custom.
+/// Themes contributed by active plugins, as (name, path) pairs. Layered below
+/// builtins and user custom themes: a plugin cannot shadow a builtin or a theme
+/// the user dropped in their own themes dir. Names already claimed by a builtin
+/// or a user theme are filtered out.
+pub fn discover_plugin_themes() -> Vec<(String, PathBuf)> {
+    let mut claimed: std::collections::HashSet<String> = builtin_theme_names()
+        .map(|s| s.to_string())
+        .chain(discover_custom_themes().into_iter().map(|(n, _)| n))
+        .collect();
+    // De-dup across plugins too: two plugins contributing the same name would
+    // otherwise show as indistinguishable picker entries, and load_theme can
+    // only resolve the first. First active plugin to claim a name wins.
+    let mut out = Vec::new();
+    for (name, path) in crate::plugin::active_plugin_themes() {
+        if claimed.insert(name.clone()) {
+            out.push((name, path));
+        }
+    }
+    out
+}
+
+/// Return the full list of available theme names: built-in themes first, then
+/// user custom themes, then active-plugin themes.
 pub fn available_themes() -> Vec<String> {
     let mut names: Vec<String> = builtin_theme_names().map(|s| s.to_string()).collect();
     for (name, _) in discover_custom_themes() {
+        names.push(name);
+    }
+    for (name, _) in discover_plugin_themes() {
         names.push(name);
     }
     names
@@ -131,7 +156,7 @@ fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
     };
 
     match toml::from_str::<Theme>(&content) {
-        Ok(theme) => Some(theme),
+        Ok(theme) => Some(fill_unread_from_accent(&content, theme)),
         Err(e) => {
             warn!("Failed to parse theme file {}: {}", path.display(), e);
             None
@@ -139,13 +164,33 @@ fn load_custom_theme(path: &std::path::Path) -> Option<Theme> {
     }
 }
 
+/// A theme TOML that omits `unread` should inherit that theme's own `accent`,
+/// not Empire's default blue. The container `#[serde(default)]` seeds every
+/// omitted field from `Theme::default()` (= Empire), and serde can't tell an
+/// omitted key from one explicitly set to Empire's value, so we detect the
+/// omission from the raw table and fall back to the parsed theme's accent.
+fn fill_unread_from_accent(content: &str, mut theme: Theme) -> Theme {
+    let omitted = content
+        .parse::<toml::Table>()
+        .map(|t| !t.contains_key("unread"))
+        .unwrap_or(false);
+    if omitted {
+        theme.unread = theme.accent;
+    }
+    theme
+}
+
 /// Parse a builtin's embedded TOML. Builtin TOMLs are committed to the repo
 /// and embedded at build time; a parse failure here is a developer bug, not
 /// user input. The `all_builtins_parse_with_expected_anchors` test guards
 /// against that landing in main.
 fn parse_builtin(builtin: &BuiltinTheme) -> Theme {
-    toml::from_str(builtin.source)
-        .unwrap_or_else(|e| panic!("builtin theme '{}' failed to parse: {}", builtin.name, e))
+    let theme = toml::from_str(builtin.source)
+        .unwrap_or_else(|e| panic!("builtin theme '{}' failed to parse: {}", builtin.name, e));
+    // All builtins define `unread`, so this is a no-op for them today, but
+    // keep the same fallback as custom themes so a future builtin that omits
+    // it inherits its own accent rather than Empire's.
+    fill_unread_from_accent(builtin.source, theme)
 }
 
 pub fn load_theme(name: &str) -> Theme {
@@ -166,14 +211,27 @@ pub fn load_theme(name: &str) -> Theme {
             }
         }
     }
-    warn!("Unknown theme '{}', falling back to default", name);
+    for (theme_name, path) in discover_plugin_themes() {
+        if theme_name == name {
+            if let Some(theme) = load_custom_theme(&path) {
+                debug!(
+                    theme = name,
+                    source = "plugin",
+                    path = %path.display(),
+                    "loaded theme"
+                );
+                return theme;
+            }
+        }
+    }
+    warn!("Unknown theme '{}', falling back to zinc", name);
     // Inline the default fallback rather than recursing through `load_theme`,
-    // so a future rename or removal of the "default" builtin would surface
-    // as a clear panic here instead of looping.
+    // so a future rename or removal of the fallback builtin would surface
+    // as a clear panic here instead of looping. `zinc` is the default theme.
     let default = BUILTIN_THEMES
         .iter()
-        .find(|b| b.name == "default")
-        .expect("'default' builtin missing from BUILTIN_THEMES");
+        .find(|b| b.name == "zinc")
+        .expect("'zinc' builtin missing from BUILTIN_THEMES");
     parse_builtin(default)
 }
 
@@ -209,6 +267,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_theme_without_unread_inherits_accent() {
+        // A theme TOML that omits `unread` should fall back to that theme's
+        // own accent, not Empire's default blue.
+        let toml_str = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\n";
+        let theme: Theme = toml::from_str(toml_str).unwrap();
+        let theme = fill_unread_from_accent(toml_str, theme);
+        assert_eq!(theme.accent, Color::Rgb(0x7a, 0xa2, 0xf7));
+        assert_eq!(
+            theme.unread, theme.accent,
+            "omitted unread field should fall back to accent"
+        );
+    }
+
+    #[test]
+    fn custom_theme_with_explicit_unread_preserves_it() {
+        // An explicit `unread` must win over the accent fallback.
+        let toml_str = "background = \"#1a1b26\"\naccent = \"#7aa2f7\"\nunread = \"#ff0000\"\n";
+        let theme: Theme = toml::from_str(toml_str).unwrap();
+        let theme = fill_unread_from_accent(toml_str, theme);
+        assert_eq!(theme.unread, Color::Rgb(0xff, 0x00, 0x00));
+        assert_ne!(theme.unread, theme.accent);
+    }
+
+    #[test]
     fn load_theme_with_mode_truecolor_yields_rgb() {
         let theme = load_theme_with_mode("empire", false);
         assert!(matches!(theme.title, Color::Rgb(_, _, _)));
@@ -223,7 +305,7 @@ mod tests {
     /// the rest. Adding a new builtin requires one row here.
     const BUILTIN_COLOR_ANCHORS: &[(&str, Color, Color)] = &[
         (
-            "default",
+            "zinc",
             Color::Rgb(0x1c, 0x1c, 0x1f),
             Color::Rgb(0xfb, 0xbf, 0x24),
         ),
@@ -444,7 +526,7 @@ border = "#414868"
     #[test]
     fn unknown_theme_falls_back_to_default() {
         let theme = load_theme("nonexistent-theme");
-        let default = load_theme("default");
+        let default = load_theme("zinc");
         assert_eq!(
             theme.color_fields(),
             default.color_fields(),
@@ -456,7 +538,7 @@ border = "#414868"
     fn test_builtin_themes_count() {
         assert_eq!(BUILTIN_THEMES.len(), 8);
         let names: Vec<&str> = builtin_theme_names().collect();
-        assert!(names.contains(&"default"));
+        assert!(names.contains(&"zinc"));
         assert!(names.contains(&"empire"));
         assert!(names.contains(&"phosphor"));
         assert!(names.contains(&"tokyo-night-storm"));

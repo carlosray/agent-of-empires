@@ -1,7 +1,7 @@
 //! User configuration management
 
 use super::get_app_dir;
-use super::repo_config::HooksConfig;
+use super::repo_config::{HooksConfig, HostHooksConfig};
 use anyhow::Result;
 use aoe_settings_derive::SettingsSection;
 use serde::{Deserialize, Serialize};
@@ -40,6 +40,11 @@ pub struct Config {
 
     #[serde(default)]
     pub hooks: HooksConfig,
+
+    /// Host-side lifecycle hooks. Profile/global only; never honored from a
+    /// repo's `.agent-of-empires/config.toml` (these run commands on the host).
+    #[serde(default)]
+    pub host_hooks: HostHooksConfig,
 
     #[serde(default)]
     pub sound: crate::sound::SoundConfig,
@@ -86,6 +91,82 @@ pub struct Config {
     /// palette (Ctrl+K).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tools: HashMap<String, ToolSessionConfig>,
+
+    /// Per-plugin configuration keyed by plugin id (`[plugins."aoe.web"]`).
+    /// An explicit typed map rather than a root-level flatten so unknown core
+    /// keys still fail loudly while plugin enable-state survives every save.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub plugins: std::collections::BTreeMap<String, PluginConfig>,
+}
+
+/// Configuration for one plugin: whether it is enabled, its install source and
+/// capability grant (external plugins only), plus its schema-free persisted
+/// settings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginConfig {
+    /// Whether the plugin is active. A disabled plugin contributes nothing to
+    /// any surface.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+
+    /// Install source for an external plugin: a `gh:owner/repo[@ref]` slug or a
+    /// local path. Absent for builtins, which are compiled in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    /// The plugin's persisted settings (`[plugins."<id>".settings]`). Kept as
+    /// an opaque `toml::Table` so values survive on disk even while the plugin
+    /// is disabled; the typed schema that validates and renders them lands
+    /// with Tier 0 registries (#2094). The toml serializer emits scalars before
+    /// subtables regardless, so field order here is for readability. Empty is
+    /// omitted.
+    #[serde(default, skip_serializing_if = "toml::Table::is_empty")]
+    pub settings: toml::Table,
+
+    /// The capability grant the user approved for an external plugin, pinned to
+    /// the manifest hash it was approved against. Absent until granted;
+    /// builtins are auto-granted and never store one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<CapabilityGrant>,
+
+    /// An available update the user declined in-app, recorded by its content
+    /// fingerprint so the popup and auto-update notification stop nagging until
+    /// the next version. Cleared on any successful apply or uninstall. Absent
+    /// when no update has been dismissed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dismissed_update: Option<String>,
+}
+
+/// A user's approval of an external plugin's requested capabilities, pinned to
+/// the exact manifest it was approved against. When the installed manifest hash
+/// later differs (an update that changed the capability set), the grant no
+/// longer applies and the plugin's runtime contributions stay inactive until
+/// re-approved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityGrant {
+    /// `sha256:<hex>` of the manifest bytes this grant was approved against.
+    pub manifest_hash: String,
+    /// The capabilities the user approved.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    /// When the user approved the grant.
+    pub granted_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            source: None,
+            settings: toml::Table::new(),
+            grant: None,
+            dismissed_update: None,
+        }
+    }
 }
 
 /// Configuration for a user-defined tool session (lazygit, yazi, tig, etc.)
@@ -442,6 +523,23 @@ pub struct AcpConfig {
     #[serde(default = "default_rate_limit_auto_resume_grace_secs")]
     #[setting(label = "Auto-resume grace (s)", widget = "number", min = 0, advanced)]
     pub rate_limit_auto_resume_grace_secs: u32,
+    /// Allow the web dashboard's "Update & restart" control to run the
+    /// agent's `npm install -g <pkg>` on the host and respawn the worker.
+    /// Off by default: the daemon executing a global package install is a
+    /// host-level capability (it runs arbitrary npm lifecycle scripts as the
+    /// daemon user), so it stays opt-in, is always blocked in read-only mode,
+    /// and is `local_only` so a remote dashboard client cannot flip it on.
+    /// Only npm-installable agents are eligible; others keep the manual
+    /// install hint. See #2109.
+    #[serde(default)]
+    #[setting(
+        label = "Allow agent install from web",
+        widget = "toggle",
+        web = "local_only:runs npm install on the host as the daemon user",
+        global_only,
+        advanced
+    )]
+    pub allow_agent_install: bool,
 }
 
 fn default_rate_limit_auto_resume_grace_secs() -> u32 {
@@ -518,6 +616,7 @@ impl Default for AcpConfig {
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             rate_limit_auto_resume: false,
             rate_limit_auto_resume_grace_secs: default_rate_limit_auto_resume_grace_secs(),
+            allow_agent_install: false,
         }
     }
 }
@@ -647,6 +746,12 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_list_width: Option<u16>,
 
+    /// Whether the home-view session list is collapsed to a narrow,
+    /// click-to-expand strip. Persisted so the choice survives restarts,
+    /// mirroring `home_list_width`. `None`/absent means expanded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_sidebar_collapsed: Option<bool>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_file_list_width: Option<u16>,
 
@@ -665,6 +770,12 @@ pub struct AppStateConfig {
 
     #[serde(default)]
     pub has_seen_custom_instruction_warning: bool,
+
+    /// Latches once the user has been warned (when adding a project in the TUI)
+    /// that the directory is not a git repository, so the one-time notice about
+    /// git features being unavailable does not repeat on every non-git add.
+    #[serde(default)]
+    pub has_seen_non_git_project_warning: bool,
 
     #[serde(default)]
     pub has_acknowledged_agent_hooks: bool,
@@ -696,6 +807,45 @@ pub struct AppStateConfig {
     /// shelved session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived_section_collapsed: Option<bool>,
+
+    /// Paths of project-mode sidebar folders the user has collapsed. Stored as
+    /// the set of collapsed paths (absent/expanded folders are not listed), so
+    /// the choice survives restarts. Group-mode collapse lives on the per-profile
+    /// GroupTrees in session storage; project-mode folders are auto-derived and
+    /// have no group record, so their collapse state is persisted here instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_group_collapsed: Vec<String>,
+
+    /// Ids of tips the user has already seen/acknowledged. Drives the unseen
+    /// badge count and stops earned tips from re-popping. Ids come from
+    /// [`crate::tips`] and are stable, so this list stays meaningful across
+    /// upgrades.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tips_seen: Vec<String>,
+
+    /// How many times the new-session dialog has been opened while a project or
+    /// session was selected. Once this passes
+    /// [`crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD`], the "new from
+    /// selection" tip becomes eligible (the earned trigger that closes #2262).
+    #[serde(default)]
+    pub new_session_with_selection_count: u32,
+
+    /// Set once the user has actually used `N` (new-from-selection). They've
+    /// discovered the feature, so the tip that teaches it is suppressed even if
+    /// the count above crosses the threshold.
+    #[serde(default)]
+    pub used_new_from_selection: bool,
+
+    /// Server-side mirror of the web dashboard's syncable UI state, keyed by
+    /// the frontend's localStorage key (the value is the opaque string the
+    /// browser stored). Single-tenant: there is one user, so these prefs
+    /// (sidebar sort/axis, tool density, repo appearance/order, group collapse,
+    /// last-used tool, welcome-seen, etc.) live here so they follow the user
+    /// across browsers and devices instead of being trapped in per-browser
+    /// localStorage. The server never interprets the values; the web owns the
+    /// shape. See `GET`/`PATCH /api/app-state/web-ui-state`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub web_ui_state: std::collections::BTreeMap<String, String>,
 }
 
 /// Session-related configuration defaults
@@ -755,6 +905,46 @@ pub struct SessionConfig {
         category = "Session"
     )]
     pub tool_session_tracking: bool,
+
+    /// For agents whose hooks are scoped to a user-selected named agent (e.g.
+    /// Kiro's `--agent NAME`), install AoE's status hooks into that agent's own
+    /// config file so status detection keeps working, on both host and sandbox
+    /// sessions. Such CLIs have no global hooks, so without this AoE's standalone
+    /// hooks agent is never loaded for a user-selected agent and status goes
+    /// dark. When disabled, AoE installs its standalone hooks agent instead and
+    /// leaves the user's agent file untouched.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Merge Hooks Into Selected Agent",
+        widget = "toggle",
+        category = "Agents"
+    )]
+    pub merge_hooks_into_selected_agent: bool,
+
+    /// Auto-rename a new structured-view (ACP) session from its first message,
+    /// using the session's own agent in one-shot mode (e.g. `claude -p`). Only
+    /// applies while the session still carries its auto-generated name; a
+    /// manually named session is never touched. Title only: the worktree
+    /// directory is not moved (the running agent holds it). Agents without a
+    /// one-shot mode, sandboxed sessions, and command-overridden agents keep
+    /// the generated name.
+    #[serde(default = "default_true")]
+    #[setting(label = "Smart Session Rename", widget = "toggle", category = "Agents")]
+    pub smart_rename: bool,
+
+    /// Agent used for the one-shot smart-rename title call. Empty means use the
+    /// session's own agent. Set this to point smart rename at a cheaper or more
+    /// obedient title model (e.g. codex or opencode) without changing the
+    /// session's working agent. Only agents with a one-shot mode qualify; an
+    /// unknown or one-shot-incapable value falls back to leaving the generated
+    /// name. The picker lists installed one-shot-capable agents.
+    #[serde(default)]
+    #[setting(
+        label = "Smart-rename agent",
+        widget = "custom:smart-rename-agent",
+        category = "Agents"
+    )]
+    pub smart_rename_agent: String,
 
     /// Request xterm mouse tracking so the TUI handles the scroll wheel
     /// (preview-pane scroll) and click-to-select rows. Disable to hand the
@@ -844,6 +1034,34 @@ pub struct SessionConfig {
         validate = "range:1:43200"
     )]
     pub snooze_duration_minutes: u32,
+
+    /// Move deleted sessions to the trash instead of purging them
+    /// immediately. When enabled (default), `delete`/`rm` and the TUI/web
+    /// delete actions stop the session and hide it in a recoverable trash
+    /// bucket; durable state (transcript, worktree, branch, container) is
+    /// kept until the session is purged or its retention window expires.
+    /// When disabled, delete performs the historical irreversible purge.
+    /// An explicit purge (`aoe rm --purge`, the web "Delete permanently"
+    /// action) always purges regardless of this setting.
+    #[serde(default = "default_true")]
+    #[setting(label = "Delete to Trash", widget = "toggle")]
+    pub delete_to_trash: bool,
+
+    /// Days a session stays in the trash before it is automatically purged,
+    /// measured from when it was trashed. `0` keeps trashed sessions
+    /// forever (manual purge only). Auto-purge is enforced by the `aoe serve`
+    /// daemon (a startup sweep plus an hourly tick); without a running daemon,
+    /// expired trash is purged on the next daemon start or by an explicit
+    /// manual purge (`aoe rm --purge`, `aoe session empty-trash`).
+    #[serde(default = "default_trash_retention_days")]
+    #[setting(
+        label = "Trash Retention (days)",
+        widget = "number",
+        min = 0,
+        max = 3650,
+        validate = "range:0:3650"
+    )]
+    pub trash_retention_days: u32,
 
     /// Seconds of inactivity after which a plain TUI/tmux session that has
     /// been `Idle` this long is auto-stopped (its tmux session and any
@@ -979,6 +1197,41 @@ pub struct SessionConfig {
     #[setting(label = "Confirm Before Quit", widget = "toggle", global_only)]
     pub confirm_before_quit: bool,
 
+    /// Show an unread indicator on sessions. When on (default), a session
+    /// whose turn just finished is painted in the theme's unread color until
+    /// you view it (Tab into live-send or Enter to attach), and you can flag
+    /// a session unread for later with `U`; unread rows also sort just below
+    /// Waiting in the Attention sort. Turn this off to disable the indicator,
+    /// the auto-marking, and the `U` toggle entirely.
+    ///
+    /// `global_only`: the gate is a single process-wide flag
+    /// (`crate::session::unread_enabled`), refreshed from the active profile's
+    /// resolved config, so it can't honor a per-profile override. Exposing it
+    /// as profile-overridable would silently ignore the override; keep the
+    /// schema honest by scoping it global.
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Unread Session Indicator",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub unread_indicator: bool,
+
+    /// Show occasional discovery tips: the `💡` badge in the footer, the
+    /// browsable tips overlay, and the one-time earned pop. Turn this off to
+    /// hide the badge and stop tips from popping; seen/earned state still lives
+    /// in `app_state`. A global UX preference, not profile-overridable. See
+    /// [`crate::tips`].
+    #[serde(default = "default_true")]
+    #[setting(
+        label = "Show tips",
+        widget = "toggle",
+        category = "Interaction",
+        global_only
+    )]
+    pub show_tips: bool,
+
     /// Keep an aoe-managed worktree session's directory leaf in sync with its
     /// title. When enabled (default), renaming the session also moves its
     /// worktree directory, and new sessions derive the directory leaf from the
@@ -1085,6 +1338,9 @@ impl Default for SessionConfig {
             agent_command_override: HashMap::new(),
             agent_status_hooks: true,
             tool_session_tracking: false,
+            merge_hooks_into_selected_agent: true,
+            smart_rename: true,
+            smart_rename_agent: String::new(),
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
@@ -1092,6 +1348,8 @@ impl Default for SessionConfig {
             acp_defaults: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
+            delete_to_trash: true,
+            trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             restart_wake_message: default_restart_wake_message(),
             row_tag: RowTagMode::default(),
@@ -1102,12 +1360,18 @@ impl Default for SessionConfig {
             default_attach_mode: NewSessionAttachMode::default(),
             click_action: ClickAction::default(),
             confirm_before_quit: true,
+            unread_indicator: true,
+            show_tips: true,
             tie_workdir_to_name: true,
         }
     }
 }
 
 fn default_snooze_duration_minutes() -> u32 {
+    30
+}
+
+fn default_trash_retention_days() -> u32 {
     30
 }
 
@@ -1531,6 +1795,17 @@ pub struct UpdatesConfig {
     #[serde(default = "default_web_poll_interval_minutes")]
     #[setting(label = "Web Poll Interval (minutes)", widget = "number", min = 0)]
     pub web_poll_interval_minutes: u64,
+
+    /// Auto-update installed external plugins at TUI and `aoe serve` startup.
+    /// Off by default. The sweep applies only updates that need no new consent;
+    /// any version that changes capabilities, build steps, or UI slots is left
+    /// for a manual `aoe plugin update` so its new grant is reviewed.
+    // global_only: the startup sweep reads the global config
+    // (`Config::load_or_warn`), so a profile/repo override would be silently
+    // ignored; show it but do not offer non-global scopes.
+    #[serde(default)]
+    #[setting(label = "Auto-update plugins", widget = "toggle", global_only)]
+    pub auto_update_plugins: bool,
 }
 
 impl Default for UpdatesConfig {
@@ -1540,6 +1815,7 @@ impl Default for UpdatesConfig {
             check_interval_hours: 24,
             notify_in_cli: true,
             web_poll_interval_minutes: 60,
+            auto_update_plugins: false,
         }
     }
 }
@@ -2098,12 +2374,12 @@ pub(crate) fn config_path() -> Result<PathBuf> {
 impl Config {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() {
-            return Ok(Config::default());
-        }
-
-        let content = fs::read_to_string(&path)?;
-        let mut config: Config = toml::from_str(&content)?;
+        let table: toml::Table = if path.exists() {
+            toml::from_str(&fs::read_to_string(&path)?)?
+        } else {
+            toml::Table::new()
+        };
+        let mut config: Config = table.try_into()?;
         config.normalize();
         Ok(config)
     }
@@ -2130,12 +2406,12 @@ impl Config {
     }
 
     /// Effective theme name to paint, mapping the empty default to the
-    /// `default` builtin. Theme is a global preference (see
+    /// `zinc` builtin (the default theme). Theme is a global preference (see
     /// [`resolve_theme_name`]); callers read it from the global config, never
     /// the profile-merged config.
     pub fn effective_theme_name(&self) -> String {
         if self.theme.name.is_empty() {
-            "default".to_string()
+            "zinc".to_string()
         } else {
             self.theme.name.clone()
         }
@@ -2157,7 +2433,8 @@ pub fn load_config() -> Result<Option<Config>> {
 
 pub fn save_config(config: &Config) -> Result<()> {
     let path = config_path()?;
-    let content = toml::to_string_pretty(config)?;
+    let table = toml::Table::try_from(config)?;
+    let content = toml::to_string_pretty(&table)?;
     super::atomic_write(&path, content.as_bytes())?;
     Ok(())
 }
@@ -2171,7 +2448,7 @@ pub fn save_config(config: &Config) -> Result<()> {
 /// the global theme on others let a per-profile override (which the web theme
 /// picker used to write) shadow the global pick on every Settings open/close,
 /// flipping the theme until the next restart. An empty name maps to the
-/// `default` builtin, matching the web dashboard's empty-name fallback.
+/// `zinc` builtin, matching the web dashboard's empty-name fallback.
 pub fn resolve_theme_name() -> String {
     Config::load_or_warn().effective_theme_name()
 }
@@ -2337,6 +2614,72 @@ mod tests {
         assert_eq!(config.default_profile, "custom");
         // Other fields should have defaults
         assert!(!config.worktree.enabled);
+    }
+
+    #[test]
+    fn test_plugins_table_round_trips_through_save() {
+        // A plugin's enable-state must survive serialize/deserialize.
+        let toml_in = r#"
+            [plugins."aoe.web"]
+            enabled = false
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        assert!(!config.plugins["aoe.web"].enabled);
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert!(!reloaded.plugins["aoe.web"].enabled);
+    }
+
+    #[test]
+    fn test_plugins_default_empty_and_omitted_from_toml() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(config.plugins.is_empty());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("[plugins"),
+            "empty plugins map must not serialize a stray section"
+        );
+    }
+
+    #[test]
+    fn test_plugin_settings_persist_even_while_disabled() {
+        // Disabling a plugin hides its settings from every surface but must
+        // never destroy them: the values survive a save/load round-trip.
+        let toml_in = r#"
+            [plugins."aoe.status"]
+            enabled = false
+
+            [plugins."aoe.status".settings]
+            poll_interval_ms = 1000
+            verbose = true
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        let plugin = &config.plugins["aoe.status"];
+        assert!(!plugin.enabled);
+        assert_eq!(plugin.settings["poll_interval_ms"].as_integer(), Some(1000));
+
+        let serialized = toml::to_string(&config).unwrap();
+        let reloaded: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reloaded.plugins["aoe.status"].settings["verbose"].as_bool(),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_plugin_empty_settings_omitted_from_toml() {
+        let toml_in = r#"
+            [plugins."aoe.web"]
+            enabled = true
+        "#;
+        let config: Config = toml::from_str(toml_in).unwrap();
+        assert!(config.plugins["aoe.web"].settings.is_empty());
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(
+            !serialized.contains("settings"),
+            "empty plugin settings must not serialize a stray section"
+        );
     }
 
     // Tests for ThemeConfig
@@ -2615,6 +2958,40 @@ mod tests {
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert!(app.has_seen_web_tour);
         assert!(!app.has_seen_welcome);
+    }
+
+    #[test]
+    fn test_app_state_config_tips_defaults_and_roundtrip() {
+        // Absent from old configs: nothing seen, zero count. (The on/off toggle
+        // lives in `SessionConfig::show_tips`, not here.)
+        let app = AppStateConfig::default();
+        assert!(app.tips_seen.is_empty());
+        assert_eq!(app.new_session_with_selection_count, 0);
+        assert!(!app.used_new_from_selection);
+
+        let toml = r#"
+            tips_seen = ["new-from-selection"]
+            new_session_with_selection_count = 4
+            used_new_from_selection = true
+        "#;
+        let app: AppStateConfig = toml::from_str(toml).unwrap();
+        assert_eq!(app.tips_seen, vec!["new-from-selection"]);
+        assert_eq!(app.new_session_with_selection_count, 4);
+        assert!(app.used_new_from_selection);
+
+        // Round-trips back out.
+        let serialized = toml::to_string(&app).unwrap();
+        let reparsed: AppStateConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.tips_seen, app.tips_seen);
+        assert_eq!(reparsed.new_session_with_selection_count, 4);
+    }
+
+    #[test]
+    fn test_session_config_show_tips_defaults_on() {
+        // Absent from old configs, tips default to on.
+        let toml = "default_tool = \"claude\"\n";
+        let session: SessionConfig = toml::from_str(toml).unwrap();
+        assert!(session.show_tips);
     }
 
     // Full config serialization roundtrip

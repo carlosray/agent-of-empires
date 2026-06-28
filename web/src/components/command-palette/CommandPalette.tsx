@@ -1,18 +1,46 @@
-import { useEffect, useMemo, useRef } from "react";
-import { Command } from "cmdk";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Command, defaultFilter } from "cmdk";
 import { StatusGlyph } from "../StatusGlyph";
+import { CheatOverlay } from "./CheatOverlay";
 import { GROUP_ORDER } from "./groups";
 import type { CommandAction, CommandActionGroup } from "./types";
+import { matchCheat, type CheatEffect } from "../../lib/cheats";
+import { reportInfo } from "../../lib/toastBus";
 
 interface Props {
   open: boolean;
   onClose: () => void;
   actions: CommandAction[];
+  /** Called with the current search text (debounced upstream) so the host
+   *  can run an async conversation-content search. */
+  onSearchChange?: (query: string) => void;
+  /** True while a conversation-content search is in flight; renders a
+   *  spinner row in the Conversations group. */
+  searching?: boolean;
 }
 
-export function CommandPalette({ open, onClose, actions }: Props) {
+export function CommandPalette({ open, onClose, actions, onSearchChange, searching }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const previousFocusRef = useRef<HTMLElement | null>(null);
+  const [search, setSearch] = useState("");
+  // Active easter-egg effect plus a monotonic id so retyping the same cheat
+  // replays the animation (the id is the overlay's React key).
+  const [cheat, setCheat] = useState<{ effect: CheatEffect; id: number } | null>(null);
+
+  // A full-string match on a known Age of Empires cheat code fires a toast and
+  // a one-off visual, then clears the input. Anything else is a normal search.
+  const handleSearchChange = (value: string) => {
+    const hit = matchCheat(value);
+    if (hit) {
+      reportInfo(hit.toast);
+      setCheat((prev) => ({ effect: hit.effect, id: (prev?.id ?? 0) + 1 }));
+      setSearch("");
+      onSearchChange?.("");
+      return;
+    }
+    setSearch(value);
+    onSearchChange?.(value);
+  };
 
   // Capture the launcher before moving focus into the palette, then restore
   // it on close so Esc / backdrop-close return keyboard users to where they
@@ -28,6 +56,23 @@ export function CommandPalette({ open, onClose, actions }: Props) {
       if (prev?.isConnected) prev.focus();
     };
   }, [open]);
+
+  // Controlled input keeps its value across open/close, so reset it when the
+  // palette closes; also drop any in-flight cheat so reopening does not replay
+  // the last one. Adjusting during render on the open->closed edge is the
+  // React-recommended pattern, no effect needed.
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    setWasOpen(open);
+    if (!open) {
+      setSearch("");
+      setCheat(null);
+    }
+  }
+
+  // Stable so the overlay's cleanup timer is not reset by unrelated re-renders
+  // (e.g. the user typing again while an effect is still on screen).
+  const clearCheat = useCallback(() => setCheat(null), []);
 
   const grouped = useMemo(() => {
     const map = new Map<CommandActionGroup, CommandAction[]>();
@@ -58,6 +103,12 @@ export function CommandPalette({ open, onClose, actions }: Props) {
       <Command
         label="Command palette"
         loop
+        filter={(value, searchText, keywords) =>
+          // Conversation hits are already filtered server-side by content
+          // (which the client text does not contain), so force-keep them;
+          // everything else uses cmdk's default fuzzy scoring.
+          value.startsWith("conversation:") ? 1 : defaultFilter!(value, searchText, keywords)
+        }
         className="w-full max-w-[600px] bg-surface-800 border border-surface-700/50 rounded-lg shadow-2xl overflow-hidden animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
@@ -78,6 +129,8 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </svg>
           <Command.Input
             ref={inputRef}
+            value={search}
+            onValueChange={handleSearchChange}
             placeholder="Search actions, sessions, settings…"
             className="flex-1 bg-transparent outline-none text-[15px] text-text-primary placeholder:text-text-muted"
           />
@@ -91,13 +144,26 @@ export function CommandPalette({ open, onClose, actions }: Props) {
 
           {GROUP_ORDER.map((groupName) => {
             const items = grouped.get(groupName) ?? [];
-            if (items.length === 0) return null;
+            // The Conversations group still renders while a content search
+            // is in flight, so the spinner replaces a premature "No matches".
+            const showSpinner = groupName === "Conversations" && !!searching;
+            if (items.length === 0 && !showSpinner) return null;
             return (
               <Command.Group
                 key={groupName}
                 heading={groupName}
                 className="mb-1 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pt-2 [&_[cmdk-group-heading]]:pb-1 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-wider [&_[cmdk-group-heading]]:text-text-muted"
               >
+                {showSpinner && (
+                  <Command.Item
+                    value="conversation:__loading__"
+                    disabled
+                    className="flex items-center gap-2 px-3 h-9 rounded-md text-sm text-text-muted"
+                  >
+                    <span className="h-3 w-3 shrink-0 animate-spin rounded-full border-2 border-text-muted border-t-transparent" />
+                    <span>Searching conversations…</span>
+                  </Command.Item>
+                )}
                 {items.map((action) => {
                   const searchValue = [action.title, action.subtitle ?? "", ...(action.keywords ?? [])].join(" ");
                   return (
@@ -136,6 +202,7 @@ export function CommandPalette({ open, onClose, actions }: Props) {
           </span>
         </div>
       </Command>
+      {cheat && <CheatOverlay key={cheat.id} effect={cheat.effect} onDone={clearCheat} />}
     </div>
   );
 }

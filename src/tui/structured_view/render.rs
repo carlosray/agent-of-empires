@@ -16,10 +16,13 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wr
 use ratatui::Frame;
 use similar::{ChangeTag, TextDiff};
 
+use aoe_plugin_api::UiSlot;
+
 use super::input::Focus;
 use super::reducer::{AcpTranscript, ActivityRow, NoteKind, ToolCallRow};
 use super::state::{FileIndex, StructuredViewState};
 use crate::acp::approvals::ApprovalDecision;
+use crate::tui::plugin_ui;
 use crate::tui::styles::Theme;
 
 pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
@@ -408,6 +411,19 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
             Style::default().fg(theme.error),
         ));
     }
+    // Plugin host-rendered slots (#2402): global status-bar segments and this
+    // session's detail badges, tone-colored. Icons / tooltips / hrefs have no
+    // terminal surface and are dropped; malformed entries are skipped.
+    for entry in plugin_ui::global_entries(&state.plugin_ui, UiSlot::StatusBar).chain(
+        plugin_ui::session_entries(&state.plugin_ui, UiSlot::DetailBadge, &state.session_id),
+    ) {
+        if let Some(text) = plugin_ui::entry_text(entry) {
+            spans.push(Span::styled(
+                format!(" {text} "),
+                plugin_ui::tone_style(plugin_ui::entry_tone(entry), theme),
+            ));
+        }
+    }
     if spans.is_empty() {
         // Footer help when nothing else is going on.
         spans.push(Span::styled(
@@ -420,14 +436,34 @@ fn render_status(frame: &mut Frame, area: Rect, theme: &Theme, state: &Structure
 }
 
 fn render_composer(frame: &mut Frame, area: Rect, theme: &Theme, state: &StructuredViewState) {
-    let title = match state.focus {
-        Focus::Composer => " Composer (Enter=send, Shift+Enter=newline, Esc=back) ",
-        _ => " Composer (Tab/i to focus) ",
+    // While browsing the queue, the title signals that an existing queued
+    // prompt is being edited (and where it sits), so the composer does not
+    // look like it merely copied text in. Position counts from the newest
+    // entry (1 = newest), matching the ArrowUp-from-newest browse order.
+    let title: String = if let Some(recall) = &state.recall {
+        let total = state.queue.len();
+        let pos = total.saturating_sub(recall.index);
+        format!(
+            " Editing queued message {pos} of {total} (Enter=save, Esc=restore draft, ↑/↓=browse) "
+        )
+    } else {
+        match state.focus {
+            Focus::Composer => " Composer (Enter=send, Shift+Enter=newline, Esc=back) ".to_string(),
+            _ => " Composer (Tab/i to focus) ".to_string(),
+        }
+    };
+    // Highlight the border while editing a queued prompt so the mode is
+    // obvious at a glance.
+    let composer_border = if state.recall.is_some() {
+        Style::default().fg(theme.title)
+    } else {
+        border_style(theme, state, Focus::Composer)
     };
     let block = Block::default()
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .title(title)
-        .border_style(border_style(theme, state, Focus::Composer));
+        .border_style(composer_border);
     // ratatui-textarea borrows the Frame's buffer indirectly via
     // widget impl; render the block first, then the textarea inside.
     let inner = block.inner(area);
@@ -699,6 +735,15 @@ fn transcript_lines<'a>(
                         crate::acp::state::PlanStepStatus::Cancelled => "[-]",
                     };
                     out.push(Line::from(format!("  {marker} {}", step.title)));
+                }
+                out.push(Line::default());
+            }
+            ActivityRow::ElicitationAnswer(answers) => {
+                for answer in answers {
+                    out.push(Line::from(Span::styled(
+                        format!("you  ▸ {}: {}", answer.question, answer.answer),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )));
                 }
                 out.push(Line::default());
             }
@@ -1311,6 +1356,30 @@ mod tests {
 
     fn joined(lines: &[Line]) -> String {
         lines.iter().map(line_text).collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn transcript_renders_elicitation_answers_as_user_rows() {
+        use crate::acp::elicitations::ElicitationAnswer;
+        let mut t = AcpTranscript::new("s-1");
+        t.rows.push(ActivityRow::ElicitationAnswer(vec![
+            ElicitationAnswer {
+                question: "Proceed?".into(),
+                answer: "Yes".into(),
+            },
+            ElicitationAnswer {
+                question: "Mode".into(),
+                answer: "Fast".into(),
+            },
+        ]));
+        let out = joined(&transcript_lines(
+            &t,
+            None,
+            Focus::Transcript,
+            &Theme::default(),
+        ));
+        assert!(out.contains("you  ▸ Proceed?: Yes"), "{out:?}");
+        assert!(out.contains("you  ▸ Mode: Fast"), "{out:?}");
     }
 
     #[test]

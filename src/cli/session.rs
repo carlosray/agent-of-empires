@@ -7,13 +7,6 @@ use std::collections::HashSet;
 
 use crate::session::{GroupTree, StartOutcome, Storage};
 
-/// Wording used by both single-session and `--all` restart paths when the
-/// resume-fallback cascade cleared a stale agent_session_id. Centralized so
-/// drift between the two surfaces cannot happen.
-pub(crate) fn stale_history_suffix(stale_sid: &str) -> String {
-    format!(" (resume failed for sid {stale_sid}; started fresh, prior history not loaded)")
-}
-
 #[derive(Subcommand)]
 pub enum SessionCommands {
     /// Start a session's tmux process
@@ -70,15 +63,23 @@ pub enum SessionCommands {
     /// Clear the favorite flag on a session.
     Unfavorite(SessionIdArgs),
 
-    /// Archive a session (sinks it to the bottom of the Attention sort).
-    /// Kills the tmux pane unless `--no-kill` is passed. The worktree,
-    /// branch, and container are preserved; use `aoe remove` (optionally
-    /// with `--delete-worktree` / `--delete-branch`) to fully destroy a
-    /// session.
+    /// Archive a session: sink it in the Attention sort and tear down its
+    /// tmux sessions. Worktree, branch, container preserved. `--no-kill`
+    /// skips tmux teardown. See #1868.
     Archive(ArchiveArgs),
 
     /// Unarchive a session (restores it to its tier in the Attention sort)
     Unarchive(SessionIdArgs),
+
+    /// Restore a trashed session, returning it to its prior bucket with its
+    /// transcript and metadata intact. See #2489.
+    Restore(SessionIdArgs),
+
+    /// List the sessions currently in the trash.
+    ListTrash,
+
+    /// Permanently purge every trashed session in the profile (irreversible).
+    EmptyTrash,
 }
 
 #[derive(Args)]
@@ -97,9 +98,7 @@ pub struct ArchiveArgs {
     /// Session ID or title
     pub identifier: String,
 
-    /// Skip killing the tmux pane. By default archiving stops the running
-    /// agent so the row renders as truly parked; pass this to keep the
-    /// pane alive while still marking the session archived.
+    /// Skip tmux teardown on archive.
     #[arg(long = "no-kill")]
     pub no_kill: bool,
 }
@@ -270,6 +269,9 @@ pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
         SessionCommands::Unfavorite(args) => unfavorite_session(profile, args).await,
         SessionCommands::Archive(args) => archive_session(profile, args).await,
         SessionCommands::Unarchive(args) => unarchive_session(profile, args).await,
+        SessionCommands::Restore(args) => restore_session(profile, args).await,
+        SessionCommands::ListTrash => list_trash(profile).await,
+        SessionCommands::EmptyTrash => empty_trash(profile).await,
     }
 }
 
@@ -307,11 +309,13 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // Phase 2 (unlocked): tmux work; Storage::update closures must stay CPU-only.
+    // Phase 2 (unlocked): tmux work. Agent kill split from ancillary so
+    // the CLI prints a warn on agent failure. #1868.
     if !args.no_kill {
         if let Err(e) = inst.kill() {
-            eprintln!("Warning: failed to kill tmux session: {}", e);
+            eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
+        inst.kill_ancillary_tmux_sessions();
     }
 
     // Phase 3 (locked, fast): set archived_at by id.
@@ -348,6 +352,134 @@ async fn unarchive_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         Ok(inst.title.clone())
     })?;
     println!("Unarchived: {}", title);
+    Ok(())
+}
+
+async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    let title = storage.update(|instances, _groups| {
+        // Resolve within the trashed subset only. The CLI advertises the
+        // argument as an id OR title, and a live or archived session can share
+        // a title/path with a trashed one; resolving against the full list
+        // would let that row win and make `untrash()` a silent no-op on an
+        // already-live session. See #2489.
+        let trashed: Vec<_> = instances
+            .iter()
+            .filter(|i| i.is_trashed())
+            .cloned()
+            .collect();
+        let id = super::resolve_session(&args.identifier, &trashed)
+            .map_err(|_| anyhow::anyhow!("No trashed session matching '{}'", args.identifier))?
+            .id
+            .clone();
+        let inst = instances
+            .iter_mut()
+            .find(|i| i.id == id)
+            .expect("resolve_session returned an id that is no longer in instances");
+        inst.untrash();
+        Ok(inst.title.clone())
+    })?;
+    println!("Restored: {}", title);
+    Ok(())
+}
+
+async fn list_trash(profile: &str) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances.iter().filter(|i| i.is_trashed()).collect();
+    if trashed.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+    println!("Trashed sessions in profile '{}':", storage.profile());
+    for inst in trashed {
+        let when = inst
+            .trashed_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "?".to_string());
+        println!("  {}  {}  (trashed {})", inst.id, inst.title, when);
+    }
+    Ok(())
+}
+
+async fn empty_trash(profile: &str) -> Result<()> {
+    let storage = Storage::new_unwatched(profile)?;
+
+    // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
+    // teardown for each. Purge is permanent; force removal so a dirty
+    // worktree cannot keep an emptied session pinned in the trash.
+    let (instances, _groups) = storage.load_with_groups()?;
+    let trashed: Vec<_> = instances
+        .iter()
+        .filter(|i| i.is_trashed())
+        .cloned()
+        .collect();
+    if trashed.is_empty() {
+        println!("Trash is empty.");
+        return Ok(());
+    }
+
+    let mut purged_ids = Vec::new();
+    for inst in &trashed {
+        let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
+            profile,
+            std::path::Path::new(&inst.project_path),
+        );
+        let delete_worktree =
+            config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
+        // Tie branch deletion to worktree deletion + config so it also fires
+        // for multi-repo workspace sessions (which have no `worktree_info`);
+        // `perform_deletion` keys the workspace-repo branch cleanup off this
+        // same flag. See #2489.
+        let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
+        let delete_sandbox =
+            inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
+
+        let result = crate::session::deletion::perform_deletion(
+            &crate::session::deletion::DeletionRequest {
+                session_id: inst.id.clone(),
+                instance: inst.clone(),
+                delete_worktree,
+                delete_branch,
+                delete_sandbox,
+                force_delete: true,
+                detach_hooks: false,
+                keep_scratch: false,
+            },
+        );
+        for err in &result.errors {
+            eprintln!("Warning ({}): {}", inst.title, err);
+        }
+        // Only after teardown succeeded: purge the durable structured-view
+        // transcript (the daemon does this via the supervisor; the CLI opens
+        // the event store directly since it has no live worker) and drop the
+        // session row. Doing the irreversible transcript delete last keeps a
+        // failed purge fully restorable, and keeping the row on failure (here
+        // or in perform_deletion) lets the orphaned worktree/container/
+        // transcript be retried instead of abandoned. See #2489.
+        if result.success {
+            match super::purge_acp_transcript(inst) {
+                Ok(()) => purged_ids.push(inst.id.clone()),
+                Err(e) => eprintln!(
+                    "Warning ({}): transcript not purged, keeping session in trash: {}",
+                    inst.title, e
+                ),
+            }
+        }
+    }
+
+    // Phase 2 (locked): drop every purged id from the latest disk state.
+    let purged_set: HashSet<String> = purged_ids.into_iter().collect();
+    storage.update(|all_instances, _groups| {
+        all_instances.retain(|i| !purged_set.contains(&i.id));
+        Ok(())
+    })?;
+
+    println!(
+        "Emptied trash: purged {} session(s) from profile '{}'.",
+        trashed.len(),
+        storage.profile()
+    );
     Ok(())
 }
 
@@ -585,24 +717,21 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
         });
     }
 
-    let mut succeeded: Vec<(String, String, Option<String>)> = Vec::new();
+    let mut succeeded: Vec<(String, String)> = Vec::new();
     let mut failed: Vec<(String, String)> = Vec::new();
-    let mut restarted: Vec<(crate::session::Instance, Option<String>)> = Vec::new();
+    let mut restarted: Vec<crate::session::Instance> = Vec::new();
     while let Some(joined) = join_set.join_next().await {
         let (title, inst_opt, result) = joined.expect("JoinSet shouldn't panic on join itself");
-        let stale_sid = match &result {
-            Ok(StartOutcome::Restarted { stale_sid }) => Some(stale_sid.clone()),
-            _ => None,
-        };
         let id = inst_opt.as_ref().map(|i| i.id.clone()).unwrap_or_default();
         if let Some(inst) = inst_opt {
-            restarted.push((inst, stale_sid.clone()));
+            restarted.push(inst);
         }
         match result {
-            Ok(StartOutcome::Restarted { stale_sid }) => {
-                succeeded.push((id, title, Some(stale_sid)))
-            }
-            Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title, None)),
+            Ok(StartOutcome::ResumeFailed { sid }) => failed.push((
+                title,
+                format!("resume failed for sid {sid}; preserved for explicit retry"),
+            )),
+            Ok(StartOutcome::Resumed | StartOutcome::Fresh) => succeeded.push((id, title)),
             Err(e) => failed.push((title, e.to_string())),
         }
     }
@@ -614,9 +743,9 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
     // closure receives the latest disk state.
     let orphaned: Vec<(String, String)> = storage.update(|instances, _groups| {
         let mut orphaned = Vec::new();
-        for (restarted_inst, stale_sid) in restarted {
+        for restarted_inst in restarted {
             if let Some(stored) = instances.iter_mut().find(|i| i.id == restarted_inst.id) {
-                stored.merge_post_restart(&restarted_inst, stale_sid.as_deref());
+                stored.merge_post_restart(&restarted_inst);
             } else {
                 tracing::warn!(
                     target: "session.cli",
@@ -631,24 +760,11 @@ async fn restart_all_sessions(profile: &str, parallel: usize) -> Result<()> {
 
     // Sessions can share a title across paths; orphan filter keys on id.
     let orphaned_ids: HashSet<&String> = orphaned.iter().map(|(id, _)| id).collect();
-    succeeded.retain(|(id, _, _)| !orphaned_ids.contains(id));
+    succeeded.retain(|(id, _)| !orphaned_ids.contains(id));
 
-    let stale_count = succeeded.iter().filter(|(_, _, s)| s.is_some()).count();
-    if stale_count == 0 {
-        println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
-    } else {
-        println!(
-            "✓ Restarted {}/{} sessions ({} without prior history):",
-            succeeded.len(),
-            total,
-            stale_count,
-        );
-    }
-    for (_id, title, stale) in &succeeded {
-        match stale {
-            Some(sid) => println!("  · {}{}", title, stale_history_suffix(sid)),
-            None => println!("  · {}", title),
-        }
+    println!("✓ Restarted {}/{} sessions:", succeeded.len(), total);
+    for (_id, title) in &succeeded {
+        println!("  · {}", title);
     }
     if !orphaned.is_empty() {
         println!(
@@ -723,7 +839,7 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .unwrap_or_else(|_| "wake up: pick up what you were doing".to_string());
 
     let mut wake_succeeded = false;
-    if !wake_msg.is_empty() {
+    if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
         // Restart re-execs the agent at a blank prompt; nudge it back into
         // its prior task. Poll capture-pane for steady-state output instead
         // of a blind sleep, so the keys land as soon as the agent is at a
@@ -746,13 +862,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
 
     // touch_last_accessed runs on `stored`, not `working`: its fields are
     // peer-mutable and do not belong in `merge_post_restart`.
-    let stale_sid = match &outcome {
-        StartOutcome::Restarted { stale_sid } => Some(stale_sid.as_str()),
-        StartOutcome::Resumed | StartOutcome::Fresh => None,
-    };
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
-            stored.merge_post_restart(&working, stale_sid);
+            stored.merge_post_restart(&working);
             if wake_succeeded {
                 stored.touch_last_accessed();
             }
@@ -774,12 +886,8 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     }
 
     match outcome {
-        StartOutcome::Restarted { stale_sid } => {
-            println!(
-                "✓ Restarted session: {}{}",
-                title,
-                stale_history_suffix(&stale_sid),
-            );
+        StartOutcome::ResumeFailed { sid } => {
+            bail!("Resume failed for sid {sid}; preserved for explicit retry");
         }
         StartOutcome::Resumed | StartOutcome::Fresh => {
             println!("✓ Restarted session: {}", title);
@@ -1058,7 +1166,15 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         let mut live = inst.clone();
         crate::tmux::refresh_session_cache();
         live.update_status();
-        if live.status.blocks_worktree_edit() {
+        // A sandbox session's container keeps the worktree dir mounted even
+        // while the agent is Idle, so `git worktree move` would fail with
+        // EBUSY; stopping the session tears the container down and releases it.
+        if live.status.blocks_worktree_edit()
+            || crate::session::worktree_edit::sandbox_container_holds_worktree(
+                &id,
+                live.is_sandboxed(),
+            )
+        {
             bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
         }
         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
@@ -1071,6 +1187,16 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             },
         ) {
             Ok(outcome) => {
+                // The dir moved (path changed): a sandbox container created
+                // against the old path is now stale, so drop it to force a
+                // fresh create on next start. A branch-only edit leaves the
+                // path (and the mount) unchanged.
+                if outcome.new_path != std::path::Path::new(&current_path) {
+                    crate::session::worktree_edit::discard_sandbox_container_after_move(
+                        &id,
+                        live.is_sandboxed(),
+                    );
+                }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
                 new_branch = outcome.new_branch;
             }
@@ -1196,7 +1322,12 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     let mut live = inst.clone();
     crate::tmux::refresh_session_cache();
     live.update_status();
-    if live.status.blocks_worktree_edit() {
+    // A sandbox container keeps the worktree dir mounted even while the agent
+    // is Idle, so the move would fail with EBUSY; stopping the session releases
+    // the mount, same as the active-status case.
+    if live.status.blocks_worktree_edit()
+        || crate::session::worktree_edit::sandbox_container_holds_worktree(&id, live.is_sandboxed())
+    {
         bail!("Cannot edit the workdir name while the session is active; stop it first");
     }
 
@@ -1208,6 +1339,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             rename_branch: args.rename_branch,
         },
     )?;
+    // The dir moved (path changed): a sandbox container created against the old
+    // path is now stale, so drop it to force a fresh create on next start. A
+    // branch-only edit leaves the path (and the mount) unchanged.
+    if outcome.new_path != std::path::Path::new(&current_path) {
+        crate::session::worktree_edit::discard_sandbox_container_after_move(
+            &id,
+            live.is_sandboxed(),
+        );
+    }
     let new_path = outcome.new_path.to_string_lossy().to_string();
     let new_branch = outcome.new_branch.clone();
 
@@ -1310,6 +1450,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                 );
             }
             inst.resume_intent = new_intent.clone();
+            inst.resume_probe_failed_sid = None;
             Ok((inst.title.clone(), inst.tool.clone()))
         })
     })?;
@@ -1534,31 +1675,53 @@ mod target_filter_tests {
 }
 
 #[cfg(test)]
-mod stale_history_suffix_tests {
-    use super::stale_history_suffix;
+mod set_session_id_tests {
+    use super::{set_session_id, SetSessionIdArgs};
+    use crate::session::{Instance, ResumeIntent, Storage};
+    use serial_test::serial;
+    use tempfile::tempdir;
 
-    #[test]
-    fn matches_single_session_wording() {
-        let suffix = stale_history_suffix("11111111-1111-1111-1111-111111111111");
-        assert_eq!(
-            suffix,
-            " (resume failed for sid 11111111-1111-1111-1111-111111111111; \
-             started fresh, prior history not loaded)"
-        );
-    }
+    #[tokio::test]
+    #[serial]
+    async fn set_session_id_clears_resume_probe_failed_marker() {
+        let temp = tempdir().unwrap();
+        std::env::set_var("HOME", temp.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-    #[test]
-    fn renders_inline_with_title_correctly() {
-        let line = format!(
-            "  · {}{}",
-            "alpha",
-            stale_history_suffix("22222222-2222-2222-2222-222222222222"),
-        );
+        let storage = Storage::new_unwatched("set-sid-clear-marker").unwrap();
+        let mut inst = Instance::new("marked_session", "/tmp/x");
+        inst.agent_session_id = Some("11111111-1111-1111-1111-111111111111".to_string());
+        inst.resume_probe_failed_sid = Some("11111111-1111-1111-1111-111111111111".to_string());
+        let id = inst.id.clone();
+        let on_disk = inst.clone();
+        storage
+            .update(|i, g| {
+                *i = vec![on_disk.clone()];
+                *g =
+                    crate::session::GroupTree::new_with_groups(std::slice::from_ref(&on_disk), &[])
+                        .get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+
+        set_session_id(
+            "set-sid-clear-marker",
+            SetSessionIdArgs {
+                identifier: id.clone(),
+                session_id: "22222222-2222-2222-2222-222222222222".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let loaded = storage.load().unwrap();
+        let inst_disk = loaded.iter().find(|i| i.id == id).unwrap();
         assert_eq!(
-            line,
-            "  · alpha (resume failed for sid 22222222-2222-2222-2222-222222222222; \
-             started fresh, prior history not loaded)"
+            inst_disk.resume_intent,
+            ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
+        assert_eq!(inst_disk.resume_probe_failed_sid, None);
     }
 }
 

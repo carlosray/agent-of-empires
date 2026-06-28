@@ -45,6 +45,7 @@ pub enum ResumeStrategy {
 }
 
 /// A single hook event that AoE registers in an agent's settings file.
+#[derive(Debug)]
 pub struct HookEvent {
     /// Event name as the agent expects it (e.g. `"PreToolUse"` for Claude Code).
     pub name: &'static str,
@@ -54,11 +55,30 @@ pub struct HookEvent {
     pub status: Option<&'static str>,
     /// When `true`, install an additional hook command that extracts
     /// `session_id` from the agent's stdin JSON payload and writes it to
-    /// `/tmp/aoe-hooks/<AOE_INSTANCE_ID>/session_id`.
+    /// `/tmp/aoe-hooks-<euid>/<AOE_INSTANCE_ID>/session_id`.
     pub session_id_capture: bool,
 }
 
+/// On-disk format an agent uses for its status-detection hooks. Each variant
+/// drives one install path: `JsonSettings` goes through the generic
+/// `hooks.<event>[].hooks[].command` JSON writer used by Claude-shape agents;
+/// `CodexJson` shares the same JSON payload but resolves its path through
+/// Codex's `CODEX_HOME` convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookFormat {
+    /// JSON `settings.json` with `hooks.<event>[].hooks[].command`. Used by
+    /// Claude, Cursor, Gemini, Qwen, and any future agent that adopts this
+    /// shape.
+    JsonSettings,
+    /// Codex `hooks.json`. Identical JSON payload shape to `JsonSettings`,
+    /// but the path is resolved via `CODEX_HOME` → `~/.codex/hooks.json`.
+    /// Codex's `[hooks.state]` trust block lives in `config.toml` and is
+    /// untouched by this writer.
+    CodexJson,
+}
+
 /// Configuration for installing status-detection hooks into an agent's settings file.
+#[derive(Debug)]
 pub struct AgentHookConfig {
     /// Path relative to the home dir where the agent's settings live
     /// (e.g. `.claude/settings.json`).
@@ -71,6 +91,10 @@ pub struct AgentHookConfig {
     pub config_dir_env_var: Option<&'static str>,
     /// Hook events to register (status transitions and session lifecycle).
     pub events: &'static [HookEvent],
+    /// On-disk format of the settings file. Drives target-kind selection in
+    /// [`crate::hooks::iter_hook_targets_in`], which feeds the v015 marker
+    /// walker and the uninstall path.
+    pub format: HookFormat,
 }
 
 /// Installer for an agent whose status hooks live in a config format the
@@ -80,6 +104,7 @@ pub struct AgentHookConfig {
 /// call site (`status_hook_env_prefix`, host install, sandbox install,
 /// `uninstall_all_hooks`) dispatch through one field instead of matching agent
 /// names. An agent has at most one of `hook_config` or `sidecar_hooks`.
+#[derive(Debug)]
 pub struct SidecarHooks {
     /// Config path relative to the home directory for a host session
     /// (e.g. `.hermes/config.yaml`).
@@ -88,14 +113,62 @@ pub struct SidecarHooks {
     /// (e.g. `.hermes/sandbox/config.yaml`). The `sandbox` segment mirrors the
     /// container staging dir. Empty (and unused) for `host_only` agents.
     pub sandbox_config_subpath: &'static str,
-    /// Write AoE status hooks into the config file at the given path.
-    pub install: fn(&std::path::Path) -> anyhow::Result<()>,
+    /// Write AoE status hooks into the config file at the given path. The
+    /// `target` parameter selects which `{base}` is baked into the hook
+    /// command string (`/tmp/aoe-hooks-<euid>` for host, `/tmp/aoe-hooks` for
+    /// sandbox; see `crate::hooks::HookInstallTarget`).
+    pub install: fn(&std::path::Path, crate::hooks::HookInstallTarget) -> anyhow::Result<()>,
     /// Remove AoE status hooks from the config file at the given path.
     /// Returns whether anything was changed.
     pub uninstall: fn(&std::path::Path) -> anyhow::Result<bool>,
     /// Optional host-only follow-up run after a successful host install
     /// (e.g. kiro promotes its `aoe-hooks` agent to the active default).
     pub post_install_host: Option<fn()>,
+    /// Set for CLIs whose hooks are scoped to a user-selectable named agent
+    /// rather than applying globally (e.g. Kiro: `--agent NAME` loads only that
+    /// agent's config, and there is no global hooks mechanism). When set and
+    /// the user selected an agent, AoE installs its hooks into that agent's own
+    /// config file instead of the standalone `host_config_subpath` agent, and
+    /// skips `post_install_host`. `None` for agents whose hooks apply
+    /// regardless of which agent is selected. See
+    /// [`crate::session::Instance::install_agent_status_hooks`].
+    pub selected_agent_hooks: Option<SelectedAgentHooks>,
+    /// On-disk format of the sidecar's config file. Drives marker-presence
+    /// walker dispatch in [`crate::hooks::has_aoe_marker`].
+    pub format: SidecarFormat,
+}
+
+/// How to install status hooks into a user-selected named agent, for CLIs
+/// whose hooks are scoped to the selected agent (see
+/// [`SidecarHooks::selected_agent_hooks`]). Keeps the flag and path convention
+/// as data on the agent definition rather than a per-agent string match at the
+/// install site.
+#[derive(Debug)]
+pub struct SelectedAgentHooks {
+    /// CLI flag a user passes to choose a named agent (e.g. `"--agent"`).
+    pub flag: &'static str,
+    /// Absolute path, under the given agents directory, of the config file the
+    /// CLI actually loads for the selected agent name. The first argument is
+    /// the agents directory to resolve within (host: `$HOME/.kiro/agents`;
+    /// sandbox: the staged `.kiro/sandbox/agents`), the second is the validated
+    /// selected agent name. Resolves by the `name` field inside each config
+    /// rather than the filename, since generator-managed agents name files
+    /// `<prefix>-<name>.json`. See [`crate::hooks::resolve_kiro_agent_file`].
+    pub resolve_config_file: fn(&std::path::Path, &str) -> std::path::PathBuf,
+}
+
+/// On-disk format of a sidecar agent's config file. Drives
+/// marker-presence walker dispatch in [`crate::hooks::has_aoe_marker`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidecarFormat {
+    /// Settl `[[hooks]]` table in `.settl/config.toml`.
+    SettlToml,
+    /// Hermes `hooks: { event: [...] }` map in `.hermes/config.yaml` (or
+    /// `.hermes/sandbox/config.yaml`).
+    HermesYaml,
+    /// Kiro per-agent JSON with a flat `hooks.{event}: [{command, ...}]`
+    /// shape under `.kiro/...` agent files.
+    KiroJson,
 }
 
 /// Everything we know about a single agent CLI.
@@ -104,6 +177,20 @@ pub struct AgentDef {
     pub name: &'static str,
     /// Binary to invoke (usually same as name).
     pub binary: &'static str,
+    /// Subcommand token inserted immediately after `binary` when AoE builds the
+    /// default launch command (e.g. `Some("chat")` for kiro → `kiro-cli chat`).
+    /// Required for CLIs whose interactive flags (yolo, `--agent`, resume) live
+    /// on a subcommand rather than the top-level binary: bare
+    /// `kiro-cli --trust-all-tools` is rejected with "unexpected argument",
+    /// while `kiro-cli chat --trust-all-tools` parses. `None` for agents whose
+    /// bare binary already accepts those flags. Only applied to the default
+    /// binary path, never to a user's custom command override.
+    ///
+    /// Must not be combined with [`ResumeStrategy::Subcommand`]: that strategy
+    /// inserts the resume token after the first whitespace token (the binary),
+    /// which would land it before this launch subcommand. The pairing is
+    /// rejected by `test_launch_subcommand_not_combined_with_subcommand_resume`.
+    pub launch_subcommand: Option<&'static str>,
     /// Alternative substrings recognised by `resolve_tool_name` (e.g. `"open-code"`).
     pub aliases: &'static [&'static str],
     /// How to detect availability on the host.
@@ -113,6 +200,14 @@ pub struct AgentDef {
     /// CLI flag template for custom instruction injection.
     /// `{}` is replaced with the shell-escaped instruction text.
     pub instruction_flag: Option<&'static str>,
+    /// Single argv token that runs this agent non-interactively (one-shot),
+    /// printing the model's response to stdout and exiting (e.g. claude `-p`,
+    /// codex `exec`, opencode `run`, gemini `-p`). It is exactly one token,
+    /// placed immediately before the prompt argument, and must NOT contain a
+    /// `{}` placeholder (the prompt is passed as its own argv element, never
+    /// interpolated). `None` means the agent has no known one-shot mode, so
+    /// smart session rename is skipped for it. See `session::smart_rename`.
+    pub oneshot_flag: Option<&'static str>,
     /// If true, `builder.rs` sets `instance.command = binary` for this agent.
     pub set_default_command: bool,
     /// Status detection function pointer. Takes raw (non-lowercased) pane content.
@@ -144,10 +239,19 @@ pub struct AgentDef {
 
 /// Claude Code hook events. `SessionStart` and `UserPromptSubmit` carry
 /// `session_id_capture: true` so the per-instance sidecar
-/// (`/tmp/aoe-hooks/<id>/session_id`) is updated whenever Claude rotates
+/// (`/tmp/aoe-hooks-<euid>/<id>/session_id`) is updated whenever Claude rotates
 /// its session UUID (`/clear`, `/new`, `--fork-session`, resume, compact).
 /// `claude_poll_fn` reads this sidecar before falling back to its disk
 /// scan.
+///
+/// `idle` has two sources, not just `Stop`. `Stop` does not fire on every
+/// turn-end path: a turn killed by an API error fires `StopFailure` instead,
+/// and a user interrupt fires nothing. Without a second idle signal the status
+/// file stays on the last `running` write and the session sticks on Running.
+/// `Notification` with matcher `idle_prompt` is Claude's explicit "done
+/// working, waiting for the user" signal and fires whenever Claude parks at the
+/// prompt regardless of why the turn ended, so it backstops `Stop`;
+/// `StopFailure` covers the API-error path deterministically.
 const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -174,9 +278,21 @@ const CLAUDE_HOOK_EVENTS: &[HookEvent] = &[
         session_id_capture: false,
     },
     HookEvent {
+        name: "StopFailure",
+        matcher: None,
+        status: Some("idle"),
+        session_id_capture: false,
+    },
+    HookEvent {
         name: "Notification",
         matcher: Some("permission_prompt|elicitation_dialog"),
         status: Some("waiting"),
+        session_id_capture: false,
+    },
+    HookEvent {
+        name: "Notification",
+        matcher: Some("idle_prompt"),
+        status: Some("idle"),
         session_id_capture: false,
     },
     HookEvent {
@@ -261,8 +377,7 @@ const QWEN_HOOK_EVENTS: &[HookEvent] = &[
     },
 ];
 
-/// Codex hook events. Codex loads these from the `[hooks]` table in
-/// `~/.codex/config.toml`.
+/// Codex hook events. AoE installs these into `~/.codex/hooks.json`.
 const CODEX_HOOK_EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -305,7 +420,9 @@ const CODEX_HOOK_EVENTS: &[HookEvent] = &[
 pub const AGENTS: &[AgentDef] = &[
     AgentDef {
         name: "claude",
+        oneshot_flag: Some("-p"),
         binary: "claude",
+        launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("claude"),
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
@@ -317,6 +434,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".claude/settings.json",
             config_dir_env_var: Some("CLAUDE_CONFIG_DIR"),
             events: CLAUDE_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
@@ -329,7 +447,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "opencode",
+        oneshot_flag: Some("run"),
         binary: "opencode",
+        launch_subcommand: None,
         aliases: &["open-code"],
         detection: DetectionMethod::Which("opencode"),
         yolo: Some(YoloMode::EnvVar("OPENCODE_PERMISSION", r#"{"*":"allow"}"#)),
@@ -346,7 +466,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "vibe",
+        oneshot_flag: None,
         binary: "vibe",
+        launch_subcommand: None,
         aliases: &["mistral-vibe"],
         detection: DetectionMethod::RunWithArg("vibe", "--version"),
         yolo: Some(YoloMode::CliFlag("--agent auto-approve")),
@@ -363,7 +485,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "codex",
+        oneshot_flag: Some("exec"),
         binary: "codex",
+        launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("codex"),
         yolo: Some(YoloMode::CliFlag(
@@ -374,11 +498,12 @@ pub const AGENTS: &[AgentDef] = &[
         detect_status: status_detection::detect_codex_status,
         container_env: &[],
         hook_config: Some(AgentHookConfig {
-            settings_rel_path: ".codex/config.toml",
-            // Codex resolves its config dir via `CODEX_HOME` through a bespoke
-            // path pair; install/uninstall are special-cased on agent name.
+            settings_rel_path: ".codex/hooks.json",
+            // Codex's config dir resolves via `CODEX_HOME`, not a generic
+            // `config_dir_env_var`; the `CodexJson` writer handles that itself.
             config_dir_env_var: None,
             events: CODEX_HOOK_EVENTS,
+            format: HookFormat::CodexJson,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Subcommand("resume"),
@@ -391,7 +516,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "gemini",
+        oneshot_flag: Some("-p"),
         binary: "gemini",
+        launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("gemini"),
         yolo: Some(YoloMode::CliFlag("--approval-mode yolo")),
@@ -428,6 +555,7 @@ pub const AGENTS: &[AgentDef] = &[
                     session_id_capture: false,
                 },
             ],
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
@@ -437,7 +565,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "cursor",
+        oneshot_flag: None,
         binary: "agent",
+        launch_subcommand: None,
         aliases: &["agent"],
         detection: DetectionMethod::Which("agent"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
@@ -449,6 +579,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".cursor/settings.json",
             config_dir_env_var: Some("CURSOR_CONFIG_DIR"),
             events: CURSOR_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Unsupported,
@@ -458,7 +589,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "copilot",
+        oneshot_flag: None,
         binary: "copilot",
+        launch_subcommand: None,
         aliases: &["github-copilot"],
         detection: DetectionMethod::Which("copilot"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
@@ -475,7 +608,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "pi",
+        oneshot_flag: None,
         binary: "pi",
+        launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("pi"),
         // Pi runs in full YOLO mode by default (no approval gates), so no flag needed.
@@ -493,7 +628,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "droid",
+        oneshot_flag: None,
         binary: "droid",
+        launch_subcommand: None,
         aliases: &["factory-droid"],
         detection: DetectionMethod::Which("droid"),
         yolo: Some(YoloMode::CliFlag("--skip-permissions-unsafe")),
@@ -510,7 +647,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "settl",
+        oneshot_flag: None,
         binary: "settl",
+        launch_subcommand: None,
         aliases: &["settlers", "catan"],
         detection: DetectionMethod::Which("settl"),
         yolo: Some(YoloMode::AlwaysYolo),
@@ -528,6 +667,8 @@ pub const AGENTS: &[AgentDef] = &[
             install: crate::hooks::install_settl_hooks,
             uninstall: crate::hooks::uninstall_settl_hooks,
             post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::SettlToml,
         }),
         resume_strategy: ResumeStrategy::Unsupported,
         host_only: true,
@@ -536,7 +677,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "hermes",
+        oneshot_flag: None,
         binary: "hermes",
+        launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("hermes"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
@@ -560,6 +703,8 @@ pub const AGENTS: &[AgentDef] = &[
             install: crate::hooks::install_hermes_hooks,
             uninstall: crate::hooks::uninstall_hermes_hooks,
             post_install_host: None,
+            selected_agent_hooks: None,
+            format: SidecarFormat::HermesYaml,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume"),
         host_only: false,
@@ -569,7 +714,12 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "kiro",
+        oneshot_flag: None,
         binary: "kiro-cli",
+        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // are defined on the `chat` subcommand. Bare `kiro-cli --trust-all-tools`
+        // fails with "unexpected argument"; `kiro-cli chat ...` parses.
+        launch_subcommand: Some("chat"),
         aliases: &["kiro-cli"],
         detection: DetectionMethod::Which("kiro-cli"),
         yolo: Some(YoloMode::CliFlag("--trust-all-tools")),
@@ -590,6 +740,15 @@ pub const AGENTS: &[AgentDef] = &[
             install: crate::hooks::install_kiro_hooks,
             uninstall: crate::hooks::uninstall_kiro_hooks,
             post_install_host: Some(crate::hooks::set_kiro_default_agent_if_builtin),
+            // Kiro scopes hooks to the agent selected by `--agent`; when the
+            // user picks their own agent, install hooks into that agent's file
+            // (Kiro has no global hooks) instead of the standalone aoe-hooks
+            // agent, and skip the set-default promotion above.
+            selected_agent_hooks: Some(SelectedAgentHooks {
+                flag: "--agent",
+                resolve_config_file: crate::hooks::resolve_kiro_agent_file,
+            }),
+            format: SidecarFormat::KiroJson,
         }),
         resume_strategy: ResumeStrategy::Flag("--resume-id"),
         host_only: false,
@@ -598,7 +757,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "qwen",
+        oneshot_flag: None,
         binary: "qwen",
+        launch_subcommand: None,
         aliases: &[],
         detection: DetectionMethod::Which("qwen"),
         yolo: Some(YoloMode::CliFlag("--yolo")),
@@ -610,6 +771,7 @@ pub const AGENTS: &[AgentDef] = &[
             settings_rel_path: ".qwen/settings.json",
             config_dir_env_var: None,
             events: QWEN_HOOK_EVENTS,
+            format: HookFormat::JsonSettings,
         }),
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::FlagPair {
@@ -622,7 +784,9 @@ pub const AGENTS: &[AgentDef] = &[
     },
     AgentDef {
         name: "antigravity",
+        oneshot_flag: None,
         binary: "agy",
+        launch_subcommand: None,
         aliases: &["agy"],
         detection: DetectionMethod::Which("agy"),
         yolo: Some(YoloMode::CliFlag("--dangerously-skip-permissions")),
@@ -640,8 +804,96 @@ pub const AGENTS: &[AgentDef] = &[
 ];
 
 /// Look up an agent by canonical name.
+impl AgentDef {
+    /// Extra argv tokens inserted between the one-shot flag and the prompt for a
+    /// one-shot (smart-rename) title call. These are static, never user input,
+    /// so the no-injection contract (prompt stays the final argv element) holds.
+    ///
+    /// Codex's `exec` refuses to run outside a trusted git repo
+    /// ("Not inside a trusted directory and --skip-git-repo-check was not
+    /// specified", exit 1), so a one-shot in a scratch or other non-repo session
+    /// cwd fails. `--skip-git-repo-check` lets the title call run anywhere; the
+    /// title task does not touch the repo, so skipping the check is safe.
+    pub fn oneshot_extra_args(&self) -> &'static [&'static str] {
+        match self.name {
+            "codex" => &["--skip-git-repo-check"],
+            _ => &[],
+        }
+    }
+
+    /// The base launch token(s) for the default (non-overridden) command:
+    /// the binary, plus any `launch_subcommand` (e.g. `"kiro-cli chat"`). All
+    /// subsequent flags (extra args, yolo, resume) are appended after this, so
+    /// subcommand-scoped flags land on the subcommand where the CLI expects
+    /// them. Agents without a `launch_subcommand` just return the binary.
+    pub fn launch_base_command(&self) -> String {
+        match self.launch_subcommand {
+            Some(sub) => format!("{} {}", self.binary, sub),
+            None => self.binary.to_string(),
+        }
+    }
+}
+
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+/// Extract the agent name a user selected via `<flag> NAME` or `<flag>=NAME`
+/// in a command/extra-args string (e.g. Kiro's `--agent custom-agent`). The flag
+/// comes from [`SelectedAgentHooks::flag`] so the convention stays data on the
+/// agent definition. Returns `None` when the flag is absent, has no value, or
+/// its final occurrence carries a rejected value.
+///
+/// The **last** occurrence decides the result, matching how clap-based CLIs
+/// (Kiro included) resolve a repeated single-value flag: `--agent a --agent b`
+/// loads `b`. Crucially, a later occurrence overwrites an earlier one even when
+/// its value is rejected, so `--agent good --agent ..` returns `None` rather
+/// than `good`: the CLI itself would load `..` (and reject it / fall back to its
+/// default), so AoE must not install hooks into `good`, an agent the CLI is not
+/// running. Returning `None` makes AoE fall back to its standalone hooks agent,
+/// which is what the CLI effectively does. This also gives extra-args the final
+/// say over a command override when [`crate::session::Instance::selected_agent_args`]
+/// concatenates command then extra-args.
+///
+/// A value is rejected by [`is_safe_agent_name`] (empty, `.`/`..`, leading dash,
+/// or a path separator) so a parsed value can be safely joined to an agents
+/// directory without path traversal. Whitespace-tokenized, which matches how AoE
+/// assembles the launch string; quoted values containing spaces are not handled
+/// (agent names do not contain spaces in practice).
+pub fn parse_selected_agent(args: &str, flag: &str) -> Option<String> {
+    let eq_prefix = format!("{flag}=");
+    let mut tokens = args.split_whitespace();
+    let mut selected = None;
+    while let Some(tok) = tokens.next() {
+        // The value of this flag occurrence: the text after `=`, the next token
+        // for the space-separated form, or `None` for a dangling flag.
+        let value = if let Some(rest) = tok.strip_prefix(&eq_prefix) {
+            Some(rest)
+        } else if tok == flag {
+            tokens.next()
+        } else {
+            continue;
+        };
+        // Last occurrence wins: overwrite with this occurrence's validated
+        // value, so a trailing rejected/missing value clears an earlier valid
+        // one (mirroring the CLI's last-wins resolution).
+        selected = value.filter(|&v| is_safe_agent_name(v)).map(str::to_string);
+    }
+    selected
+}
+
+/// Guard against path traversal and obvious misparses: a selected agent name is
+/// joined to an agents directory, so reject empty names, `.`/`..`, anything
+/// containing a path separator, and flag-shaped tokens. The leading-dash check
+/// means a value-less flag (`--agent --model`) yields `None` rather than
+/// treating the following flag as an agent name.
+fn is_safe_agent_name(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.starts_with('-')
+        && !name.contains('/')
+        && !name.contains('\\')
 }
 
 /// Returns the delay (in ms) to insert before the submit-Enter for this agent.
@@ -703,9 +955,49 @@ pub fn name_from_settings_index(index: usize) -> Option<&'static str> {
     }
 }
 
+/// Names of built-in agents that can run a one-shot title call (a non-`None`
+/// `oneshot_flag`). The smart-rename agent picker lists these, since only
+/// these agents can be used for the one-shot rename.
+pub fn oneshot_capable_names() -> Vec<&'static str> {
+    AGENTS
+        .iter()
+        .filter(|a| a.oneshot_flag.is_some())
+        .map(|a| a.name)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_oneshot_flags_are_single_tokens_without_placeholders() {
+        // The smart-rename safety contract: a non-None oneshot_flag is exactly
+        // one argv token placed before the prompt, and never interpolates the
+        // prompt. Keep future agent additions from weakening that.
+        for agent in AGENTS {
+            let Some(flag) = agent.oneshot_flag else {
+                continue;
+            };
+            assert_eq!(
+                flag,
+                flag.trim(),
+                "agent '{}' one-shot flag must not have surrounding whitespace",
+                agent.name
+            );
+            assert_eq!(
+                flag.split_whitespace().count(),
+                1,
+                "agent '{}' one-shot flag must be exactly one argv token",
+                agent.name
+            );
+            assert!(
+                !flag.contains("{}"),
+                "agent '{}' one-shot flag must not interpolate the prompt",
+                agent.name
+            );
+        }
+    }
 
     #[test]
     fn test_get_agent_known() {
@@ -840,6 +1132,156 @@ mod tests {
     }
 
     #[test]
+    fn test_kiro_launches_via_chat_subcommand() {
+        // Kiro's interactive flags (--trust-all-tools, --agent, --resume-id)
+        // are scoped to the `chat` subcommand, so the base command must include
+        // it; bare `kiro-cli --trust-all-tools` is rejected by the CLI.
+        let kiro = get_agent("kiro").unwrap();
+        assert_eq!(kiro.launch_subcommand, Some("chat"));
+        assert_eq!(kiro.launch_base_command(), "kiro-cli chat");
+    }
+
+    #[test]
+    fn test_launch_base_command_without_subcommand_is_binary() {
+        // Agents with no launch_subcommand keep their bare binary.
+        let claude = get_agent("claude").unwrap();
+        assert_eq!(claude.launch_subcommand, None);
+        assert_eq!(claude.launch_base_command(), "claude");
+    }
+
+    #[test]
+    fn test_only_kiro_uses_launch_subcommand() {
+        // Lock the surface: today only kiro needs a launch subcommand. A new
+        // agent that needs one must update this test deliberately.
+        for agent in AGENTS {
+            let expected = if agent.name == "kiro" {
+                Some("chat")
+            } else {
+                None
+            };
+            assert_eq!(
+                agent.launch_subcommand, expected,
+                "agent '{}' launch_subcommand drifted",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_launch_subcommand_not_combined_with_subcommand_resume() {
+        // `append_resume_flags` inserts a Subcommand resume token after the
+        // first whitespace token, which for a launch_subcommand agent is the
+        // binary. That lands the resume token before the subcommand and produces
+        // a malformed command (e.g. `kiro-cli resume <id> chat ...`). Forbid the
+        // pairing until that insertion is made subcommand-aware.
+        for agent in AGENTS {
+            if agent.launch_subcommand.is_some() {
+                assert!(
+                    !matches!(agent.resume_strategy, ResumeStrategy::Subcommand(_)),
+                    "agent '{}' combines launch_subcommand with ResumeStrategy::Subcommand; \
+                     resume token would be inserted before the subcommand",
+                    agent.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_selected_agent() {
+        assert_eq!(
+            parse_selected_agent("--agent custom-agent", "--agent"),
+            Some("custom-agent".to_string())
+        );
+        assert_eq!(
+            parse_selected_agent(
+                "--trust-all-tools --agent custom-agent --model x",
+                "--agent"
+            ),
+            Some("custom-agent".to_string())
+        );
+        assert_eq!(
+            parse_selected_agent("--agent=custom-agent", "--agent"),
+            Some("custom-agent".to_string())
+        );
+        // Absent flag.
+        assert_eq!(parse_selected_agent("--trust-all-tools", "--agent"), None);
+        assert_eq!(parse_selected_agent("", "--agent"), None);
+        // Dangling flag with no value.
+        assert_eq!(parse_selected_agent("--foo --agent", "--agent"), None);
+        // A value-less flag followed by another flag must not capture the flag
+        // as the agent name.
+        assert_eq!(parse_selected_agent("--agent --model x", "--agent"), None);
+        // Repeated flag: last occurrence wins, matching clap precedence.
+        assert_eq!(
+            parse_selected_agent("--agent first --agent second", "--agent"),
+            Some("second".to_string())
+        );
+        // Last-wins is honored even when the trailing value is rejected: the CLI
+        // would load `..` (and reject / fall back), so AoE must NOT keep `good`
+        // and write hooks into an agent the CLI is not running. Returns None so
+        // AoE falls back to its standalone hooks agent.
+        assert_eq!(
+            parse_selected_agent("--agent good --agent ..", "--agent"),
+            None
+        );
+        // A trailing dangling flag likewise clears an earlier valid value.
+        assert_eq!(
+            parse_selected_agent("--agent good --agent", "--agent"),
+            None
+        );
+        // `--agent=` (empty value) is rejected.
+        assert_eq!(parse_selected_agent("--agent=", "--agent"), None);
+        // Path-traversal / unsafe names are rejected.
+        assert_eq!(
+            parse_selected_agent("--agent ../../etc/passwd", "--agent"),
+            None
+        );
+        assert_eq!(parse_selected_agent("--agent=a/b", "--agent"), None);
+        assert_eq!(parse_selected_agent("--agent .", "--agent"), None);
+        // Flag is parameterized, not hardcoded.
+        assert_eq!(
+            parse_selected_agent("--profile prod", "--profile"),
+            Some("prod".to_string())
+        );
+    }
+
+    #[test]
+    fn test_kiro_declares_selected_agent_hooks() {
+        // Kiro's hooks are scoped to the --agent-selected agent; the flag and
+        // path convention live as data on the AgentDef, not a string match at
+        // the install site.
+        let kiro = get_agent("kiro").unwrap();
+        let sel = kiro
+            .sidecar_hooks
+            .as_ref()
+            .unwrap()
+            .selected_agent_hooks
+            .as_ref()
+            .expect("kiro declares selected_agent_hooks");
+        assert_eq!(sel.flag, "--agent");
+        // With no matching agent file in the dir, the resolver falls back to
+        // `<dir>/<name>.json` (the create-path for a brand-new user agent).
+        let tmp = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            (sel.resolve_config_file)(tmp.path(), "custom-agent"),
+            tmp.path().join("custom-agent.json")
+        );
+        // The other sidecar agents do not (their hooks apply globally).
+        for name in ["settl", "hermes"] {
+            assert!(
+                get_agent(name)
+                    .unwrap()
+                    .sidecar_hooks
+                    .as_ref()
+                    .unwrap()
+                    .selected_agent_hooks
+                    .is_none(),
+                "agent '{name}' should not declare selected_agent_hooks"
+            );
+        }
+    }
+
+    #[test]
     fn test_send_keys_enter_delay() {
         // Codex needs a delay to outlast its 120ms paste-burst suppression window
         assert!(send_keys_enter_delay("codex") >= 150);
@@ -898,5 +1340,85 @@ mod tests {
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
         assert!(install_hint("unknown").is_none());
+    }
+
+    #[test]
+    fn test_all_hook_configs_declare_expected_format() {
+        // Adding or changing an agent's hook format requires updating both
+        // this list and the declaration in `AGENTS`. The dispatch in
+        // `crate::hooks::iter_hook_targets_in` is keyed off this field, so
+        // drift here is a behavior change.
+        let expected: &[(&str, HookFormat)] = &[
+            ("claude", HookFormat::JsonSettings),
+            ("codex", HookFormat::CodexJson),
+            ("gemini", HookFormat::JsonSettings),
+            ("cursor", HookFormat::JsonSettings),
+            ("qwen", HookFormat::JsonSettings),
+        ];
+        for (name, fmt) in expected {
+            let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
+            let cfg = agent
+                .hook_config
+                .as_ref()
+                .unwrap_or_else(|| panic!("agent {name} must have hook_config"));
+            assert_eq!(cfg.format, *fmt, "agent {name} hook format must be {fmt:?}");
+        }
+        let declared: Vec<&str> = AGENTS
+            .iter()
+            .filter(|a| a.hook_config.is_some())
+            .map(|a| a.name)
+            .collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            declared, expected_names,
+            "hook_config agent set drifted; update test_all_hook_configs_declare_expected_format"
+        );
+    }
+
+    #[test]
+    fn test_all_sidecar_hooks_declare_expected_format() {
+        // Mirror of `test_all_hook_configs_declare_expected_format` for the
+        // sidecar path. The dispatch in `crate::hooks::has_aoe_marker` is
+        // keyed off this field.
+        let expected: &[(&str, SidecarFormat)] = &[
+            ("settl", SidecarFormat::SettlToml),
+            ("hermes", SidecarFormat::HermesYaml),
+            ("kiro", SidecarFormat::KiroJson),
+        ];
+        for (name, fmt) in expected {
+            let agent = get_agent(name).unwrap_or_else(|| panic!("missing agent {name}"));
+            let sidecar = agent
+                .sidecar_hooks
+                .as_ref()
+                .unwrap_or_else(|| panic!("agent {name} must have sidecar_hooks"));
+            assert_eq!(
+                sidecar.format, *fmt,
+                "agent {name} sidecar format must be {fmt:?}"
+            );
+        }
+        let declared: Vec<&str> = AGENTS
+            .iter()
+            .filter(|a| a.sidecar_hooks.is_some())
+            .map(|a| a.name)
+            .collect();
+        let expected_names: Vec<&str> = expected.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            declared, expected_names,
+            "sidecar_hooks agent set drifted; update test_all_sidecar_hooks_declare_expected_format"
+        );
+    }
+
+    #[test]
+    fn test_hook_config_and_sidecar_hooks_are_mutually_exclusive() {
+        // `SidecarHooks` doc states the two are mutually exclusive. Lock
+        // the invariant so a future agent does not silently get hooks
+        // installed by both paths.
+        for agent in AGENTS {
+            assert!(
+                !(agent.hook_config.is_some() && agent.sidecar_hooks.is_some()),
+                "agent {} must not declare both hook_config and sidecar_hooks",
+                agent.name
+            );
+        }
     }
 }

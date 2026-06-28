@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
-use super::container_interface::{ContainerConfig, ContainerRuntimeInterface};
+use super::container_interface::ContainerConfig;
 use super::error::{DockerError, Result};
 use super::runtime_base::RuntimeBase;
 
@@ -52,24 +52,20 @@ impl Default for ContainerRuntime {
     }
 }
 
-impl ContainerRuntimeInterface for ContainerRuntime {
-    fn is_available(&self) -> bool {
+impl ContainerRuntime {
+    pub fn is_available(&self) -> bool {
         self.base.is_available()
     }
 
-    fn is_daemon_running(&self) -> bool {
+    pub fn is_daemon_running(&self) -> bool {
         self.base.is_daemon_running()
     }
 
-    fn get_version(&self) -> Result<String> {
-        self.base.get_version()
-    }
-
-    fn image_exists_locally(&self, image: &str) -> bool {
+    pub fn image_exists_locally(&self, image: &str) -> bool {
         self.base.image_exists_locally(image)
     }
 
-    fn local_image_digest(&self, image: &str) -> Option<String> {
+    pub fn local_image_digest(&self, image: &str) -> Option<String> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 // `RepoDigests` holds `repo@sha256:...` entries for the pulled
@@ -99,23 +95,23 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         }
     }
 
-    fn pull_image(&self, image: &str) -> Result<()> {
+    pub fn pull_image(&self, image: &str) -> Result<()> {
         self.base.pull_image(image)
     }
 
-    fn ensure_image(&self, image: &str) -> Result<()> {
+    pub fn ensure_image(&self, image: &str) -> Result<()> {
         self.base.ensure_image(image)
     }
 
-    fn default_sandbox_image(&self) -> &'static str {
+    pub fn default_sandbox_image(&self) -> &'static str {
         self.base.default_sandbox_image()
     }
 
-    fn effective_default_image(&self) -> String {
+    pub fn effective_default_image(&self) -> String {
         self.base.effective_default_image()
     }
 
-    fn does_container_exist(&self, name: &str) -> Result<bool> {
+    pub fn does_container_exist(&self, name: &str) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 let output = self
@@ -135,7 +131,7 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         }
     }
 
-    fn is_container_running(&self, name: &str) -> Result<bool> {
+    pub fn is_container_running(&self, name: &str) -> Result<bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 let output = self
@@ -170,11 +166,42 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         }
     }
 
-    fn build_create_args(&self, name: &str, image: &str, config: &ContainerConfig) -> Vec<String> {
+    /// The container's configured working directory (`Config.WorkingDir`), or
+    /// `None` if it can't be determined (container gone, inspect failed, or the
+    /// field is empty). Used to backfill the create-time-pinned workdir for
+    /// sandbox sessions that predate it (#2414). Works on stopped containers
+    /// too, since `inspect` reads static config.
+    ///
+    /// Apple's `container` CLI does not expose this via a stable `inspect`
+    /// field we rely on, so it returns `None` there and the caller keeps the
+    /// create-time value (or the live fallback for legacy sessions).
+    pub fn container_working_dir(&self, name: &str) -> Option<String> {
+        if !matches!(self.kind, RuntimeKind::Docker | RuntimeKind::Podman) {
+            return None;
+        }
+        let output = self
+            .base
+            .command()
+            .args(["container", "inspect", "-f", "{{.Config.WorkingDir}}", name])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let wd = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        (!wd.is_empty()).then_some(wd)
+    }
+
+    pub fn build_create_args(
+        &self,
+        name: &str,
+        image: &str,
+        config: &ContainerConfig,
+    ) -> Vec<String> {
         self.base.build_create_args(name, image, config)
     }
 
-    fn create_container(
+    pub fn create_container(
         &self,
         name: &str,
         image: &str,
@@ -186,19 +213,19 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         self.base.run_create(name, image, config)
     }
 
-    fn start_container(&self, name: &str) -> Result<()> {
+    pub fn start_container(&self, name: &str) -> Result<()> {
         self.base.start_container(name)
     }
 
-    fn stop_container(&self, name: &str) -> Result<()> {
+    pub fn stop_container(&self, name: &str) -> Result<()> {
         self.base.stop_container(name)
     }
 
-    fn remove(&self, name: &str, force: bool) -> Result<()> {
+    pub fn remove(&self, name: &str, force: bool) -> Result<()> {
         self.base.remove(name, force)
     }
 
-    fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
+    pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 // Docker/Podman containers inherit a full PATH, so the command
@@ -232,11 +259,11 @@ impl ContainerRuntimeInterface for ContainerRuntime {
         }
     }
 
-    fn exec(&self, name: &str, cmd: &[&str]) -> Result<std::process::Output> {
+    pub fn exec(&self, name: &str, cmd: &[&str]) -> Result<std::process::Output> {
         self.base.exec(name, cmd)
     }
 
-    fn batch_running_states(&self, prefix: &str) -> HashMap<String, bool> {
+    pub fn batch_running_states(&self, prefix: &str) -> HashMap<String, bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
                 let output = self

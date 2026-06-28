@@ -5,7 +5,7 @@
 //! - Container cleanup when deleting a sandboxed session
 //! - Docker availability validation
 
-use agent_of_empires::containers::{self, ContainerRuntimeInterface, DockerContainer};
+use agent_of_empires::containers::{self, DockerContainer};
 use agent_of_empires::session::{GroupTree, Instance, SandboxInfo, Storage};
 use serial_test::serial;
 
@@ -23,6 +23,8 @@ fn test_sandbox_info_serialization() {
         container_name: "aoe-sandbox-test1234".to_string(),
         extra_env: Some(vec!["MY_VAR".to_string()]),
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     };
 
     let json = serde_json::to_string(&sandbox_info).unwrap();
@@ -47,6 +49,8 @@ fn test_instance_is_sandboxed() {
         container_name: "aoe-sandbox-test".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
     assert!(inst.is_sandboxed());
 
@@ -57,6 +61,8 @@ fn test_instance_is_sandboxed() {
         container_name: "aoe-sandbox-test".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
     assert!(!inst.is_sandboxed());
 }
@@ -81,6 +87,8 @@ fn test_sandbox_info_persists_across_save_load() {
         container_name: "aoe-sandbox-abcd1234".to_string(),
         extra_env: Some(vec!["API_KEY".to_string(), "SECRET=my_secret".to_string()]),
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
 
     let seeded = vec![inst.clone()];

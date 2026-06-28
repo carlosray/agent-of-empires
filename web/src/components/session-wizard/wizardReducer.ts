@@ -59,11 +59,15 @@ export interface WizardData {
   useStructuredView: boolean;
   agentModel: string;
   agentEffort: string;
+  /** When non-empty, this create is importing an existing Claude Code
+   *  session: the on-disk session id to resume via `session/load`. Set by
+   *  the ProjectStep import tab, which also forces `tool: "claude"`,
+   *  structured view on, and worktree off. See #2276. */
+  importAcpSessionId: string;
   [key: string]: unknown;
 }
 
 export interface WizardState {
-  currentStep: number;
   data: WizardData;
   isSubmitting: boolean;
   error: string | null;
@@ -75,7 +79,6 @@ export interface WizardState {
 
 export type Action =
   | { type: "SET_FIELD"; field: string; value: unknown }
-  | { type: "SET_STEP"; step: number }
   | { type: "SUBMIT_START" }
   | { type: "SUBMIT_ERROR"; error: string }
   | { type: "SUBMIT_SUCCESS" }
@@ -88,6 +91,7 @@ export type Action =
       type: "APPLY_PROFILE_DEFAULTS";
       yoloMode: boolean;
       sandboxEnabled: boolean;
+      worktreeEnabled: boolean;
       tool: string;
       extraEnv: string[];
       agentModel?: string;
@@ -105,7 +109,11 @@ export const initialData: WizardData = {
   title: "",
   worktreeBranch: "",
   worktreeBranchDirty: false,
-  useWorktree: true,
+  // Default off to match the backend `worktree.enabled` default
+  // (WorktreeConfig::default). SessionWizard seeds the real value from
+  // /api/settings on mount via APPLY_PROFILE_DEFAULTS; this fallback also
+  // covers the case where that fetch fails. See #2423.
+  useWorktree: false,
   attachExisting: false,
   baseBranch: "",
   group: "",
@@ -125,6 +133,7 @@ export const initialData: WizardData = {
   useStructuredView: true,
   agentModel: "",
   agentEffort: "",
+  importAcpSessionId: "",
 };
 
 export function reducer(state: WizardState, action: Action): WizardState {
@@ -147,12 +156,20 @@ export function reducer(state: WizardState, action: Action): WizardState {
         newData.path = "";
         newData.extraRepoPaths = [];
         newData.useWorktree = false;
+        // Leaving the import flow for scratch: drop the import id so it
+        // can't ride along on the submit. See #2276.
+        newData.importAcpSessionId = "";
       }
       if (
         (action.field === "path" && typeof action.value === "string" && action.value.length > 0) ||
         (action.field === "extraRepoPaths" && Array.isArray(action.value) && action.value.length > 0)
       ) {
         newData.scratch = false;
+        // A path chosen from Browse / Recent / Clone is not an import; clear
+        // the stale import id so it isn't submitted with the wrong path
+        // (#2276). The import picker dispatches `importAcpSessionId` AFTER
+        // `path`, so its own selection survives this.
+        newData.importAcpSessionId = "";
       }
       // Mark dirty whenever the user manually edits an agent-step
       // field. Guarded against `state.data.profile` previously, but the
@@ -163,13 +180,15 @@ export function reducer(state: WizardState, action: Action): WizardState {
       // no-profile guard would leave profileDirty false. The picker
       // path's window.confirm() also benefits: picking a profile after
       // unprofiled edits now prompts before overwriting.
-      if (["yoloMode", "sandboxEnabled", "tool", "extraEnv", "agentModel", "agentEffort"].includes(action.field)) {
+      if (
+        ["yoloMode", "sandboxEnabled", "useWorktree", "tool", "extraEnv", "agentModel", "agentEffort"].includes(
+          action.field,
+        )
+      ) {
         newData.profileDirty = true;
       }
       return { ...state, data: newData, error: null };
     }
-    case "SET_STEP":
-      return { ...state, currentStep: action.step };
     case "SUBMIT_START":
       return { ...state, isSubmitting: true, error: null };
     case "SUBMIT_ERROR":
@@ -200,6 +219,9 @@ export function reducer(state: WizardState, action: Action): WizardState {
           ...state.data,
           yoloMode: action.yoloMode,
           sandboxEnabled: action.sandboxEnabled,
+          // Scratch sessions never use a worktree; don't let the seeded
+          // default flip it back on. Mirrors the SET_FIELD scratch arm.
+          useWorktree: state.data.scratch ? false : action.worktreeEnabled,
           tool: action.tool || state.data.tool,
           extraEnv: action.extraEnv,
           agentModel: action.agentModel ?? "",

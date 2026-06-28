@@ -386,14 +386,9 @@ fn parse_node_major(raw: &str) -> Option<u32> {
 }
 
 fn find_in_path(binary: &str) -> Option<String> {
-    let path_var = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_var) {
-        let candidate = dir.join(binary);
-        if candidate.is_file() {
-            return Some(candidate.to_string_lossy().into_owned());
-        }
-    }
-    None
+    which::which(binary)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 pub(crate) fn command_present(command: &str) -> bool {
@@ -525,13 +520,34 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
         println!("No matching agent workers.");
         return Ok(());
     }
-    for record in &targets {
+    stop_worker_records(&targets, timeout_secs).await;
+    Ok(())
+}
+
+/// Stop every registered agent worker. Returns the number stopped. Shared by
+/// `aoe acp stop --all` and the top-level `aoe stop-all` panic command. A
+/// failure to read the worker registry is surfaced as `Err` so callers can
+/// reflect it in their exit status instead of silently reporting zero workers;
+/// per-worker signaling stays best-effort.
+pub(crate) async fn stop_all_workers(timeout_secs: u64) -> Result<usize> {
+    use crate::acp::worker_registry;
+    let targets = worker_registry::list()?;
+    stop_worker_records(&targets, timeout_secs).await;
+    Ok(targets.len())
+}
+
+async fn stop_worker_records(
+    targets: &[crate::acp::worker_registry::WorkerRecord],
+    timeout_secs: u64,
+) {
+    use crate::acp::worker_registry;
+    for record in targets {
         // Delete the registry entry BEFORE SIGTERM. The running daemon
         // (if any) uses the registry-gone signal in `restart_decision`
         // to distinguish a user-initiated stop from a crash; without
         // this ordering, the daemon's drain task sees socket EOF first,
         // observes the registry still present, and respawns the runner
-        // — which immediately gets killed by our SIGTERM, racing into a
+        // which immediately gets killed by our SIGTERM, racing into a
         // crash loop that burns the restart budget and surfaces the
         // "ACP agent crashed more than N times" banner.
         worker_registry::delete(&record.session_id).ok();
@@ -541,7 +557,6 @@ async fn stop(session: Option<String>, all: bool, timeout_secs: u64) -> Result<(
             record.session_id, record.pid
         );
     }
-    Ok(())
 }
 
 fn kill_now(session: &str) -> Result<()> {
@@ -559,7 +574,7 @@ fn kill_now(session: &str) -> Result<()> {
     // liveness would skip the killpg and leak surviving descendants.
     // killpg ignores ESRCH, so signaling an already-empty group is a
     // harmless no-op.
-    worker_registry::kill_runner_group(record.pid);
+    crate::process::worker::kill_process_group(record.pid);
     println!("Killed agent worker for {} (PID {}).", session, record.pid);
     Ok(())
 }
@@ -570,7 +585,7 @@ async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, tim
     // goes down together, not just the runner pid. Sent unconditionally:
     // the group can outlive its leader pid, so gating on leader liveness
     // would skip the SIGTERM and leak surviving descendants. See #1689.
-    worker_registry::terminate_runner_group(record.pid);
+    crate::process::worker::terminate_process_group(record.pid);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
     while std::time::Instant::now() < deadline {
         if !worker_registry::is_pid_alive(record.pid) {
@@ -578,7 +593,7 @@ async fn signal_and_wait(record: &crate::acp::worker_registry::WorkerRecord, tim
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    worker_registry::kill_runner_group(record.pid);
+    crate::process::worker::kill_process_group(record.pid);
 }
 
 fn logs(session: Option<String>, follow: bool) -> Result<()> {
@@ -657,7 +672,7 @@ fn restart(session: &str) -> Result<()> {
     // runner rather than orphaning under PID 1 before respawn (#1689).
     // Unconditional: the group can outlive its leader pid, so gating on
     // leader liveness would skip the killpg and leak descendants.
-    worker_registry::terminate_runner_group(record.pid);
+    crate::process::worker::terminate_process_group(record.pid);
     println!(
         "Stopped runner for {} (PID {}). `aoe serve` will respawn on its next reconciler tick.",
         session, record.pid
@@ -866,12 +881,15 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
     match event {
         Event::PlanUpdated { .. } => "plan_updated",
         Event::TodoListUpdated { .. } => "todo_list_updated",
+        Event::SessionTitleSuggested { .. } => "session_title_suggested",
         Event::ToolCallStarted { .. } => "tool_call_started",
         Event::ToolCallCompleted { .. } => "tool_call_completed",
         Event::ToolCallContent { .. } => "tool_call_content",
         Event::ToolCallUpdated { .. } => "tool_call_updated",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
+        Event::ElicitationRequested { .. } => "elicitation_requested",
+        Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
@@ -886,6 +904,10 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
+        Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
+        Event::BackgroundAgentProgress { .. } => "background_agent_progress",
+        Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
+        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
@@ -899,6 +921,7 @@ fn event_kind(event: &crate::acp::Event) -> &'static str {
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
+        Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
     }

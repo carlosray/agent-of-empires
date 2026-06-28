@@ -10,7 +10,8 @@
 - `src/tui/`: ratatui UI and input handling.
 - `src/session/`: session storage, configuration, and group management.
 - `src/tmux/`: tmux integration and status detection.
-- `src/process/`: OS-specific process handling (`macos.rs`, `linux.rs`).
+- `src/process/`: OS-specific process handling (`macos.rs`, `linux.rs`) plus `worker.rs`, the protocol-agnostic worker-subprocess substrate (process-group signalling, liveness, on-disk worker paths) that `src/acp/` consumes and the plugin host will reuse.
+- `src/events/`: protocol-agnostic durable event-log storage core (topic-keyed SQLite seq log, retention, keyset scans, attachments); `src/acp/`'s `EventStore` is the first consumer.
 - `src/docker/`: Docker sandboxing and container management.
 - `src/git/`: git worktree operations and template resolution.
 - `src/server/`: web dashboard backend (axum server, REST API, WebSocket PTY relay, auth).
@@ -24,6 +25,7 @@
 - `docs/development/adding-settings.md`: guide for adding a setting via the single-source schema.
 - `scripts/`: installation and utility scripts.
 - `xtask/`: build automation workspace.
+- `aoe-plugin-api/`: plugin manifest and capability types (see `docs/development/internals/plugin-system.md`).
 
 - `contrib/`: community-maintained integration files (e.g., OpenClaw skill). Checked by `cargo xtask check-skill` in CI.
 
@@ -44,6 +46,7 @@
 - Build: `cargo build --features serve` (build.rs runs `npm install && npm run build` in `web/` when inputs change).
 - Run: `aoe serve --host 0.0.0.0` (token-based auth by default).
 - Frontend dev: `cargo xtask dev` (Unix) builds the serve binary, then runs `aoe serve` (8081) and the Vite dev server (5173, HMR) together, pointing Vite at the backend via `VITE_PROXY` so `/api` and the `/sessions/*/ws` relays resolve; open `:5173`, Ctrl-C stops both. Or run them by hand: `cd web && npm run dev` plus a separate `cargo run --features serve -- serve`.
+- Web checks (CI gates all three on any `web/` change): `cd web && npm run format:check` (oxfmt, NOT prettier; `npm run format` to fix), `npm run lint` (ESLint), and `npx tsc -b` (typecheck, also part of `npm run build`). ESLint and tsc do not catch formatting; run oxfmt explicitly.
 - TUI-only `cargo build` (without `--features serve`) needs no JS tooling.
 
 ## Settings & Configuration
@@ -149,7 +152,11 @@ When deciding which suite to use:
 
 **Mandate:** any PR that changes a user-facing dashboard flow under auth, wizard / session creation, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, or read-only behavior must update `web/tests/coverage-matrix.json` and add or modify the appropriate test. CI fails on a missing matrix entry via `web/tests/validate-coverage-matrix.mjs`. Pure styling or copy-only changes may add a `kind: "deferred"` entry with a `reason` and a linked issue.
 
-**Coverage reports.** Vitest uses `@vitest/coverage-v8`; Playwright uses `vite-plugin-istanbul` gated by `AOE_COVERAGE=1`. The merge script (`web/scripts/merge-coverage.mjs`, via `npm run coverage:merge`) feeds both into `monocart-coverage-reports` and writes `web/coverage/merged/` (LCOV + HTML + summary). The CI `coverage` job posts a PR comment with deltas via `davelosert/vitest-coverage-report-action`; baseline is the most recent main-branch artifact.
+**Coverage reports.** Vitest uses `@vitest/coverage-v8`; Playwright collects raw Chromium V8 coverage (`page.coverage`, gated by `AOE_COVERAGE=1`) against a bundle built with inline sourcemaps. Both are V8-based so they remap to the same `web/src` source line map; this is deliberate, because Codecov reconciles each file to one line map and the old istanbul-on-bundle Playwright coverage numbered the bundle differently than Vitest, making Codecov drop Vitest's hits (#2157). The merge script (`web/scripts/merge-coverage.mjs`, via `npm run coverage:merge`) converts the Playwright V8 to istanbul-shape via the inline sourcemap, then merges it with Vitest into `monocart-coverage-reports` and writes `web/coverage/merged/` (LCOV + HTML + summary). The CI `coverage` job posts a PR comment with deltas via `davelosert/vitest-coverage-report-action`; baseline is the most recent main-branch artifact.
+
+**Test analytics.** Vitest and both Playwright suites emit JUnit XML (`web/test-report.junit.xml`; Playwright via the CI-gated `junit` reporter in the configs, Vitest via `--reporter=junit` in the CI step). Each test job uploads it with `codecov/test-results-action` (reuses `CODECOV_TOKEN`, runs `if: !cancelled()` so failures still report) under the matching `vitest` / `playwright-mocked` / `playwright-live` flag, feeding Codecov's flaky-test + failure analytics.
+
+**Bundle analysis.** The `bundle-analysis` CI job runs a clean `npm run build` (no `AOE_COVERAGE`, which would inflate chunk sizes) so `@codecov/vite-plugin` uploads bundle stats to Codecov. It is gated in `web/vite.config.ts` on `command === "build"`, not instrumented, and `CODECOV_TOKEN` present, so dev/test builds and forks without the token are a no-op. The plugin's vite peer caps at 6.x while the repo is on vite 8, so a `package.json` `overrides` entry (`"@codecov/vite-plugin": { "vite": "$vite" }`) keeps `npm ci` resolving; the plugin runs on the stable unplugin API regardless.
 
 Full recipe, harness API, and fake-ACP-agent details live in `docs/development/playwright.md`.
 
@@ -172,7 +179,7 @@ Full recipe, harness API, and fake-ACP-agent details live in `docs/development/p
 
 Before requesting review, every PR must clear:
 
-1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view).
+1. **`cargo fmt`, `cargo clippy`, `cargo test`** all clean (`--features serve` if the change touches the web dashboard or structured view). For any `web/` change, also **`cd web && npm run format:check && npm run lint`** (oxfmt + ESLint; both are CI gates, and neither ESLint nor tsc catches formatting).
 2. **Web tests when applicable.** If the change touches a user-facing dashboard flow listed in the coverage matrix mandate (auth, wizard, settings, profiles, sessions / sidebar, right panel / diff / notifications, directory browser, devices, git clone, connectivity, read-only), update `web/tests/coverage-matrix.json` and add or modify the appropriate Vitest / Playwright test. CI fails on a missing matrix entry.
 3. **Codecov checks.** See below.
 

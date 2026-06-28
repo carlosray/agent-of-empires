@@ -14,14 +14,14 @@
 //!   the web-exposed schema), and
 //! - the host `environment` list (a root-level `Config` field).
 //!
-//! The five `custom:*` widgets (theme picker, default-tool picker, sound mode
-//! and volume, per-target logging matrix) keep bespoke value mapping here,
-//! keyed by the widget id from the schema.
+//! The `custom:*` widgets (theme picker, default-tool picker, smart-rename
+//! agent picker, sound mode and volume, per-target logging matrix) keep
+//! bespoke value mapping here, keyed by the widget id from the schema.
 
 use serde_json::{json, Value};
 
 use crate::session::settings_schema::{
-    clear_path, merge_json, schema, FieldDescriptor, ValidationKind, WidgetKind,
+    clear_path, merge_json, FieldDescriptor, ValidationKind, WidgetKind,
 };
 use crate::session::{validate_snooze_duration, Config, ProfileConfig};
 use crate::sound::{
@@ -52,6 +52,7 @@ pub enum SettingsCategory {
     Acp,
     Diff,
     Logging,
+    Plugins,
 }
 
 impl SettingsCategory {
@@ -73,6 +74,7 @@ impl SettingsCategory {
             Self::Acp => "Acp",
             Self::Diff => "Diff",
             Self::Logging => "Logging",
+            Self::Plugins => "Plugins",
         }
     }
 
@@ -97,6 +99,7 @@ impl SettingsCategory {
             Self::Diff => "Diff",
             Self::Telemetry => "Telemetry",
             Self::Logging => "Logging",
+            Self::Plugins => "Plugins",
         }
     }
 }
@@ -199,6 +202,19 @@ impl SettingField {
     /// True when this entry is a non-interactive section divider.
     pub fn is_section_header(&self) -> bool {
         matches!(self.value, FieldValue::SectionHeader)
+    }
+
+    /// Human-readable rendering of the current value (for read-only displays).
+    pub fn display_value(&self) -> String {
+        value_display_string(&self.value)
+    }
+
+    /// The schema `section` this row edits, if it is a schema-backed row.
+    pub fn schema_section(&self) -> Option<&str> {
+        match &self.kind {
+            FieldKind::Schema { section, .. } => Some(section),
+            _ => None,
+        }
     }
 
     /// Stable identifier used by the search overlay to relocate the cursor
@@ -385,6 +401,11 @@ fn json_at<'a>(root: &'a Value, section: &str, field: &str) -> Option<&'a Value>
     root.get(section)?.get(field)
 }
 
+/// Build the `{section: {field: leaf}}` JSON object that writes `section.field`.
+fn nested_leaf(section: &str, field: &str, leaf: Value) -> Value {
+    json!({ section: { field: leaf } })
+}
+
 // ---------------------------------------------------------------------------
 // Reading: JSON value -> FieldValue
 // ---------------------------------------------------------------------------
@@ -438,6 +459,19 @@ fn json_to_list(current: &Value) -> Vec<String> {
     }
 }
 
+/// Built-in agents that can run a one-shot rename (a `oneshot_flag`) AND are
+/// installed on this host. The smart-rename agent picker offers only these, so
+/// a user cannot pick an agent the one-shot would just fail on. Detection uses
+/// the per-agent availability check directly to avoid the `Config::load` side
+/// effects of `AvailableTools::detect()`.
+fn installed_oneshot_agents() -> Vec<String> {
+    crate::agents::oneshot_capable_names()
+        .into_iter()
+        .filter(|name| crate::agents::get_agent(name).is_some_and(crate::tmux::is_agent_available))
+        .map(|name| name.to_string())
+        .collect()
+}
+
 /// Build a `FieldValue` for a `custom:*` widget from its current JSON.
 fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
     match id {
@@ -451,6 +485,18 @@ fn custom_value_from_json(id: &str, current: &Value) -> FieldValue {
             let mut options = vec!["Auto (first available)".to_string()];
             options.extend(crate::agents::agent_names().iter().map(|n| n.to_string()));
             let selected = crate::agents::settings_index_from_name(current.as_str());
+            FieldValue::Select { selected, options }
+        }
+        "smart-rename-agent" => {
+            let names = installed_oneshot_agents();
+            let mut options = vec!["Same as session".to_string()];
+            options.extend(names.iter().cloned());
+            let current = current.as_str().unwrap_or("").trim();
+            let selected = if current.is_empty() {
+                0
+            } else {
+                names.iter().position(|n| n == current).map_or(0, |i| i + 1)
+            };
             FieldValue::Select { selected, options }
         }
         "sound-mode" => {
@@ -564,6 +610,20 @@ fn custom_value_to_json(id: &str, value: &FieldValue) -> Value {
                 None => Value::Null,
             }
         }
+        ("smart-rename-agent", FieldValue::Select { selected, options }) => {
+            // Index 0 is "Same as session" (empty string); the rest are agent
+            // names (label == value). Persist from the rendered `options` so the
+            // saved value is exactly what the user picked, even if the installed
+            // set changed between render and save.
+            if *selected == 0 {
+                json!("")
+            } else {
+                options
+                    .get(*selected)
+                    .map(|name| json!(name))
+                    .unwrap_or_else(|| json!(""))
+            }
+        }
         ("sound-mode", FieldValue::Select { selected, .. }) => {
             let mode = if *selected == 1 {
                 SoundMode::Specific(String::new())
@@ -648,7 +708,7 @@ pub fn build_fields_for_category(
         });
     }
 
-    for desc in schema()
+    for desc in crate::session::settings_schema::runtime_schema()
         .into_iter()
         .filter(|d| d.category == category.schema_name())
         // Global-only fields (e.g. the theme) are not profile-overridable, so
@@ -719,10 +779,20 @@ fn build_schema_row(
     desc: &FieldDescriptor,
     ctx: &BuildCtx,
 ) -> SettingField {
-    let value = value_from_json(
-        &desc.widget,
-        json_at(ctx.effective_json, &desc.section, &desc.field),
-    );
+    // Plugin settings (`plugin:<id>` sections) live at a different storage
+    // path (`plugins.<id>.settings.<field>`) and fall back to the manifest's
+    // declared default when unset; core fields read their `section.field` leaf,
+    // which always exists via the struct Default.
+    let current = match crate::session::settings_schema::section_plugin_id(&desc.section) {
+        Some(id) => crate::session::settings_schema::plugin_storage_value(
+            ctx.effective_json,
+            id,
+            &desc.field,
+        )
+        .or(desc.default.as_ref()),
+        None => json_at(ctx.effective_json, &desc.section, &desc.field),
+    };
+    let value = value_from_json(&desc.widget, current);
     let has_override = desc.profile_overridable && ctx.has_override(&desc.section, &desc.field);
     let inherited_display = if has_override {
         let base_value = value_from_json(
@@ -913,10 +983,32 @@ pub fn apply_field_to_config(
     };
 
     match scope {
-        SettingsScope::Global => set_config_path(global, &section, &sub, leaf),
+        SettingsScope::Global => {
+            // Plugin settings are global-only and persist under
+            // `plugins.<id>.settings`; core fields write their `section.field`.
+            match crate::session::settings_schema::section_plugin_id(&section) {
+                Some(id) => set_config_plugin_path(global, id, &sub, leaf),
+                None => set_config_path(global, &section, &sub, leaf),
+            }
+        }
+        // Plugin fields are filtered out of Profile/Repo scope (not
+        // profile_overridable), so only core fields reach here.
         SettingsScope::Profile | SettingsScope::Repo => {
             set_override_path(profile, &section, &sub, leaf)
         }
+    }
+}
+
+/// Write a plugin setting leaf into `plugins.<id>.settings.<field>` of the
+/// global config.
+fn set_config_plugin_path(config: &mut Config, plugin_id: &str, field: &str, leaf: Value) {
+    let mut j = serde_json::to_value(&*config).unwrap_or_else(|_| json!({}));
+    merge_json(
+        &mut j,
+        &crate::session::settings_schema::plugin_storage_leaf(plugin_id, field, leaf),
+    );
+    if let Ok(updated) = serde_json::from_value(j) {
+        *config = updated;
     }
 }
 
@@ -968,7 +1060,7 @@ fn apply_logging_target(global: &mut Config, idx: usize, value: &FieldValue) {
 /// Write `section.field = leaf` into a typed `Config` via its JSON form.
 fn set_config_path(config: &mut Config, section: &str, field: &str, leaf: Value) {
     let mut j = serde_json::to_value(&*config).unwrap_or_else(|_| json!({}));
-    merge_json(&mut j, &json!({ section: { field: leaf } }));
+    merge_json(&mut j, &nested_leaf(section, field, leaf));
     if let Ok(updated) = serde_json::from_value(j) {
         *config = updated;
     }
@@ -978,7 +1070,7 @@ fn set_config_path(config: &mut Config, section: &str, field: &str, leaf: Value)
 /// Always stores the value as an override; the `r` key clears it.
 fn set_override_path(profile: &mut ProfileConfig, section: &str, field: &str, leaf: Value) {
     let mut j = serde_json::to_value(&*profile).unwrap_or_else(|_| json!({}));
-    merge_json(&mut j, &json!({ section: { field: leaf } }));
+    merge_json(&mut j, &nested_leaf(section, field, leaf));
     if let Ok(updated) = serde_json::from_value(j) {
         *profile = updated;
     }
@@ -1114,6 +1206,47 @@ mod tests {
         assert_eq!(
             custom_value_to_json("acp-defaults", &FieldValue::Text("[1,2]".to_string())),
             json!({}),
+        );
+    }
+
+    #[test]
+    fn smart_rename_agent_widget_same_as_session_round_trips() {
+        // "Same as session" is index 0 and persists as the empty string,
+        // independent of which agents are installed on the test host.
+        assert!(matches!(
+            custom_value_from_json("smart-rename-agent", &json!("")),
+            FieldValue::Select { selected: 0, ref options } if options[0] == "Same as session"
+        ));
+        assert!(matches!(
+            custom_value_from_json("smart-rename-agent", &Value::Null),
+            FieldValue::Select { selected: 0, .. }
+        ));
+        assert_eq!(
+            custom_value_to_json(
+                "smart-rename-agent",
+                &FieldValue::Select {
+                    selected: 0,
+                    options: vec!["Same as session".to_string()],
+                },
+            ),
+            json!(""),
+        );
+        // A non-zero index persists the rendered option's name verbatim (not a
+        // re-detected list), so the saved value cannot drift if availability
+        // changes between render and save.
+        assert_eq!(
+            custom_value_to_json(
+                "smart-rename-agent",
+                &FieldValue::Select {
+                    selected: 2,
+                    options: vec![
+                        "Same as session".to_string(),
+                        "claude".to_string(),
+                        "codex".to_string(),
+                    ],
+                },
+            ),
+            json!("codex"),
         );
     }
 

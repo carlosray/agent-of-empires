@@ -15,7 +15,9 @@ async function shot(page: Page, name: string) {
 async function openSession(page: Page) {
   await clickSidebarSession(page, "pinch-test");
   await expect(page.locator('[data-term="agent"]')).toHaveCount(1);
-  await expect(page.locator('[data-term="agent"] .xterm')).toBeVisible();
+  await expect(
+    page.locator('[data-term="agent"] .xterm, [data-term="agent"] [data-live-terminal]').first(),
+  ).toBeVisible();
 }
 
 async function focusedKind(page: Page): Promise<"agent" | "paired" | null> {
@@ -34,14 +36,15 @@ async function focusedKind(page: Page): Promise<"agent" | "paired" | null> {
 }
 
 async function focusKind(page: Page, kind: "agent" | "paired") {
-  const target = kind === "paired" ? "paired-visible" : "agent";
-  if (target === "agent") {
+  if (kind === "agent") {
     await page.locator('[data-term="agent"]').first().locator("textarea").focus();
     return;
   }
-  // The paired panel renders once (the inline desktop split copy); on
-  // mobile it is promoted into the single pane. Filter by visibility to
-  // hit whichever instance the user would actually use.
+  // Tabbed docks (#2437): the paired shell mounts only when its terminal tab is
+  // the active tab, so activate it first (desktop). On mobile the picker handles
+  // it and there is no tab strip.
+  const termTab = page.locator('[data-testid^="pane-tab-terminal:"]').first();
+  if (await termTab.count()) await termTab.click();
   const visiblePaired = page.locator('[data-term="paired"]:visible').first();
   await visiblePaired.locator("textarea").focus();
 }
@@ -65,7 +68,7 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await mockTerminalApis(page);
     await page.goto("/");
     await openSession(page);
-    await expect(page.locator('[data-term="paired"]')).toHaveCount(1);
+    // The paired shell mounts on demand once its tab is active (tabbed docks).
 
     await focusKind(page, "agent");
     await expect.poll(() => focusedKind(page)).toBe("agent");
@@ -145,9 +148,11 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await clickSidebarSession(page, "pinch-test");
 
     // Wait for paired to be ready (its ensureTerminal isn't delayed); use
-    // it as the focus source so target=agent.
+    // it as the focus source so target=agent. Activate its tab first so the
+    // paired shell mounts (tabbed docks #2437).
+    await page.locator('[data-testid^="pane-tab-terminal:"]').first().click();
     const paired = page.locator('[data-term="paired"]:visible').first();
-    await expect(paired.locator(".xterm")).toBeVisible();
+    await expect(paired.locator("[data-live-terminal]")).toBeVisible();
     await paired.locator("textarea").focus();
     await expect.poll(() => focusedKind(page)).toBe("paired");
 
@@ -209,6 +214,14 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await openSession(page);
     await focusKind(page, "agent");
 
+    // Tabbed docks (#2437): the paired tab mounts lazily on first focus. Warm it
+    // up once (and return to agent) so the rapid loop below toggles a mounted
+    // panel and stays deterministic, instead of racing the one-time mount.
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect.poll(() => focusedKind(page)).toBe("paired");
+    await page.keyboard.press("ControlOrMeta+`");
+    await expect.poll(() => focusedKind(page)).toBe("agent");
+
     // 11 toggles total = odd flips from agent → paired.
     for (let i = 0; i < 11; i++) {
       await page.keyboard.press("ControlOrMeta+`");
@@ -216,18 +229,9 @@ test.describe("Cmd/Ctrl+` desktop", () => {
     await expect.poll(() => focusedKind(page)).toBe("paired");
   });
 
-  test("term-focused CSS class follows the focused panel", async ({ page }) => {
-    await mockTerminalApis(page);
-    await page.goto("/");
-    await openSession(page);
-
-    await focusKind(page, "agent");
-    await expect(page.locator('[data-term="agent"]').first()).toHaveClass(/term-focused/);
-
-    await page.keyboard.press("ControlOrMeta+`");
-    // The visible paired panel should pick up term-focused.
-    await expect(page.locator('[data-term="paired"]:visible').first()).toHaveClass(/term-focused/);
-  });
+  // (The xterm-only `term-focused` panel CSS ring was removed with the xterm
+  // renderer; focus correctness is covered by the focusedKind() assertions
+  // above.)
 });
 
 // ────────────────────────────────────────────────────────────────────

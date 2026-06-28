@@ -869,6 +869,30 @@ describe("applyEvent / Stopped empty-output fallback", () => {
     });
     expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
   });
+
+  it("suppresses the notice when a prompt runtime error was surfaced first", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "/aoe-investigate bug" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        PromptRuntimeError: {
+          message: "Bad Request: model is not supported for this account.",
+        },
+      },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { Stopped: {} },
+    });
+    expect(state.lastError).toBe("Bad Request: model is not supported for this account.");
+    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
+  });
 });
 
 describe("applyEvent / Stopped user_stopped", () => {
@@ -1065,6 +1089,104 @@ describe("applyEvent / WakeupScheduled lifecycle", () => {
     expect(state.nextWakeupAt).toBeNull();
     expect(state.nextWakeupReason).toBeNull();
   });
+});
+
+describe("applyEvent / MonitorArmed lifecycle", () => {
+  it("MonitorArmed sets the monitoring badge with its description", () => {
+    const state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "clippy passes" } },
+    });
+    expect(state.monitorArmed).toBe(true);
+    expect(state.monitorDescription).toBe("clippy passes");
+  });
+
+  it("persists across agent activity with no user prompt", () => {
+    // A monitor firing re-invokes the agent with activity but never a
+    // UserPromptSent, so the badge must survive the resumed turn.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "build" } },
+    });
+    state = applyEvent(state, { session_id: "s-1", seq: 2, event: "ThinkingStarted" });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: { AgentMessageChunk: { text: "resuming" } },
+    });
+    expect(state.monitorArmed).toBe(true);
+  });
+
+  it("clears on the next user prompt (the user takes over)", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "watch" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "stop watching" } },
+    });
+    expect(state.monitorArmed).toBe(false);
+    expect(state.monitorDescription).toBeNull();
+  });
+
+  it("persists on the arming turn's Stopped while the monitor is still pending", () => {
+    // Arm, then end the turn with no post-arm tool work: the monitor has not
+    // fired yet, the badge must stay up. See #2325.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { MonitorArmed: { description: "watch" } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    expect(state.monitorArmed).toBe(true);
+  });
+
+  it.each(["prompt_complete", "agent_idle"])(
+    "clears once the monitor fired (tool started after arm) and the turn ends with %s",
+    (reason) => {
+      // The fire makes the agent act (a tool call after the arm); the badge
+      // then retires on the next Stopped, covering both the in-band
+      // (prompt_complete) and between-prompt (agent_idle) shapes. See #2325.
+      let state = applyEvent(emptyAcpState(), {
+        session_id: "s-1",
+        seq: 1,
+        event: { MonitorArmed: { description: "watch" } },
+      });
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 2,
+        event: {
+          ToolCallStarted: {
+            tool_call: {
+              id: "tc-1",
+              name: "Read File",
+              kind: "read",
+              args_preview: "{}",
+              started_at: new Date().toISOString(),
+            },
+          },
+        },
+      });
+      // Fired-work seen but turn not ended yet: badge still up.
+      expect(state.monitorArmed).toBe(true);
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq: 3,
+        event: { Stopped: { reason } },
+      });
+      expect(state.monitorArmed).toBe(false);
+      expect(state.monitorDescription).toBeNull();
+    },
+  );
 });
 
 describe("applyEvent / CancelRequested lifecycle (#1727)", () => {
@@ -2741,5 +2863,106 @@ describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
       event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
     });
     expect(state.rateLimit).toBeNull();
+  });
+});
+
+describe("applyEvent / elicitation", () => {
+  const elicitation = {
+    nonce: "e-1",
+    message: "Pick one",
+    tool_call_id: null,
+    questions: [
+      {
+        field_key: "question_0",
+        title: "Color?",
+        description: null,
+        required: true,
+        kind: "single_select" as const,
+        options: [{ value: "Red", label: "Red" }],
+        min_items: null,
+        max_items: null,
+      },
+    ],
+    requested_at: "2026-06-10T00:00:00Z",
+    resolved: null,
+  };
+
+  it("adds a pending elicitation on ElicitationRequested and drops it on resolve", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationRequested: { elicitation } },
+    });
+    expect(state.pendingElicitations).toHaveLength(1);
+    expect(state.pendingElicitations[0].nonce).toBe("e-1");
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ElicitationResolved: { nonce: "e-1", outcome: "Accepted" } },
+    });
+    expect(state.pendingElicitations).toHaveLength(0);
+  });
+
+  it("suppresses the AskUserQuestion tool card when the tool call started first", () => {
+    const toolCall = {
+      id: "tc-ask",
+      name: "Asking for your input",
+      kind: "other",
+      args_preview: '{"questions":[]}',
+      started_at: "2026-06-10T00:00:00Z",
+    };
+    // Tool call arrives first -> a transcript row appears.
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ToolCallStarted: { tool_call: toolCall } },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(true);
+
+    // The matching elicitation then arrives -> the row + in-flight pointer
+    // are stripped and the id is remembered.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
+    expect(state.inFlightTool).toBeNull();
+
+    // A later completion for the same id produces no card.
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 3,
+      event: {
+        ToolCallCompleted: { tool_call_id: "tc-ask", is_error: false, content: "", output: [] },
+      },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
+  });
+
+  it("suppresses the AskUserQuestion tool card when the elicitation arrived first", () => {
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
+    });
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: {
+        ToolCallStarted: {
+          tool_call: {
+            id: "tc-ask",
+            name: "Asking for your input",
+            kind: "other",
+            args_preview: "{}",
+            started_at: "2026-06-10T00:00:00Z",
+          },
+        },
+      },
+    });
+    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
+    expect(state.inFlightTool).toBeNull();
   });
 });

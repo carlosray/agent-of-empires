@@ -187,6 +187,140 @@ export interface Approval {
   } | null;
 }
 
+/** Mirror of `ElicitationFieldKind` in src/acp/elicitations.rs. */
+export type ElicitationFieldKind = "free_text" | "single_select" | "multi_select" | "number" | "integer" | "boolean";
+
+export interface ElicitationOption {
+  value: string;
+  label: string;
+}
+
+/** A pre-fill / submitted value. Mirror of `AnswerValue` (untagged): a
+ *  string for free-text / single-select, a list for multi-select, a number
+ *  for number / integer, a boolean for boolean. */
+export type AnswerValue = string | string[] | number | boolean;
+
+export interface ElicitationQuestion {
+  field_key: string;
+  title?: string | null;
+  description?: string | null;
+  required: boolean;
+  kind: ElicitationFieldKind;
+  options: ElicitationOption[];
+  /** Multi-select bounds. */
+  min_items?: number | null;
+  max_items?: number | null;
+  /** String bounds (free_text). */
+  min_length?: number | null;
+  max_length?: number | null;
+  /** Regex the string must match (free_text). */
+  pattern?: string | null;
+  /** Format annotation (`email` / `uri` / `date` / `date-time` / custom),
+   *  a UI hint mapped to an input type. */
+  format?: string | null;
+  /** Numeric bounds (number / integer). */
+  minimum?: number | null;
+  maximum?: number | null;
+  /** Pre-fill value, shaped to match the field kind. */
+  default?: AnswerValue | null;
+}
+
+/** Mirror of `Elicitation` in src/acp/elicitations.rs: a normalized,
+ *  form-mode elicitation the structured view renders. AskUserQuestion is
+ *  the common producer; MCP-server forms flow through the same path. */
+export interface Elicitation {
+  nonce: string;
+  message: string;
+  /** Schema-level heading (MCP forms may set one; AskUserQuestion does not). */
+  title?: string | null;
+  /** Schema-level description rendered under the message. */
+  description?: string | null;
+  tool_call_id?: string | null;
+  questions: ElicitationQuestion[];
+  requested_at: string;
+  resolved?: {
+    outcome: ElicitationOutcome;
+    resolved_at: string;
+  } | null;
+}
+
+export type ElicitationOutcome = "Accepted" | "Declined" | "Cancelled";
+
+/** Resolution payload POSTed to
+ *  `/api/sessions/{id}/acp/elicitations/{nonce}`. Mirror of
+ *  `ElicitationResolution` (tag = "action"). */
+export type ElicitationResolution =
+  | { action: "accept"; answers: Record<string, AnswerValue> }
+  | { action: "decline" }
+  | { action: "cancel" };
+
+/** One answered question rendered for the transcript. Mirror of
+ *  `ElicitationAnswer` in src/acp/elicitations.rs. Carried on
+ *  `ElicitationResolved` (server-rendered) and rebuilt locally by the
+ *  optimistic path. See #2209. */
+export interface ElicitationAnswer {
+  question: string;
+  answer: string;
+}
+
+/** Narrow a message-metadata payload to a non-empty answer list, so
+ *  UserText can pick the card over the plain-text fallback. */
+export function isElicitationAnswersPayload(value: unknown): value is ElicitationAnswer[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (x) =>
+        typeof x === "object" &&
+        x !== null &&
+        typeof (x as ElicitationAnswer).question === "string" &&
+        typeof (x as ElicitationAnswer).answer === "string",
+    )
+  );
+}
+
+/** Separator the adapter wedges between an AskUserQuestion option's label and
+ *  its description (`"<label> <sep> <description>"`). Written as an escape so
+ *  the em dash never appears literally in source. Mirrors `OPTION_DESC_SEP` in
+ *  AskUserQuestionCard and `OPTION_DESC_SEP` in src/acp/elicitations.rs. */
+const OPTION_DESC_SEP = " \u2014 ";
+
+/** Map a selected option value to its human label. A generic MCP form sends a
+ *  machine token as the value and the display text as the label; AskUserQuestion
+ *  sends the label as the value (with `label` possibly carrying a trailing
+ *  `"value <sep> description"`), so the bare value is kept there. */
+function selectLabel(question: ElicitationQuestion, raw: string): string {
+  const opt = question.options.find((o) => o.value === raw);
+  if (!opt) return raw;
+  return opt.label.startsWith(`${raw}${OPTION_DESC_SEP}`) ? raw : opt.label;
+}
+
+/** Render a submitted answer value for display, mapping select values to their
+ *  option labels. */
+function renderAnswerValue(question: ElicitationQuestion, value: AnswerValue): string {
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.map((v) => selectLabel(question, v)).join(", ");
+  if (typeof value === "string") return selectLabel(question, value);
+  return String(value);
+}
+
+/** Build display-ready answer pairs from a form and the submitted answers,
+ *  in question order, omitting unanswered questions. Mirrors
+ *  `summarize_answers` in src/acp/elicitations.rs so the optimistic local
+ *  path renders the same row the server broadcasts. */
+export function summarizeAnswers(elicitation: Elicitation, answers: Record<string, AnswerValue>): ElicitationAnswer[] {
+  const out: ElicitationAnswer[] = [];
+  for (const question of elicitation.questions) {
+    const value = answers[question.field_key];
+    if (value === undefined) continue;
+    out.push({
+      question: question.title || question.field_key,
+      answer: renderAnswerValue(question, value),
+    });
+  }
+  return out;
+}
+
 /** Mirror of `StartupErrorDetail` in src/acp/state.rs. Serde's
  *  default for `#[serde(tag = "kind", ...)]` is internal tagging keyed
  *  on `kind`. Carries the structured remediation data the
@@ -198,17 +332,23 @@ export type IncompatibleAgentDetail =
       installed: string;
       required: string;
       install_command: string;
+      /** True when the daemon can `npm install -g` this agent itself, so
+       *  the web can offer "Update & restart" (gated on the
+       *  `acp.allow_agent_install` setting). See #2109. */
+      auto_install: boolean;
     }
   | {
       kind: "missing_agent_info";
       expected_package: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "mismatched_agent_name";
       expected: string;
       received: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unparseable_agent_version";
@@ -216,6 +356,7 @@ export type IncompatibleAgentDetail =
       raw_version: string;
       required: string;
       install_command: string;
+      auto_install: boolean;
     }
   | {
       kind: "unsupported_protocol_version";
@@ -255,6 +396,14 @@ export type AcpEvent =
          *  backward compatibility with events persisted before this
          *  field landed. */
         completed_at?: string;
+        /** True when this completion is the synchronous launch of an
+         *  async sub-agent (Claude `Task` with isAsync): the call
+         *  completes immediately while the real work runs off-protocol
+         *  and never reports back on this stream. Renderers draw a
+         *  neutral "runs in background" sub-agent card and drop the
+         *  marker body (it carries an internal agent id). Absent for
+         *  events persisted before this field landed. */
+        async_subagent?: boolean;
       };
     }
   | {
@@ -290,6 +439,14 @@ export type AcpEvent =
     }
   | { ApprovalRequested: { approval: Approval } }
   | { ApprovalResolved: { nonce: string; decision: ApprovalDecision } }
+  | { ElicitationRequested: { elicitation: Elicitation } }
+  | {
+      ElicitationResolved: {
+        nonce: string;
+        outcome: ElicitationOutcome;
+        answers?: ElicitationAnswer[];
+      };
+    }
   | "SessionCleared"
   | "ConversationCompacted"
   | { DiffEmitted: { diff: DiffPreview } }
@@ -317,10 +474,42 @@ export type AcpEvent =
       };
     }
   | { RawAgentUpdate: { payload: unknown } }
+  | {
+      BackgroundAgentLaunched: {
+        agent_id: string;
+        tool_call_id: string;
+        description: string;
+        prompt: string;
+        model: string;
+        started_at: string;
+      };
+    }
+  | {
+      BackgroundAgentProgress: {
+        agent_id: string;
+        status: BackgroundAgentStatus;
+        tool_count: number;
+        tools?: BackgroundAgentTool[];
+        last_tool?: string | null;
+        last_text?: string | null;
+        at: string;
+      };
+    }
+  | {
+      BackgroundAgentCompleted: {
+        agent_id: string;
+        status: BackgroundAgentStatus;
+        tools?: BackgroundAgentTool[];
+        result?: string | null;
+        warning?: string | null;
+        ended_at: string;
+      };
+    }
   | { AgentMessageChunk: { text: string } }
   | { CancelRequested: { escalates_at: string } }
   | { Stopped: { reason: string } }
   | { AgentStartupError: { message: string } }
+  | { PromptRuntimeError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | {
       UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] };
@@ -344,6 +533,7 @@ export type AcpEvent =
   | { AcpSessionAssigned: { acp_session_id: string } }
   | { SessionContextReset: { reason: string } }
   | { WakeupScheduled: { at: string; reason: string | null } }
+  | { MonitorArmed: { description: string | null } }
   | { PromptRejected: { reason: string; text: string } }
   | { AgentSwitched: { from: string; to: string; reason: string } };
 
@@ -408,6 +598,14 @@ export interface AcpState {
   plan: Plan | null;
   inFlightTool: ToolCall | null;
   pendingApprovals: Approval[];
+  /** Pending AskUserQuestion elicitations awaiting a user answer. */
+  pendingElicitations: Elicitation[];
+  /** tool_call_ids that surfaced as an elicitation. The adapter emits an
+   *  AskUserQuestion tool call alongside the `elicitation/create`; the
+   *  elicitation card is the real UI, so its tool card is suppressed from
+   *  the transcript. Persisted across resolution so the completion frame
+   *  is dropped too. */
+  elicitationToolCallIds: string[];
   recentDiffs: DiffPreview[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
@@ -437,6 +635,12 @@ export interface AcpState {
    *  reconnect-replay can deliver the same frames again without
    *  double-applying them to state. */
   lastSeq: number;
+  /** Lowest seq whose rows are currently in `activity`, i.e. the
+   *  recent-first load watermark. 0 means nothing loaded yet (or the
+   *  whole history is loaded down to the start). The client pages older
+   *  history by requesting `?before=<oldestSeq>`; the reducer's `prepend`
+   *  action lowers it. See #2236. */
+  oldestSeq: number;
   /** True if the most recent broadcast told us we lagged. Cleared
    *  the next time the client successfully resyncs via the snapshot
    *  endpoint. */
@@ -555,6 +759,24 @@ export interface AcpState {
   /** Reason the agent provided when scheduling the wakeup. Shown in
    *  the structured view banner next to the countdown. */
   nextWakeupReason: string | null;
+  /** True when the agent has an armed `Monitor` (a background watch).
+   *  Unlike a scheduled wakeup it has no fire time, so the UI shows a
+   *  static "monitoring" badge, not a countdown. A monitor firing
+   *  re-invokes the agent with activity but never a `UserPromptSent`, so
+   *  this persists across the wait and clears when the user takes over
+   *  (`UserPromptSent`) or the monitor fires and that turn ends: a tool
+   *  call started after the arm (`monitorWorkSeen`) followed by a
+   *  `Stopped`. See #2325. */
+  monitorArmed: boolean;
+  /** True once a tool call has started after the latest `MonitorArmed`,
+   *  i.e. the monitor fired and the agent acted on it. Gates the badge
+   *  clear on the next `Stopped` so the arming turn ending while the
+   *  monitor is still pending does not clear it. Reset by `MonitorArmed`
+   *  and `UserPromptSent`. See #2325. */
+  monitorWorkSeen: boolean;
+  /** The `description` the agent gave the `Monitor` tool, shown as the
+   *  badge tooltip. Null when none was provided or no monitor is armed. */
+  monitorDescription: string | null;
   /** True between a `CancelRequested` event (aoe sent `session/cancel`
    *  and armed the escalation watchdog) and the next `Stopped`. Drives
    *  the "Stopping..." spinner label and reveals the Force-stop
@@ -629,6 +851,50 @@ export interface AcpState {
    *  or finished without notifying the daemon (`agentOrphaned`).
    *  Cleared on `AcpSessionAssigned` or `UserPromptSent`. See #1240. */
   agentOrphaned: boolean;
+  /** Async sub-agents (Claude `Task` with isAsync) launched this session.
+   *  The parent stream only carries each launch; the daemon tails each
+   *  agent's transcript and emits `BackgroundAgent*` events that build
+   *  this list. Drives the Background agents panel and the inline Task
+   *  card linkage. Insertion order (oldest first). */
+  backgroundAgents: BackgroundAgent[];
+}
+
+/** Lifecycle status of an async background sub-agent. Mirrors the Rust
+ *  `BackgroundAgentStatus`. `completed` is the only clean-finish state. */
+export type BackgroundAgentStatus = "running" | "stalled" | "completed" | "detached" | "error";
+
+/** One tool call a background sub-agent made, for the per-agent tool list.
+ *  Mirrors the Rust `BackgroundAgentTool`. */
+export interface BackgroundAgentTool {
+  name: string;
+  /** Short label from the tool input (command / file path / pattern). */
+  title?: string | null;
+  /** Outcome: undefined while running, true succeeded, false errored. */
+  ok?: boolean | null;
+}
+
+/** One async background sub-agent, built up from `BackgroundAgent*`
+ *  events. Mirrors the Rust `BackgroundAgentRecord`. */
+export interface BackgroundAgent {
+  agentId: string;
+  /** The parent `Task` tool call that launched this agent; links the
+   *  inline tool card to this panel entry. */
+  toolCallId: string;
+  description: string;
+  prompt: string;
+  model: string;
+  status: BackgroundAgentStatus;
+  /** ISO-8601 launch time. */
+  startedAt: string;
+  /** ISO-8601 terminal time, set on completion/stall/error. */
+  endedAt: string | null;
+  toolCount: number;
+  /** Individual tool calls in order, like the main output. */
+  tools: BackgroundAgentTool[];
+  lastTool: string | null;
+  lastText: string | null;
+  result: string | null;
+  warning: string | null;
 }
 
 export interface RejectedPrompt {
@@ -668,6 +934,7 @@ export interface ActivityRow {
     | "thinking"
     | "user_prompt"
     | "user_diff_comments"
+    | "elicitation_answered"
     | "empty_output"
     | "context_reset"
     | "session_cleared"
@@ -697,6 +964,14 @@ export interface ActivityRow {
    *  ships them only at completion. Absent for text-only completions
    *  (those render from `text`). See #1818. */
   output?: ToolOutputBlock[];
+  /** Display-ready answers on an `elicitation_answered` row (the user's
+   *  reply to an AskUserQuestion / elicitation form). `text` holds a flat
+   *  fallback; the card renders the structured pairs. See #2209. */
+  elicitationAnswers?: ElicitationAnswer[];
+  /** True on a `tool_complete` row that is the synchronous launch of an
+   *  async sub-agent (Claude `Task` with isAsync). The runtime routes it
+   *  to a neutral background sub-agent card and drops the marker body. */
+  asyncSubagent?: boolean;
   at: string; // ISO-8601
 }
 
@@ -726,6 +1001,8 @@ export function emptyAcpState(): AcpState {
     plan: null,
     inFlightTool: null,
     pendingApprovals: [],
+    pendingElicitations: [],
+    elicitationToolCallIds: [],
     recentDiffs: [],
     thinking: false,
     rateLimit: null,
@@ -734,6 +1011,7 @@ export function emptyAcpState(): AcpState {
     assistantMessage: "",
     activity: [],
     lastSeq: 0,
+    oldestSeq: 0,
     lagged: false,
     startupError: null,
     incompatibleAgent: null,
@@ -752,12 +1030,16 @@ export function emptyAcpState(): AcpState {
     queuedPrompts: [],
     nextWakeupAt: null,
     nextWakeupReason: null,
+    monitorArmed: false,
+    monitorWorkSeen: false,
+    monitorDescription: null,
     cancelling: false,
     cancelEscalatesAt: null,
     contextPrimerAvailable: null,
     rejectedPrompts: [],
     agentUnresponsive: false,
     agentOrphaned: false,
+    backgroundAgents: [],
     modeSwitchFailed: null,
     lastAgentSwitch: null,
     configOptions: [],
@@ -810,6 +1092,12 @@ function applyNewTurnResets(next: AcpState): void {
       next.nextWakeupReason = null;
     }
   }
+  // A monitor has no fire time to gate on. Unlike a wakeup it never
+  // self-fires a prompt, so any UserPromptSent reaching here is the user
+  // taking over: clear the "monitoring" badge unconditionally.
+  next.monitorArmed = false;
+  next.monitorWorkSeen = false;
+  next.monitorDescription = null;
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
@@ -887,6 +1175,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.plan = null;
       next.mode = "Default";
       next.pendingApprovals = [];
+      next.pendingElicitations = [];
+      next.elicitationToolCallIds = [];
       // Capture the agent's cumulative cost snapshot as the new
       // baseline so the next UsageUpdate reports cost-since-clear
       // instead of session-lifetime cumulative. `sessionUsage.cost`
@@ -907,7 +1197,20 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("ToolCallStarted" in event) {
     const tc = event.ToolCallStarted.tool_call;
+    // An AskUserQuestion tool call is rendered by its elicitation card, not
+    // a transcript tool card. If the elicitation arrived first, drop the
+    // redundant start frame entirely. See ElicitationRequested.
+    if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
+      return next;
+    }
     next.inFlightTool = tc;
+    // A tool call after the monitor armed means the monitor fired and the
+    // agent is acting on it; gate the badge clear on the next Stopped. The
+    // Monitor tool's own start precedes its MonitorArmed, so it never marks
+    // itself. See #2325.
+    if (next.monitorArmed) {
+      next.monitorWorkSeen = true;
+    }
     // The reasoning block produced output (a tool call), so the agent is
     // no longer thinking. The adapter often skips ThinkingEnded when it
     // transitions into tool calls, so clear it here. See #1213.
@@ -947,7 +1250,16 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, output, completed_at } = event.ToolCallCompleted;
+    const { tool_call_id, is_error, content, output, completed_at, async_subagent } = event.ToolCallCompleted;
+    // The AskUserQuestion tool's completion is owned by its elicitation
+    // card; drop it so no transcript tool card materializes. Clear the
+    // in-flight pointer if it still points at this suppressed tool.
+    if (next.elicitationToolCallIds.includes(tool_call_id)) {
+      if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
+        next.inFlightTool = null;
+      }
+      return next;
+    }
     // #1713: a completion with no preceding start frame would render no
     // card (the render layer only attaches results to an existing
     // tool-call part). Synthesize a minimal start row first so the card
@@ -982,6 +1294,7 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       text,
       toolCallId: tool_call_id,
       output: output && output.length > 0 ? output : undefined,
+      asyncSubagent: async_subagent || undefined,
       at: completed_at ?? new Date().toISOString(),
     });
     return next;
@@ -1053,6 +1366,35 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("ApprovalResolved" in event) {
     const { nonce } = event.ApprovalResolved;
     next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
+    return next;
+  }
+  if ("ElicitationRequested" in event) {
+    const e = event.ElicitationRequested.elicitation;
+    next.pendingElicitations = [...next.pendingElicitations, e];
+    // The adapter also emits an AskUserQuestion tool call for this
+    // elicitation. The card below replaces it, so remember the
+    // tool_call_id (to drop a later start/complete frame) and strip any
+    // tool row + in-flight pointer it already produced.
+    if (e.tool_call_id) {
+      const id = e.tool_call_id;
+      if (!next.elicitationToolCallIds.includes(id)) {
+        next.elicitationToolCallIds = [...next.elicitationToolCallIds, id];
+      }
+      next.activity = next.activity.filter((r) => r.toolCallId !== id);
+      if (next.inFlightTool && next.inFlightTool.id === id) {
+        next.inFlightTool = null;
+      }
+    }
+    return next;
+  }
+  if ("ElicitationResolved" in event) {
+    const { nonce, answers } = event.ElicitationResolved;
+    next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
+    // Record the picked answer so it survives the card closing. Deduped by
+    // id, so this is a no-op if the optimistic local clear already added it
+    // (and the safety net when that clear never ran: cold replay, a second
+    // device). See #2209.
+    next.activity = appendElicitationAnswerRow(next.activity, nonce, answers ?? []);
     return next;
   }
   if ("DiffEmitted" in event) {
@@ -1201,6 +1543,20 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.cancelEscalatesAt = null;
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
+    // Clear the "monitoring" badge once the monitor has fired and that turn
+    // ends. The monitor firing makes the agent act (a tool call after the
+    // arm, tracked by `monitorWorkSeen`); the badge then retires on the next
+    // Stopped. This covers both shapes: the agent ending the arming turn and
+    // resuming later between prompts (closed by `agent_idle`), and the
+    // monitor blocking the arming turn in-band (closed by `prompt_complete`).
+    // A Stopped with no post-arm work is the arming turn ending while the
+    // monitor is still pending, so it deliberately leaves the badge up. See
+    // #2325.
+    if (next.monitorArmed && next.monitorWorkSeen) {
+      next.monitorArmed = false;
+      next.monitorWorkSeen = false;
+      next.monitorDescription = null;
+    }
     // The "user_stopped" / "restart_pending" reasons are published by
     // the supervisor's reap_user_stopped pass when it detects an
     // out-of-band CLI teardown. Surface a distinct UI state for each:
@@ -1322,6 +1678,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // submitted. See #1170.
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
+    return next;
+  }
+  if ("PromptRuntimeError" in event) {
+    next.lastError = event.PromptRuntimeError.message;
+    // A real turn-level failure was surfaced, so the generic
+    // "Command produced no output." fallback must stay suppressed when
+    // the terminal Stopped arrives for the same turn.
+    next.turnHasOutput = true;
     return next;
   }
   if ("PromptCapabilities" in event) {
@@ -1501,6 +1865,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.nextWakeupReason = event.WakeupScheduled.reason ?? null;
     return next;
   }
+  if ("MonitorArmed" in event) {
+    next.monitorArmed = true;
+    // Reset the fired-work gate: work only counts once it follows THIS arm.
+    next.monitorWorkSeen = false;
+    next.monitorDescription = event.MonitorArmed.description ?? null;
+    return next;
+  }
   if ("CancelRequested" in event) {
     // aoe sent session/cancel and armed the escalation watchdog; the
     // turn is still active. Surface "Stopping..." and the escalation
@@ -1528,6 +1899,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     sweepOpenToolCalls(next, frame.seq);
     next.thinking = false;
     next.pendingApprovals = [];
+    next.pendingElicitations = [];
+    next.elicitationToolCallIds = [];
     next.sessionUsage = null;
     // The new backend reports its own cumulative cost starting from
     // zero, so the prior agent's per-clear baseline does not apply.
@@ -1591,10 +1964,82 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.turnActive = isTurnActive(next);
     return next;
   }
+  if ("BackgroundAgentLaunched" in event) {
+    const e = event.BackgroundAgentLaunched;
+    const record: BackgroundAgent = {
+      agentId: e.agent_id,
+      toolCallId: e.tool_call_id,
+      description: e.description,
+      prompt: e.prompt,
+      model: e.model,
+      status: "running",
+      startedAt: e.started_at,
+      endedAt: null,
+      toolCount: 0,
+      tools: [],
+      lastTool: null,
+      lastText: null,
+      result: null,
+      warning: null,
+    };
+    // Idempotent on replay: replace any existing record for this agent.
+    const i = next.backgroundAgents.findIndex((a) => a.agentId === e.agent_id);
+    next.backgroundAgents =
+      i >= 0 ? next.backgroundAgents.map((a, idx) => (idx === i ? record : a)) : [...next.backgroundAgents, record];
+    return next;
+  }
+  if ("BackgroundAgentProgress" in event) {
+    const e = event.BackgroundAgentProgress;
+    next.backgroundAgents = next.backgroundAgents.map((a) => {
+      if (a.agentId !== e.agent_id) return a;
+      // A terminal record never reopens to running.
+      if (a.status === "completed" || a.status === "detached" || a.status === "error") return a;
+      return {
+        ...a,
+        status: e.status,
+        toolCount: e.tool_count,
+        tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+        // Freeze the elapsed timer once stalled (the agent stopped
+        // writing; the SDK likely dropped it). Clear it if it resumes.
+        // The terminal Completed event sets the authoritative ended time.
+        endedAt: e.status === "stalled" ? (a.endedAt ?? e.at) : e.status === "running" ? null : a.endedAt,
+        lastTool: e.last_tool ?? a.lastTool,
+        lastText: e.last_text ?? a.lastText,
+      };
+    });
+    return next;
+  }
+  if ("BackgroundAgentCompleted" in event) {
+    const e = event.BackgroundAgentCompleted;
+    next.backgroundAgents = next.backgroundAgents.map((a) =>
+      a.agentId === e.agent_id
+        ? {
+            ...a,
+            status: e.status,
+            endedAt: e.ended_at,
+            tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
+            result: e.result ?? a.result,
+            warning: e.warning ?? a.warning,
+          }
+        : a,
+    );
+    return next;
+  }
   // RawAgentUpdate, TodoListUpdated, anything else: pass through with
   // no state mutation. The activity feed shows the raw text where
   // useful via the catch-all branch in the UI.
   return next;
+}
+
+/** Fold a self-contained run of frames from an empty state. Used by the
+ *  recent-first load to reduce an OLDER history page in isolation (so the
+ *  page's activity rows can be prepended without disturbing the live
+ *  reducer's optimistic / queue / approval state, which is not a pure
+ *  fold of the frame log), and to project the handshake snapshot. The
+ *  caller is responsible for the frames being a clean unit; backward
+ *  paging guarantees each page starts at a user-turn boundary. See #2236. */
+export function reduceFrames(frames: AcpFrame[]): AcpState {
+  return frames.reduce(applyEvent, emptyAcpState());
 }
 
 /** True when `rows` already carries a `tool_start` row for this id. */
@@ -1659,6 +2104,29 @@ function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
     return next.slice(next.length - activityLimit);
   }
   return next;
+}
+
+/** Append an `elicitation_answered` row recording the user's answers,
+ *  keyed by `elicitation-<nonce>` and deduped by id. Shared by the
+ *  optimistic local clear (renders from the pending card) and the
+ *  server-event handler (renders from the broadcast), so whichever lands
+ *  first wins and the other is a no-op even when the broadcast survives
+ *  seq dedupe. No row for empty answers (skip / cancel / teardown). See
+ *  #2209. */
+export function appendElicitationAnswerRow(
+  rows: ActivityRow[],
+  nonce: string,
+  answers: ElicitationAnswer[],
+): ActivityRow[] {
+  const id = `elicitation-${nonce}`;
+  if (answers.length === 0 || rows.some((r) => r.id === id)) return rows;
+  return pushActivity(rows, {
+    id,
+    kind: "elicitation_answered",
+    text: answers.map((a) => `${a.question}: ${a.answer}`).join("\n"),
+    elicitationAnswers: answers,
+    at: new Date().toISOString(),
+  });
 }
 
 /** Close any `tool_start` rows that never received a matching terminal
@@ -1737,6 +2205,7 @@ export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "las
  *  fully retired) and re-derive `turnActive` from the counters. */
 export function normaliseTurnCounters(
   state: AcpState & {
+    oldestSeq?: number;
     pendingUserPromptSeq?: number;
     lastStoppedSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
@@ -1772,8 +2241,16 @@ export function normaliseTurnCounters(
   const configOptions = Array.isArray(state.configOptions) ? state.configOptions : [];
   const configOptionSwitchFailed = state.configOptionSwitchFailed === undefined ? null : state.configOptionSwitchFailed;
   const pendingConfigOption = state.pendingConfigOption === undefined ? null : state.pendingConfigOption;
+  // Pre-#2236 persisted entries lack oldestSeq; backfill to 0 (nothing
+  // older loaded) so the recent-first `before=<oldestSeq>` paging contract
+  // never sees undefined on a warm hydrate.
+  const oldestSeq =
+    typeof state.oldestSeq === "number" && Number.isFinite(state.oldestSeq)
+      ? Math.max(0, Math.floor(state.oldestSeq))
+      : 0;
   return {
     ...state,
+    oldestSeq,
     rejectedPrompts,
     agentUnresponsive,
     agentOrphaned,

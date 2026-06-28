@@ -4,6 +4,8 @@
 //! happen from [`super::mod`]'s async loop; this struct stays a plain
 //! POD so the render layer can borrow it freely.
 
+use std::collections::VecDeque;
+
 use ratatui_textarea::TextArea;
 
 use super::input::Focus;
@@ -12,7 +14,15 @@ use super::reducer::AcpTranscript;
 use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, WsHandle};
 use crate::acp::state::AvailableCommand;
+use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::session::config::QueueDrainMode;
+use crate::tui::plugin_ui;
+
+/// Most plugin notifications buffered locally awaiting a free toast slot. The
+/// daemon already bounds its notification ring; this is a second guard so a
+/// burst can't grow the view's memory, and old un-shown toasts drop rather
+/// than the newest.
+const MAX_PENDING_PLUGIN_TOASTS: usize = 20;
 
 pub struct StructuredViewState {
     pub session_id: String,
@@ -65,6 +75,44 @@ pub struct StructuredViewState {
     /// Keeps the picker closed while they keep typing in that same
     /// token; cleared once the token goes away or a fresh `@` is typed.
     pub dismissed_mention: Option<(usize, usize)>,
+    /// Active ArrowUp/ArrowDown queue-recall browse, or `None` when the
+    /// composer is in its normal typing mode. See [`RecallState`].
+    pub recall: Option<RecallState>,
+    /// Latest plugin UI-state snapshot polled from the daemon (#2402). Empty
+    /// until the first poll lands; the status line renders the
+    /// TUI-applicable slots (global `StatusBar`, this session's
+    /// `DetailBadge`) from it.
+    pub plugin_ui: UiSnapshot,
+    /// Notification bookkeeping so each `ui.notify` toasts once. See
+    /// [`PluginNotifyState`].
+    pub plugin_notify: PluginNotifyState,
+}
+
+/// Tracks which plugin notifications have been shown and buffers any awaiting
+/// a free toast slot, so a poll that returns several new notifications shows
+/// them in turn instead of clobbering the single-slot banner down to the last.
+#[derive(Debug, Default)]
+pub struct PluginNotifyState {
+    /// Highest notification seq already accounted for. Notifications at or
+    /// below this are not re-toasted.
+    pub last_seen_seq: u64,
+    /// False until the first snapshot establishes the baseline. The first
+    /// snapshot only sets `last_seen_seq` (pre-existing notifications must not
+    /// toast on open); subsequent ones enqueue what is genuinely new.
+    pub initialized: bool,
+    /// Notifications waiting to be shown, oldest first.
+    pub pending: VecDeque<Notification>,
+}
+
+/// In-progress shell-history-style browse of the prompt queue. The user
+/// pressed ArrowUp on an empty-origin composer; `index` points at the
+/// queued entry currently loaded into the composer and `stashed_draft`
+/// holds the text that was there before browsing started, restored when
+/// ArrowDown walks back past the newest entry.
+#[derive(Debug, Clone)]
+pub struct RecallState {
+    pub index: usize,
+    pub stashed_draft: String,
 }
 
 /// Build a composer textarea with the shared placeholder + cursor
@@ -132,7 +180,46 @@ impl StructuredViewState {
             file_index: FileIndex::Unloaded,
             mention: None,
             dismissed_mention: None,
+            recall: None,
+            plugin_ui: UiSnapshot {
+                entries: Vec::new(),
+                notifications: Vec::new(),
+                revisions: Default::default(),
+            },
+            plugin_notify: PluginNotifyState::default(),
         }
+    }
+
+    /// Fold a freshly-polled plugin UI snapshot into state: store it for the
+    /// renderer and enqueue any genuinely-new notifications for this session
+    /// as toasts. The first snapshot only baselines the seq watermark (so
+    /// notifications that predate opening the view stay silent); a snapshot
+    /// whose max seq regressed below the watermark is treated as a daemon
+    /// restart (seq ring reset) and re-baselines without toasting.
+    pub fn ingest_plugin_ui(&mut self, snapshot: UiSnapshot) {
+        let max_seq = plugin_ui::max_notification_seq(&snapshot);
+        if !self.plugin_notify.initialized || max_seq < self.plugin_notify.last_seen_seq {
+            self.plugin_notify.last_seen_seq = max_seq;
+            self.plugin_notify.initialized = true;
+        } else {
+            for n in plugin_ui::new_notifications(
+                &snapshot,
+                self.plugin_notify.last_seen_seq,
+                &self.session_id,
+            ) {
+                self.plugin_notify.pending.push_back(n.clone());
+                while self.plugin_notify.pending.len() > MAX_PENDING_PLUGIN_TOASTS {
+                    self.plugin_notify.pending.pop_front();
+                }
+            }
+            self.plugin_notify.last_seen_seq = max_seq;
+        }
+        self.plugin_ui = snapshot;
+    }
+
+    /// Pop the next buffered plugin notification to show, if any.
+    pub fn next_plugin_toast(&mut self) -> Option<Notification> {
+        self.plugin_notify.pending.pop_front()
     }
 
     /// Whether a fresh Enter should park in the queue rather than send
@@ -157,7 +244,118 @@ impl StructuredViewState {
         // too. The fetched file_index cache survives for the session.
         self.mention = None;
         self.dismissed_mention = None;
+        // A submit / reset ends any queue-recall browse.
+        self.recall = None;
         text
+    }
+
+    /// True when the composer caret sits at the very start (row 0, col 0).
+    /// An empty composer trivially satisfies this. Gates entry into
+    /// queue-recall so ArrowUp keeps moving the caret inside a multi-line
+    /// draft until the user is at the top-left, then falls through to the
+    /// queue like a shell history.
+    pub fn caret_at_origin(&self) -> bool {
+        self.composer.cursor() == (0, 0)
+    }
+
+    /// Whether an ArrowUp/ArrowDown queue browse is active.
+    pub fn browsing_queue(&self) -> bool {
+        self.recall.is_some()
+    }
+
+    /// Replace the composer contents with `text`, caret at the end.
+    /// Mirrors [`take_composer_text`]'s fresh-textarea swap since
+    /// ratatui-textarea has no public clear.
+    fn set_composer_text(&mut self, text: &str) {
+        self.composer = new_composer_textarea();
+        self.composer.insert_str(text);
+        self.slash_selected = 0;
+        self.dismissed_slash_query = None;
+        self.mention = None;
+        self.dismissed_mention = None;
+    }
+
+    /// Step the queue-recall browse by `delta` (-1 = older via ArrowUp,
+    /// +1 = newer via ArrowDown). Entering from the normal composer
+    /// stashes the current draft; walking past the newest entry restores
+    /// it and exits browse. A no-op on an empty queue.
+    pub fn recall_step(&mut self, delta: i32) {
+        let len = self.queue.len();
+        if len == 0 {
+            self.recall = None;
+            return;
+        }
+        match self.recall.take() {
+            None => {
+                // Only ArrowUp enters browse; ArrowDown with no browse is a
+                // no-op (the dispatcher already gates this, but stay safe).
+                if delta >= 0 {
+                    return;
+                }
+                let stashed_draft = self.composer.lines().join("\n");
+                let index = len - 1;
+                self.set_composer_text(&self.queue.get(index).cloned().unwrap_or_default());
+                self.recall = Some(RecallState {
+                    index,
+                    stashed_draft,
+                });
+            }
+            Some(mut r) => {
+                if delta < 0 {
+                    // Older: stop at the oldest entry, no wrap.
+                    if r.index > 0 {
+                        r.index -= 1;
+                        self.set_composer_text(
+                            &self.queue.get(r.index).cloned().unwrap_or_default(),
+                        );
+                    }
+                    self.recall = Some(r);
+                } else {
+                    // Newer: past the newest entry, restore the stashed draft.
+                    if r.index + 1 < len {
+                        r.index += 1;
+                        self.set_composer_text(
+                            &self.queue.get(r.index).cloned().unwrap_or_default(),
+                        );
+                        self.recall = Some(r);
+                    } else {
+                        let draft = r.stashed_draft.clone();
+                        self.set_composer_text(&draft);
+                        self.recall = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reconcile an active browse after `dropped` entries drain off the
+    /// front of the queue. The browsed entry shifts down by `dropped`; if
+    /// it was among the drained ones (or the queue emptied) the browse is
+    /// cancelled, leaving the in-progress composer text as a normal draft.
+    pub fn reconcile_recall_after_drain(&mut self, dropped: usize) {
+        if let Some(r) = self.recall.as_mut() {
+            if r.index < dropped || self.queue.is_empty() {
+                self.recall = None;
+            } else {
+                r.index -= dropped;
+            }
+        }
+    }
+
+    /// End a queue-recall browse without touching the composer text, so
+    /// any edited prompt is retained as a draft. Called when the queue is
+    /// cleared or focus leaves the composer mid-browse.
+    pub fn cancel_recall(&mut self) {
+        self.recall = None;
+    }
+
+    /// Abandon a queue-recall browse and restore the draft that was in the
+    /// composer before browsing began (the `Esc` while browsing).
+    pub fn recall_cancel_restore(&mut self) {
+        if let Some(r) = self.recall.take() {
+            let draft = r.stashed_draft;
+            self.set_composer_text(&draft);
+        }
     }
 
     /// The current single-line slash query (without the leading slash),
@@ -306,6 +504,111 @@ mod tests {
         assert!(state.is_busy());
     }
 
+    fn composer_text(state: &StructuredViewState) -> String {
+        state.composer.lines().join("\n")
+    }
+
+    #[test]
+    fn recall_browses_from_newest_and_stashes_the_draft() {
+        let mut state = test_state(None);
+        state.queue.push("first".into());
+        state.queue.push("second".into());
+        state.composer.insert_str("my draft");
+
+        // ArrowUp loads the newest queued prompt and stashes the draft.
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "second");
+        assert_eq!(state.recall.as_ref().unwrap().index, 1);
+
+        // ArrowUp again walks to the older entry.
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "first");
+        assert_eq!(state.recall.as_ref().unwrap().index, 0);
+
+        // Past the oldest: no wrap, stays put.
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "first");
+        assert_eq!(state.recall.as_ref().unwrap().index, 0);
+    }
+
+    #[test]
+    fn recall_down_past_newest_restores_the_stashed_draft() {
+        let mut state = test_state(None);
+        state.queue.push("only".into());
+        state.composer.insert_str("draft text");
+
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "only");
+        // ArrowDown past the newest restores the draft and ends browse.
+        state.recall_step(1);
+        assert_eq!(composer_text(&state), "draft text");
+        assert!(state.recall.is_none());
+    }
+
+    #[test]
+    fn reconcile_shifts_browse_index_when_front_drains() {
+        let mut state = test_state(None);
+        state.queue.push("a".into());
+        state.queue.push("b".into());
+        state.queue.push("c".into());
+        state.recall_step(-1); // browsing "c" at index 2
+        assert_eq!(state.recall.as_ref().unwrap().index, 2);
+
+        // Two entries drain off the front; the browsed entry shifts to 0.
+        state.queue.drop_front(2);
+        state.reconcile_recall_after_drain(2);
+        assert_eq!(state.recall.as_ref().unwrap().index, 0);
+    }
+
+    #[test]
+    fn reconcile_cancels_browse_when_browsed_entry_drains() {
+        let mut state = test_state(None);
+        state.queue.push("a".into());
+        state.queue.push("b".into());
+        // Browse the oldest ("a", index 0) by walking up twice.
+        state.recall_step(-1);
+        state.recall_step(-1);
+        assert_eq!(state.recall.as_ref().unwrap().index, 0);
+        let browsed = composer_text(&state);
+
+        state.queue.drop_front(1);
+        state.reconcile_recall_after_drain(1);
+        // The browsed entry is gone: browse cancelled, edited text retained.
+        assert!(state.recall.is_none());
+        assert_eq!(composer_text(&state), browsed);
+    }
+
+    #[test]
+    fn recall_cancel_restore_brings_back_the_draft() {
+        let mut state = test_state(None);
+        state.queue.push("queued".into());
+        state.composer.insert_str("draft");
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "queued");
+        state.recall_cancel_restore();
+        assert!(state.recall.is_none());
+        assert_eq!(composer_text(&state), "draft");
+    }
+
+    #[test]
+    fn cancel_recall_keeps_composer_text() {
+        let mut state = test_state(None);
+        state.queue.push("queued".into());
+        state.recall_step(-1);
+        assert_eq!(composer_text(&state), "queued");
+        state.cancel_recall();
+        assert!(state.recall.is_none());
+        assert_eq!(composer_text(&state), "queued");
+    }
+
+    #[test]
+    fn caret_at_origin_tracks_cursor() {
+        let mut state = test_state(None);
+        assert!(state.caret_at_origin());
+        state.composer.insert_str("text");
+        assert!(!state.caret_at_origin());
+    }
+
     #[test]
     fn enqueue_grows_the_local_queue() {
         let mut state = test_state(None);
@@ -405,5 +708,79 @@ mod tests {
         state.transcript.available_commands = vec![cmd("compact")];
         state.reconcile_slash_selection();
         assert_eq!(state.slash_selected, 0);
+    }
+
+    fn notify_snapshot(notifications: serde_json::Value) -> UiSnapshot {
+        serde_json::from_value(serde_json::json!({
+            "entries": [],
+            "notifications": notifications,
+        }))
+        .expect("snapshot deserializes")
+    }
+
+    #[test]
+    fn first_snapshot_baselines_without_toasting() {
+        // test_state uses session "s-1".
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 5, "plugin_id": "p", "tone": "info", "title": "old"}
+        ])));
+        assert!(
+            state.next_plugin_toast().is_none(),
+            "pre-open notifications stay silent"
+        );
+        assert_eq!(state.plugin_notify.last_seen_seq, 5);
+    }
+
+    #[test]
+    fn later_snapshot_enqueues_only_new_matching_once() {
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "old"}
+        ])));
+        // seq 2 (global) and seq 3 (this session) are new; seq 4 targets
+        // another session and must not toast here.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "old"},
+            {"seq": 2, "plugin_id": "p", "tone": "info", "title": "global"},
+            {"seq": 3, "plugin_id": "p", "tone": "warn", "title": "mine", "session_id": "s-1"},
+            {"seq": 4, "plugin_id": "p", "tone": "info", "title": "other", "session_id": "s-2"}
+        ])));
+        assert_eq!(state.next_plugin_toast().unwrap().title, "global");
+        assert_eq!(state.next_plugin_toast().unwrap().title, "mine");
+        assert!(state.next_plugin_toast().is_none());
+
+        // Re-polling the same snapshot enqueues nothing new.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 4, "plugin_id": "p", "tone": "info", "title": "other", "session_id": "s-2"}
+        ])));
+        assert!(state.next_plugin_toast().is_none());
+    }
+
+    #[test]
+    fn pending_queue_is_bounded_dropping_oldest() {
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([])));
+        let many: Vec<serde_json::Value> = (1..=MAX_PENDING_PLUGIN_TOASTS as u64 + 5)
+            .map(|seq| serde_json::json!({"seq": seq, "plugin_id": "p", "tone": "info", "title": format!("n{seq}")}))
+            .collect();
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!(many)));
+        assert_eq!(state.plugin_notify.pending.len(), MAX_PENDING_PLUGIN_TOASTS);
+        // Oldest dropped: the front is n6, not n1.
+        assert_eq!(state.next_plugin_toast().unwrap().title, "n6");
+    }
+
+    #[test]
+    fn seq_rollback_rebaselines_without_toasting() {
+        let mut state = test_state(None);
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 50, "plugin_id": "p", "tone": "info", "title": "high"}
+        ])));
+        // Daemon restarts: seq ring resets, max seq drops below the watermark.
+        state.ingest_plugin_ui(notify_snapshot(serde_json::json!([
+            {"seq": 1, "plugin_id": "p", "tone": "info", "title": "fresh"}
+        ])));
+        assert!(state.next_plugin_toast().is_none());
+        assert_eq!(state.plugin_notify.last_seen_seq, 1);
     }
 }

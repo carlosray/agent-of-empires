@@ -130,6 +130,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "containers",
     "git",
     "migrations",
+    "plugin",
     "web",
     // `log` is the meta-target prefix for filter-swap audit events
     // (`log.runtime`). Without this, `log.runtime` would be dropped
@@ -147,6 +148,7 @@ pub const DEFAULT_TARGET_ROOTS: &[&str] = &[
     "hooks",
     "sound",
     "telemetry",
+    "smart_rename",
 ];
 
 /// Sub-targets users can tune individually from the settings UI.
@@ -167,6 +169,7 @@ pub const KNOWN_SUB_TARGETS: &[&str] = &[
     "acp.supervisor",
     "acp.event_store",
     "acp.runner",
+    "plugin.host",
     "terminal.ws",
     "terminal.ws.bytes",
     "auth.token",
@@ -1099,6 +1102,19 @@ mod tests {
     }
 
     #[test]
+    fn smart_rename_target_is_captured_by_default_filter() {
+        // The expanded filter has no global default directive, so a target that
+        // is not a known root is dropped at every level. smart_rename emits under
+        // `target: "smart_rename"`; without a root entry its skip/success lines
+        // are invisible and the feature cannot be diagnosed.
+        let s = LogConfig::filter_for_level(LogLevel::Debug);
+        assert!(
+            s.contains("smart_rename=debug"),
+            "smart_rename root missing from filter: {s}"
+        );
+    }
+
+    #[test]
     fn filter_string_overlay_acp() {
         let cfg = LogConfig {
             level: Some(LogLevel::Info),
@@ -1132,6 +1148,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_env_no_vars() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("AOE_LOG_LEVEL");
@@ -1145,6 +1162,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_env_aoe_log_level() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::set_var("AOE_LOG_LEVEL", "trace");
@@ -1155,6 +1173,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn from_env_legacy_debug_flag() {
         let _g = ENV_LOCK.lock().unwrap();
         std::env::remove_var("AOE_LOG_LEVEL");

@@ -12,11 +12,13 @@ use super::add::AddArgs;
 use super::extract_session_id::ExtractSessionIdArgs;
 use super::group::GroupCommands;
 use super::init::InitArgs;
+use super::killall::KillallArgs;
 use super::list::ListArgs;
 #[cfg(feature = "serve")]
 use super::log_level::LogLevelArgs;
 use super::logs::LogsArgs;
 use super::mcp::McpCommands;
+use super::plugin::PluginCommands;
 use super::profile::ProfileCommands;
 use super::project::ProjectCommands;
 use super::remove::RemoveArgs;
@@ -24,6 +26,7 @@ use super::send::SendArgs;
 #[cfg(feature = "serve")]
 use super::serve::ServeArgs;
 use super::session::SessionCommands;
+use super::settings::SettingsCommands;
 use super::sounds::SoundsCommands;
 use super::status::StatusArgs;
 use super::telemetry::TelemetryCommands;
@@ -98,6 +101,21 @@ pub enum Commands {
     /// Show session status summary
     Status(StatusArgs),
 
+    /// Force-stop everything aoe is running: the serve daemon, all agent
+    /// workers, and all aoe tmux sessions. Destructive and unprompted.
+    Killall(KillallArgs),
+
+    /// Internal: trap for `aoe stop`, which is not a command in aoe (stopping
+    /// is always scoped to a noun). Redirects users to `session stop`,
+    /// `acp stop`, `serve --stop`, or `killall`. Hidden from help.
+    #[command(name = "stop", hide = true)]
+    Stop {
+        /// Swallow any args the user typed (e.g. a session id) so the trap
+        /// fires instead of clap erroring on an unexpected positional.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
     /// Manage session lifecycle (start, stop, attach, etc.)
     Session {
         #[command(subcommand)]
@@ -108,6 +126,12 @@ pub enum Commands {
     Group {
         #[command(subcommand)]
         command: GroupCommands,
+    },
+
+    /// Manage plugins (list, info, enable, disable, install, update, uninstall)
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommands,
     },
 
     /// Manage profiles (separate workspaces)
@@ -144,6 +168,12 @@ pub enum Commands {
     Theme {
         #[command(subcommand)]
         command: ThemeCommands,
+    },
+
+    /// Inspect resolved settings and their provenance
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommands,
     },
 
     /// Manage anonymous opt-in usage telemetry
@@ -219,14 +249,17 @@ pub const CLI_COMMAND_NAMES: &[&str] = &[
     "remove",
     "send",
     "status",
+    "killall",
     "session",
     "group",
+    "plugin",
     "profile",
     "project",
     "worktree",
     "tmux",
     "sounds",
     "theme",
+    "settings",
     "telemetry",
     "mcp",
     "serve",
@@ -259,14 +292,19 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         Commands::Remove(_) => "remove",
         Commands::Send(_) => "send",
         Commands::Status(_) => "status",
+        Commands::Killall(_) => "killall",
+        // Hidden trap; never a user action, never counted.
+        Commands::Stop { .. } => return None,
         Commands::Session { .. } => "session",
         Commands::Group { .. } => "group",
+        Commands::Plugin { .. } => "plugin",
         Commands::Profile { .. } => "profile",
         Commands::Project { .. } => "project",
         Commands::Worktree { .. } => "worktree",
         Commands::Tmux { .. } => "tmux",
         Commands::Sounds { .. } => "sounds",
         Commands::Theme { .. } => "theme",
+        Commands::Settings { .. } => "settings",
         Commands::Telemetry { .. } => "telemetry",
         Commands::Mcp { .. } => "mcp",
         #[cfg(feature = "serve")]

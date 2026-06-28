@@ -8,9 +8,7 @@ use std::collections::HashMap;
 
 use crate::cli::truncate_id;
 use crate::session::{Config, ContainerRuntimeName};
-pub use container_interface::{
-    ContainerConfig, ContainerRuntimeInterface, EnvEntry, NamedVolumeMount, VolumeMount,
-};
+pub use container_interface::{ContainerConfig, EnvEntry, NamedVolumeMount, VolumeMount};
 use error::Result;
 pub use runtime::ContainerRuntime;
 
@@ -86,6 +84,13 @@ impl DockerContainer {
 
     pub fn is_running(&self) -> Result<bool> {
         self.runtime.is_container_running(&self.name)
+    }
+
+    /// The container's configured working directory, read from the live
+    /// container. `None` if it can't be determined; see
+    /// [`ContainerRuntime::container_working_dir`].
+    pub fn working_dir(&self) -> Option<String> {
+        self.runtime.container_working_dir(&self.name)
     }
 
     pub fn build_create_args(&self, config: &ContainerConfig) -> Vec<String> {

@@ -56,6 +56,10 @@ pub enum ActionId {
     ToggleArchive,
     ToggleFavorite,
     ToggleSnooze,
+    /// Toggle the selected session's unread marker (read -> manual-unread;
+    /// unread -> read). Gated behind the `session.unread_indicator` config
+    /// toggle (on by default); a no-op when disabled.
+    ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
     SortPicker,
@@ -65,17 +69,23 @@ pub enum ActionId {
     /// Palette/context-menu only (no dedicated chord), so it has empty key
     /// lists in [`BINDINGS`].
     RegenerateSummary,
+    /// Open the plugin manager (palette only; no default chord).
+    Plugins,
     /// Pin or unpin the selected project header (project view only). Pinning
     /// registers the repo so the project persists in the view without any
     /// sessions; unpinning removes the registry entry.
     ToggleProjectPin,
+    /// Open the tips overlay (the browsable list from `crate::tips`). Has no
+    /// global hotkey on purpose; reached from the command palette, the tips
+    /// badge, and the `?` help screen, so it doesn't consume a scarce key.
+    Tips,
 }
 
 /// A single chord. `ctrl` requires the Control modifier; Shift is implicit in
 /// the uppercase letter `code` (terminals deliver `Shift+d` as `Char('D')`,
 /// and iOS Mosh delivers a bare uppercase keycode with no Shift modifier, so
 /// matching on the uppercase code rather than a Shift flag covers both).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chord {
     pub code: KeyCode,
     pub ctrl: bool,
@@ -111,6 +121,10 @@ pub enum Context {
     SearchActive,
     /// The cursor is on a real (non-synthetic) project header in project view.
     ProjectGroupSelected,
+    /// The unread-session feature is enabled (`session.unread_indicator`). When
+    /// off, the binding is removed from dispatch so the key isn't swallowed by
+    /// a dead action; help and the command palette skip it separately.
+    UnreadEnabled,
 }
 
 /// Help-overlay section. Ordering mirrors `components/help.rs`.
@@ -169,6 +183,7 @@ fn context_holds(context: Context, ctx: &Ctx) -> bool {
         Context::AttentionSort => ctx.sort_order == SortOrder::Attention,
         Context::SearchActive => ctx.has_search,
         Context::ProjectGroupSelected => ctx.project_group_selected,
+        Context::UnreadEnabled => crate::session::unread_enabled(),
     }
 }
 
@@ -183,6 +198,129 @@ pub fn resolve(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ActionId> {
         }
     }
     None
+}
+
+/// A plugin-contributed action a key resolved to: a plugin id plus the command
+/// the keybind targets. At Tier 0 there is no executor, so resolving one is
+/// inspectable (and surfaces a "needs runtime" notice) but not yet runnable;
+/// the executor lands with the runtime host (#2095).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginAction {
+    pub plugin_id: String,
+    pub action: String,
+}
+
+impl PluginAction {
+    /// Canonical external name, `plugin.<id>.<action>`. Idempotent: a manifest
+    /// keybind may already target a fully-qualified `plugin.<id>.<cmd>` command,
+    /// so an action that is already canonical is returned unchanged rather than
+    /// double-prefixed.
+    pub fn canonical(&self) -> String {
+        if self.action.starts_with("plugin.") {
+            return self.action.clone();
+        }
+        format!("plugin.{}.{}", self.plugin_id, self.action)
+    }
+}
+
+/// The merged resolver's result: a core action, or a plugin action. Core always
+/// shadows a plugin binding on the same chord (core is resolved first).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAction {
+    Core(ActionId),
+    Plugin(PluginAction),
+}
+
+/// Resolve a key across the merged core + plugin binding tables. Core bindings
+/// (the static [`BINDINGS`] table, honoring strict mode and context) are tried
+/// first and always win; only then are active plugins' declared keybinds
+/// consulted. Returns `None` if nothing claims the chord.
+pub fn resolve_action(key: &KeyEvent, strict: bool, ctx: &Ctx) -> Option<ResolvedAction> {
+    if let Some(id) = resolve(key, strict, ctx) {
+        return Some(ResolvedAction::Core(id));
+    }
+    for (chord, action) in plugin_bindings() {
+        if chord_matches(&chord, key) {
+            return Some(ResolvedAction::Plugin(action));
+        }
+    }
+    None
+}
+
+/// The active plugins' declared keybinds, parsed into `(chord, action)`. A
+/// keybind whose key string does not parse is skipped (its conflict-free state
+/// is surfaced by `aoe plugin info`).
+// ponytail: rebuilt per unmatched keypress; the active set is tiny and this is
+// not a hot path. Cache behind the registry generation if that ever changes.
+fn plugin_bindings() -> Vec<(Chord, PluginAction)> {
+    let mut out = Vec::new();
+    for p in crate::plugin::registry().active() {
+        for kb in &p.manifest.keybinds {
+            if let Some(chord) = parse_chord(&kb.key) {
+                out.push((
+                    chord,
+                    PluginAction {
+                        plugin_id: p.id().to_string(),
+                        action: kb.command.clone(),
+                    },
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Parse a key-chord string like `Ctrl+K`, `Shift+D`, `F5`, or `q` into a
+/// [`Chord`]. Supports `Ctrl`/`Shift` modifiers, single characters, and
+/// function keys. Returns `None` for anything else.
+pub fn parse_chord(s: &str) -> Option<Chord> {
+    let mut ctrl = false;
+    let mut shift = false;
+    let mut key: Option<&str> = None;
+    for tok in s.split('+').map(str::trim).filter(|t| !t.is_empty()) {
+        match tok.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => ctrl = true,
+            "shift" => shift = true,
+            // Unsupported modifiers and a second key token are rejected rather
+            // than silently remapped: `Alt+K` must not collapse to a bare `k`
+            // that hijacks core navigation.
+            "alt" | "option" | "meta" | "super" | "cmd" => return None,
+            _ if key.is_none() => key = Some(tok),
+            _ => return None,
+        }
+    }
+    let key = key?;
+    let code = if key.len() == 1 {
+        // Match the table's convention: bare letters are lowercase chars, Shift
+        // is encoded as the uppercase char (terminals deliver Ctrl+k as a
+        // lowercase Char with the CONTROL modifier, Shift+d as Char('D')).
+        let c = key.chars().next().unwrap();
+        let c = if shift {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+        KeyCode::Char(c)
+    } else if let Some(n) = key
+        .strip_prefix(['F', 'f'])
+        .and_then(|n| n.parse::<u8>().ok())
+    {
+        KeyCode::F(n)
+    } else {
+        return None;
+    };
+    Some(Chord { code, ctrl })
+}
+
+/// Whether a core binding already claims `chord` in either mode. Used by
+/// `aoe plugin info` to flag a plugin keybind that core shadows.
+pub fn core_shadows(chord: &Chord) -> bool {
+    BINDINGS.iter().any(|b| {
+        b.non_strict
+            .iter()
+            .chain(b.strict)
+            .any(|c| c.code == chord.code && c.ctrl == chord.ctrl)
+    })
 }
 
 /// Human-readable label for a binding's primary chord in the given mode, e.g.
@@ -595,10 +733,32 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // `U` toggles read/unread, pinned to Shift+u in BOTH modes (matches the
+    // macOS Mail "mark unread" muscle memory and keeps the key stable). It does
+    // NOT participate in the strict relocation: `U` is already a modified key,
+    // so it satisfies strict mode's "no bare action letters" rule as-is.
+    // `u` updates (when available) and relocates the usual way: bare `u` in
+    // non-strict, `Ctrl+u` in strict.
+    Binding {
+        id: ActionId::ToggleUnread,
+        non_strict: &[k('U')],
+        strict: &[k('U')],
+        context: Context::UnreadEnabled,
+        help: Some(HelpMeta {
+            section: HelpSection::Actions,
+            desc: "Mark read/unread (toggle)",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle read/unread",
+            keywords: &["read", "unread", "seen", "flag", "viewed"],
+            group: PaletteGroup::Actions,
+            serve_only: false,
+        }),
+    },
     Binding {
         id: ActionId::Update,
         non_strict: &[k('u')],
-        strict: &[k('u')],
+        strict: &[ctrl('u')],
         context: Context::Always,
         help: Some(HelpMeta {
             section: HelpSection::Other,
@@ -709,6 +869,38 @@ pub static BINDINGS: &[Binding] = &[
             serve_only: false,
         }),
     },
+    // Tips overlay. No key chords: it's reached from the palette, the badge,
+    // and the `?` help screen, so it never shadows a typing-guard key. `help`
+    // is None because the help overlay skips keyless rows; it gets a bespoke
+    // row in `components/help.rs` instead.
+    Binding {
+        id: ActionId::Tips,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Show tips",
+            keywords: &["tips", "hints", "learn", "discover", "did you know"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
+    // Palette-only: no default chord in either mode; the manager opens from
+    // the command palette (or the web Settings Plugins tab).
+    Binding {
+        id: ActionId::Plugins,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Manage plugins",
+            keywords: &["plugin", "extension", "enable", "disable"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
 ];
 
 /// Stable palette/test id for an action (matches the legacy `builtin_commands`
@@ -734,6 +926,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleArchive => "archive",
         ActionId::ToggleFavorite => "favorite",
         ActionId::ToggleSnooze => "snooze",
+        ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
@@ -748,6 +941,8 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::Update => "update",
         ActionId::ToggleContainer => "toggle-container",
         ActionId::ToggleProjectPin => "toggle-project-pin",
+        ActionId::Tips => "tips",
+        ActionId::Plugins => "plugins",
     }
 }
 
@@ -773,6 +968,88 @@ mod tests {
     }
 
     #[test]
+    fn parse_chord_handles_modifiers_and_keys() {
+        assert_eq!(
+            parse_chord("Ctrl+K"),
+            Some(Chord {
+                code: KeyCode::Char('k'),
+                ctrl: true
+            })
+        );
+        assert_eq!(
+            parse_chord("Shift+D"),
+            Some(Chord {
+                code: KeyCode::Char('D'),
+                ctrl: false
+            })
+        );
+        assert_eq!(
+            parse_chord("q"),
+            Some(Chord {
+                code: KeyCode::Char('q'),
+                ctrl: false
+            })
+        );
+        assert_eq!(
+            parse_chord("F5"),
+            Some(Chord {
+                code: KeyCode::F(5),
+                ctrl: false
+            })
+        );
+        assert_eq!(parse_chord(""), None);
+        assert_eq!(parse_chord("Ctrl+"), None);
+    }
+
+    #[test]
+    fn parse_chord_rejects_unsupported_and_repeated_tokens() {
+        // Unknown modifiers must not collapse to a bare key that hijacks core
+        // navigation, and a chord may carry at most one key token.
+        assert_eq!(parse_chord("Alt+K"), None);
+        assert_eq!(parse_chord("Ctrl+Alt+K"), None);
+        assert_eq!(parse_chord("Ctrl+K+J"), None);
+        assert_eq!(parse_chord("Meta+K"), None);
+    }
+
+    #[test]
+    fn core_shadows_known_core_chords() {
+        // `q` is the Quit binding; an unbound chord is not shadowed.
+        assert!(core_shadows(&parse_chord("q").unwrap()));
+        assert!(!core_shadows(&Chord {
+            code: KeyCode::Char('z'),
+            ctrl: true
+        }));
+    }
+
+    #[test]
+    fn resolve_action_wraps_core_bindings() {
+        // With no active plugins in the test process, the merged resolver just
+        // returns the core action, wrapped as Core.
+        let c = ctx();
+        assert_eq!(
+            resolve_action(&key('q'), false, &c),
+            Some(ResolvedAction::Core(ActionId::Quit))
+        );
+        assert_eq!(resolve_action(&ctrl_key('z'), false, &c), None);
+    }
+
+    #[test]
+    fn plugin_action_canonical_is_namespaced() {
+        let a = PluginAction {
+            plugin_id: "acme.kit".to_string(),
+            action: "do-thing".to_string(),
+        };
+        assert_eq!(a.canonical(), "plugin.acme.kit.do-thing");
+
+        // Idempotent when the manifest already targets a canonical command.
+        let already = PluginAction {
+            plugin_id: "acme.kit".to_string(),
+            action: "plugin.acme.kit.do-thing".to_string(),
+        };
+        assert_eq!(already.canonical(), "plugin.acme.kit.do-thing");
+    }
+
+    #[test]
     fn non_strict_resolution() {
         let c = ctx();
         let cases = [
@@ -789,6 +1066,9 @@ mod tests {
             ('o', ActionId::SortPicker),
             ('g', ActionId::GroupBy),
             ('q', ActionId::Quit),
+            // `u` is Update (unread lives on Shift+U); resolves regardless of
+            // whether an update is actually available.
+            ('u', ActionId::Update),
         ];
         for (ch, want) in cases {
             assert_eq!(
@@ -797,6 +1077,34 @@ mod tests {
                 "non-strict '{ch}'"
             );
         }
+    }
+
+    #[test]
+    fn shift_u_toggles_unread_in_both_modes_and_u_updates() {
+        let c = ctx();
+        // Unread is pinned to Shift+U regardless of strict mode.
+        assert_eq!(
+            resolve(&key('U'), false, &c),
+            Some(ActionId::ToggleUnread),
+            "non-strict U = unread"
+        );
+        assert_eq!(
+            resolve(&key('U'), true, &c),
+            Some(ActionId::ToggleUnread),
+            "strict U = unread"
+        );
+        // Update relocates the usual way: bare `u` in non-strict, `Ctrl+u`
+        // in strict (and never collides with unread on `U`).
+        assert_eq!(
+            resolve(&key('u'), false, &c),
+            Some(ActionId::Update),
+            "non-strict u = update"
+        );
+        assert_eq!(
+            resolve(&ctrl_key('u'), true, &c),
+            Some(ActionId::Update),
+            "strict Ctrl+u = update"
+        );
     }
 
     #[test]
@@ -811,6 +1119,7 @@ mod tests {
             ('N', ActionId::NewSession),
             ('P', ActionId::Projects),
             ('O', ActionId::SortPicker),
+            ('U', ActionId::ToggleUnread),
         ];
         for (ch, want) in shifted {
             assert_eq!(resolve(&key(ch), true, &c), Some(want), "strict '{ch}'");
@@ -822,6 +1131,7 @@ mod tests {
             ('n', ActionId::NewFromSelection),
             ('p', ActionId::Profiles),
             ('g', ActionId::GroupBy),
+            ('u', ActionId::Update),
         ];
         for (ch, want) in ctrled {
             assert_eq!(
@@ -837,7 +1147,7 @@ mod tests {
         // They fall through to the dispatcher's typing-guard, not an action.
         let c = ctx();
         for ch in [
-            'd', 'r', 't', 'n', 'p', 's', 'x', 'm', 'e', 'i', 'z', 'g', 'o',
+            'd', 'r', 't', 'n', 'p', 's', 'x', 'm', 'e', 'i', 'z', 'g', 'o', 'u',
         ] {
             assert_eq!(resolve(&key(ch), true, &c), None, "strict bare '{ch}'");
         }

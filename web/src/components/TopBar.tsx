@@ -3,14 +3,23 @@ import type { SessionResponse, Workspace } from "../lib/types";
 import { PaletteTriggerPill } from "./PaletteTriggerPill";
 import { OverflowMenu, type OverflowItem } from "./OverflowMenu";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
+import { PluginStatusBarSegments } from "./plugin/PluginSlots";
+import { ActivityBar } from "./ActivityBar";
+import type { PaneDisplay } from "./Dock";
 
 interface Props {
   activeWorkspace: Workspace | undefined;
   activeSession: SessionResponse | null;
   onToggleSidebar: () => void;
   onOpenPalette: () => void;
+  /** Mobile (below md): opens the view picker. The desktop activity bar uses
+   *  `onTogglePane` instead. */
   onToggleDiff: () => void;
-  diffCollapsed: boolean;
+  /** All dockable pane ids (built-in + plugin) for the active session. */
+  paneIds: string[];
+  paneDescriptor: (id: string) => PaneDisplay;
+  isPaneOpen: (id: string) => boolean;
+  onTogglePane: (id: string) => void;
   onOpenHelp: () => void;
   onOpenAbout: () => void;
   onStartTutorial: () => void;
@@ -24,7 +33,19 @@ interface Props {
    *  the port is not visible in the window chrome. Driven by
    *  `ServerAbout.build_flavor === "debug"`. See #1055. */
   isDevBuild: boolean;
+  /** Opens the tip-of-the-day modal; wired into the overflow menu so tips are
+   *  re-readable any time, like GIMP/DBeaver's Help menu entry. */
+  onOpenTips: () => void;
   onGoDashboard: () => void;
+  /** When true (desktop, sidebar open, not in a full-width settings/projects
+   *  view), the header's left zone widens to match the sidebar column and the
+   *  divider runs vertically through the header instead of a bottom border, so
+   *  the top-left of the header reads as part of the sidebar. */
+  sidebarColumnVisible: boolean;
+  /** Mirror of `sidebarColumnVisible` for the right side: when the right panel
+   *  column is showing (desktop, active session, not collapsed), the header's
+   *  right zone widens to match it and the divider runs up through the header. */
+  rightColumnVisible: boolean;
 }
 
 export function TopBar({
@@ -33,7 +54,10 @@ export function TopBar({
   onToggleSidebar,
   onOpenPalette,
   onToggleDiff,
-  diffCollapsed,
+  paneIds,
+  paneDescriptor,
+  isPaneOpen,
+  onTogglePane,
   onOpenHelp,
   onOpenAbout,
   onStartTutorial,
@@ -41,25 +65,32 @@ export function TopBar({
   loginRequired,
   isOffline,
   isDevBuild,
+  onOpenTips,
   onGoDashboard,
+  sidebarColumnVisible,
+  rightColumnVisible,
 }: Props) {
   const overflowItems = useMemo<OverflowItem[]>(() => {
     const items: OverflowItem[] = [
       { label: "Help", onClick: onOpenHelp },
       { label: "Show tutorial", onClick: onStartTutorial },
+      { label: "Tips", onClick: onOpenTips },
       { label: "About", onClick: onOpenAbout },
     ];
     if (loginRequired) items.push({ label: "Sign out", onClick: onLogout });
     return items;
-  }, [onOpenHelp, onStartTutorial, onOpenAbout, onLogout, loginRequired]);
+  }, [onOpenHelp, onStartTutorial, onOpenTips, onOpenAbout, onLogout, loginRequired]);
 
   return (
-    <header
-      {...tourAnchor(TOUR_ANCHORS.topbar)}
-      className="h-12 bg-surface-800 border-b border-surface-700/20 flex items-center px-3 shrink-0 gap-2"
-    >
-      {/* LEFT ZONE */}
-      <div className="flex items-center gap-2 min-w-0 shrink-0">
+    <header {...tourAnchor(TOUR_ANCHORS.topbar)} className="h-12 bg-surface-850 flex items-stretch shrink-0">
+      {/* LEFT ZONE — widens to the sidebar column when it's visible so the
+          divider runs vertically through the header instead of cutting across
+          it; otherwise it keeps the shared bottom border like the rest. */}
+      <div
+        className={`flex items-center gap-2 px-3 min-w-0 shrink-0 border-b border-surface-700/60 ${
+          sidebarColumnVisible ? "md:w-[var(--aoe-sidebar-width)] md:bg-surface-800 md:border-b-0 md:border-r" : ""
+        }`}
+      >
         <button
           onClick={onToggleSidebar}
           className="w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-dim hover:text-text-secondary hover:bg-surface-700/50"
@@ -91,13 +122,23 @@ export function TopBar({
         </button>
       </div>
 
-      {/* CENTER ZONE — palette trigger */}
-      <div className="flex-1 flex justify-center px-2">
-        <PaletteTriggerPill onClick={onOpenPalette} />
+      {/* CENTER ZONE — palette trigger; carries the bottom border across the
+          middle, between the two column-aligned zones. */}
+      <div className="flex-1 flex items-center px-3 min-w-0 border-b border-surface-700/60">
+        <div className="flex-1 flex justify-center px-2">
+          <PaletteTriggerPill onClick={onOpenPalette} />
+        </div>
       </div>
 
-      {/* RIGHT ZONE */}
-      <div className="flex items-center gap-1.5 shrink-0">
+      {/* RIGHT ZONE — widens to the right-panel column when it's visible so the
+          divider runs vertically through the header instead of cutting across
+          it; otherwise it keeps the shared bottom border like the rest. */}
+      <div
+        className={`flex items-center justify-end gap-1.5 px-3 shrink-0 border-b border-surface-700/60 ${
+          rightColumnVisible ? "md:w-[var(--aoe-right-panel-width)] md:border-b-0 md:border-l" : ""
+        }`}
+      >
+        <PluginStatusBarSegments />
         {isDevBuild && (
           <span
             className="font-mono text-[11px] px-1.5 py-0.5 rounded-full bg-status-waiting/15 text-status-waiting ring-1 ring-status-waiting/30"
@@ -118,28 +159,32 @@ export function TopBar({
         )}
 
         {activeWorkspace && activeSession && (
-          <button
-            onClick={onToggleDiff}
-            className={`w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors hover:bg-surface-700/50 ${
-              diffCollapsed ? "text-text-dim hover:text-text-secondary" : "text-text-secondary hover:text-text-primary"
-            }`}
-            title="Toggle diff panel"
-            aria-label="Toggle diff panel"
-          >
-            <svg
-              width="16"
-              height="16"
-              viewBox="0 0 24 24"
-              fill="none"
-              stroke="currentColor"
-              strokeWidth="1.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
+          <>
+            {/* Desktop: per-pane toggles. Mobile: one button that opens the
+                full-viewport view picker (#1452); there is no side dock to
+                toggle pane-by-pane below md. */}
+            <ActivityBar paneIds={paneIds} descriptorFor={paneDescriptor} isOpen={isPaneOpen} onToggle={onTogglePane} />
+            <button
+              onClick={onToggleDiff}
+              className="md:hidden w-8 h-8 flex items-center justify-center cursor-pointer rounded-md transition-colors text-text-secondary hover:text-text-primary hover:bg-surface-700/50"
+              title="Toggle panels"
+              aria-label="Toggle panels"
             >
-              <rect x="3" y="3" width="18" height="18" rx="2" />
-              <line x1="15" y1="3" x2="15" y2="21" />
-            </svg>
-          </button>
+              <svg
+                width="16"
+                height="16"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <rect x="3" y="3" width="18" height="18" rx="2" />
+                <line x1="15" y1="3" x2="15" y2="21" />
+              </svg>
+            </button>
+          </>
         )}
 
         <OverflowMenu items={overflowItems} triggerDataTour={TOUR_ANCHORS.topbarMore} />

@@ -33,7 +33,9 @@ use crate::acp::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError, WsError,
     WsMessage, REPLAY_PAGE_SIZE,
 };
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
+use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
 
@@ -43,6 +45,11 @@ use crate::tui::styles::Theme;
 const REDRAW_INTERVAL: Duration = Duration::from_millis(120);
 /// Toasts auto-clear after this long.
 const TOAST_TTL: Duration = Duration::from_secs(4);
+/// How often to poll the daemon's plugin UI-state snapshot (#2402). Matches
+/// the web dashboard's cadence. The fetch runs on its own task so a slow or
+/// unreachable daemon never blocks the event loop on the HTTP client's
+/// 15-second timeout.
+const PLUGIN_UI_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Set up an alternate-screen terminal, run the structured view against
 /// the given session, and tear it back down on exit. Used by the
@@ -231,6 +238,34 @@ pub async fn run_for_endpoint(
     let mut redraw_ticker = tokio::time::interval(REDRAW_INTERVAL);
     redraw_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Poll the daemon's plugin UI-state on its own task and stream snapshots
+    // back over a channel, so a slow daemon stalls neither input nor render.
+    // The task exits once the view returns and drops the receiver.
+    let (plugin_tx, mut plugin_rx) = tokio::sync::mpsc::channel::<UiSnapshot>(8);
+    {
+        let http = state.http.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(PLUGIN_UI_POLL_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match http.plugin_ui_state().await {
+                    Ok(snapshot) => {
+                        if plugin_tx.send(snapshot).await.is_err() {
+                            break; // view exited; receiver gone.
+                        }
+                    }
+                    // Transient or older-daemon-without-the-endpoint: keep the
+                    // last good snapshot and retry on the next tick rather than
+                    // toasting repeatedly.
+                    Err(e) => {
+                        tracing::debug!(target: "acp.tui", "plugin ui-state poll failed: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             biased;
@@ -337,6 +372,11 @@ pub async fn run_for_endpoint(
                     }
                 }
             }
+            Some(snapshot) = plugin_rx.recv() => {
+                state.ingest_plugin_ui(snapshot);
+                drain_plugin_toast(&mut state, &mut toast_deadline);
+                redraw(terminal, theme, &state)?;
+            }
             _ = redraw_ticker.tick() => {
                 let now = Instant::now();
                 if let Some(deadline) = toast_deadline {
@@ -345,10 +385,33 @@ pub async fn run_for_endpoint(
                         toast_deadline = None;
                     }
                 }
+                // A freed slot lets the next buffered plugin notification show.
+                drain_plugin_toast(&mut state, &mut toast_deadline);
                 redraw(terminal, theme, &state)?;
             }
         }
     }
+}
+
+/// Show the next buffered plugin notification as a toast, but only when no
+/// toast is currently up, so app toasts (errors, send confirmations) are not
+/// pre-empted and queued notifications show one at a time.
+fn drain_plugin_toast(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    if state.toast.is_some() {
+        return;
+    }
+    let Some(n) = state.next_plugin_toast() else {
+        return;
+    };
+    let kind = match n.tone {
+        Tone::Warn | Tone::Danger => ToastKind::Error,
+        _ => ToastKind::Info,
+    };
+    let text = match &n.body {
+        Some(body) => format!("{}: {body}", n.title),
+        None => n.title.clone(),
+    };
+    set_toast(state, toast_deadline, text, kind);
 }
 
 async fn handle_terminal_event(
@@ -369,8 +432,12 @@ async fn handle_terminal_event(
     let has_pending = !state.transcript.pending_approvals.is_empty();
     let ctx = InputContext {
         has_pending_approval: has_pending,
+        has_pending_elicitation: !state.transcript.pending_elicitations.is_empty(),
         slash_picker_open: state.slash_picker_open(),
         mention_picker_open: state.mention.is_some(),
+        caret_at_origin: state.caret_at_origin(),
+        browsing_queue: state.browsing_queue(),
+        queue_len: state.queue.len(),
     };
     let intent = input::dispatch(state.focus, &key, ctx);
     match intent {
@@ -384,6 +451,11 @@ async fn handle_terminal_event(
             } else {
                 focus
             };
+            // Leaving the composer ends any queue-recall browse; the
+            // in-progress text stays put as a draft.
+            if state.focus != Focus::Composer {
+                state.cancel_recall();
+            }
             state.reconcile_selection();
             Ok(false)
         }
@@ -434,7 +506,28 @@ async fn handle_terminal_event(
             Ok(false)
         }
         Intent::SubmitPrompt => {
+            // Capture the browse target before take_composer_text resets
+            // the recall state.
+            let recall = state.recall.take();
             let text = state.take_composer_text();
+            // Submitting while browsing edits that queued entry in place,
+            // preserving its position rather than enqueuing a duplicate.
+            // If the entry drained between recall and now, the index is
+            // stale; fall through to the normal send / queue path so the
+            // edited text is never lost.
+            if !text.is_empty() {
+                if let Some(r) = recall {
+                    if state.queue.replace(r.index, text.clone()) {
+                        set_toast(
+                            state,
+                            toast_deadline,
+                            format!("edited queued prompt ({} waiting)", state.queue.len()),
+                            ToastKind::Info,
+                        );
+                        return Ok(false);
+                    }
+                }
+            }
             if text.is_empty() {
                 // Empty Enter is a manual flush: if the agent is idle and
                 // prompts are stuck in the queue (e.g. a drain POST failed
@@ -478,12 +571,23 @@ async fn handle_terminal_event(
                 return Ok(false);
             }
             state.queue.clear();
+            // The browsed entry no longer exists; end the browse but keep
+            // whatever text is in the composer as a draft.
+            state.cancel_recall();
             set_toast(
                 state,
                 toast_deadline,
                 "queue cleared".into(),
                 ToastKind::Info,
             );
+            Ok(false)
+        }
+        Intent::RecallQueued(delta) => {
+            state.recall_step(delta);
+            Ok(false)
+        }
+        Intent::RecallCancel => {
+            state.recall_cancel_restore();
             Ok(false)
         }
         Intent::Scroll(delta) => {
@@ -546,6 +650,37 @@ async fn handle_terminal_event(
                         state,
                         toast_deadline,
                         format!("approval failed: {e}"),
+                        ToastKind::Error,
+                    );
+                }
+            }
+            Ok(false)
+        }
+        Intent::SkipElicitation | Intent::CancelElicitation => {
+            let Some(pending) = state.transcript.pending_elicitations.first().cloned() else {
+                return Ok(false);
+            };
+            let (resolution, label) = if matches!(intent, Intent::SkipElicitation) {
+                (ElicitationResolution::Decline, "question skipped")
+            } else {
+                (ElicitationResolution::Cancel, "question cancelled")
+            };
+            match state
+                .http
+                .resolve_elicitation(&state.session_id, &pending.nonce, &resolution)
+                .await
+            {
+                Ok(()) | Err(HttpError::ApprovalGone) => {
+                    // Clear locally now; the ElicitationResolved broadcast
+                    // also clears it, but the seq dedupe can swallow that.
+                    state.transcript.resolve_elicitation_locally(&pending.nonce);
+                    set_toast(state, toast_deadline, label.into(), ToastKind::Info);
+                }
+                Err(e) => {
+                    set_toast(
+                        state,
+                        toast_deadline,
+                        format!("elicitation resolve failed: {e}"),
                         ToastKind::Error,
                     );
                 }
@@ -805,6 +940,9 @@ async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Optio
     };
     if send_prompt_now(state, toast_deadline, &text).await {
         state.queue.drop_front(count);
+        // Keep an in-progress ArrowUp/ArrowDown browse pointing at the
+        // right entry now that the front of the queue shifted.
+        state.reconcile_recall_after_drain(count);
         let remaining = state.queue.len();
         let msg = if remaining == 0 {
             "queue drained".to_string()

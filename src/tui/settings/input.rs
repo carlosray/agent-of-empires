@@ -7,7 +7,9 @@ use tui_input::Input;
 use crate::tui::dialogs::{CustomInstructionDialog, DialogResult};
 
 use super::fields::ListItemValidation;
-use super::{FieldValue, ListEditState, SettingsFocus, SettingsScope, SettingsView};
+use super::{
+    FieldValue, ListEditState, SettingsCategory, SettingsFocus, SettingsScope, SettingsView,
+};
 
 /// Result of handling a key event in the settings view
 pub enum SettingsAction {
@@ -84,16 +86,26 @@ impl SettingsView {
             return self.handle_search_key(key);
         }
 
+        // Save is always reachable
+        if key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::CONTROL {
+            if let Err(e) = self.save() {
+                self.error_message = Some(format!("Failed to save: {}", e));
+            }
+            return SettingsAction::Continue;
+        }
+
+        // The Plugins category hosts the plugin manager inline. While the right
+        // pane is focused the manager owns the keys: Space stages an
+        // enable/disable into this view's config, Esc steps back to the
+        // category panel.
+        if self.current_category() == SettingsCategory::Plugins
+            && self.focus == SettingsFocus::Fields
+        {
+            return self.handle_plugins_manager_key(key);
+        }
+
         // Normal mode
         match (key.code, key.modifiers) {
-            // Save
-            (KeyCode::Char('s'), KeyModifiers::CONTROL) => {
-                if let Err(e) = self.save() {
-                    self.error_message = Some(format!("Failed to save: {}", e));
-                }
-                SettingsAction::Continue
-            }
-
             // Close from anywhere
             (KeyCode::Char('q'), _) => {
                 if self.has_changes {
@@ -382,6 +394,42 @@ impl SettingsView {
         }
     }
 
+    /// Route a key to the embedded plugin manager (Plugins category). Space
+    /// (and Enter) stage an enable/disable into this view's config; Esc/`q`
+    /// (manager Cancel) returns to the category panel.
+    fn handle_plugins_manager_key(&mut self, key: KeyEvent) -> SettingsAction {
+        // Space/Enter STAGE enable/disable in this view's config, like every
+        // other settings row, instead of writing to disk immediately. That
+        // keeps it in the Ctrl-s save flow (no surprise immediate write, no
+        // file-watch flash); the row shows the pending state at once.
+        if matches!(key.code, KeyCode::Char(' ') | KeyCode::Enter) {
+            if let Some(p) = self.plugin_manager.selected() {
+                let id = p.id.clone();
+                let enabled = !p.enabled;
+                self.global_config
+                    .plugins
+                    .entry(id.clone())
+                    .or_default()
+                    .enabled = enabled;
+                self.recompute_dirty();
+                self.plugin_manager.set_row_enabled(&id, enabled);
+            }
+            return SettingsAction::Continue;
+        }
+        match self.plugin_manager.handle_key(key) {
+            DialogResult::Continue | DialogResult::Submit(()) => {
+                if self.plugin_manager.take_mutated() {
+                    self.resync_after_plugin_mutation();
+                }
+                SettingsAction::Continue
+            }
+            DialogResult::Cancel => {
+                self.focus = SettingsFocus::Categories;
+                SettingsAction::Continue
+            }
+        }
+    }
+
     /// Drive the settings-wide search overlay. Esc closes without
     /// changing selection; Enter jumps to the highlighted hit; up/down
     /// navigates the hit list; every other key feeds `search_input`
@@ -648,27 +696,6 @@ impl SettingsView {
     /// Force close without saving
     pub fn force_close(&mut self) {
         self.has_changes = false;
-    }
-
-    /// Discard changes and reload
-    pub fn discard_changes(&mut self) -> anyhow::Result<()> {
-        self.global_config = crate::session::Config::load()?;
-        self.profile_config = crate::session::load_profile_config(&self.profile)?;
-        self.repo_config = self.project_path.as_ref().and_then(|p| {
-            crate::session::load_repo_config(std::path::Path::new(p))
-                .ok()
-                .flatten()
-        });
-        self.resolved_base =
-            crate::session::merge_configs(self.global_config.clone(), &self.profile_config);
-        self.repo_as_profile = self
-            .repo_config
-            .as_ref()
-            .map(crate::session::repo_config_to_profile)
-            .unwrap_or_default();
-        self.snapshot_baseline();
-        self.rebuild_fields();
-        Ok(())
     }
 
     pub fn handle_paste(&mut self, text: &str) {

@@ -295,7 +295,7 @@ pub fn select_initial_tool_session(
         .cloned()
         .collect();
 
-    fresh.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    fresh.sort_by_key(|s| std::cmp::Reverse(s.created_at));
     if fresh.len() == 1 {
         return fresh.into_iter().next();
     }
@@ -309,7 +309,7 @@ pub fn select_initial_tool_session(
             })
             .cloned()
             .collect();
-        rebound.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+        rebound.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
         if rebound.len() == 1 {
             return rebound.into_iter().next();
         }
@@ -335,7 +335,7 @@ pub fn select_refreshed_tool_session(
         .filter(|candidate| candidate.updated_at > current.updated_at)
         .cloned()
         .collect();
-    successors.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    successors.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
 
     // Never spontaneously clear: an absent source_ref or ambiguous successor
     // set is far more likely to mean "the discovery snapshot truncated or the
@@ -439,7 +439,7 @@ fn discover_claude_candidates(project_path: &Path) -> Result<Vec<ToolSessionCand
             updated_at,
         });
     }
-    candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    candidates.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     Ok(candidates)
 }
 
@@ -463,7 +463,7 @@ fn discover_codex_candidates(project_path: &Path) -> Result<Vec<ToolSessionCandi
         }
     }
 
-    candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    candidates.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     Ok(candidates)
 }
 
@@ -592,7 +592,7 @@ fn discover_pi_candidates(project_path: &Path) -> Result<Vec<ToolSessionCandidat
         });
     }
 
-    candidates.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
+    candidates.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
     Ok(candidates)
 }
 
@@ -1137,6 +1137,8 @@ mod tests {
             container_name: "sandbox".to_string(),
             extra_env: None,
             custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
         });
 
         assert!(build_probe(&instance).is_none());
@@ -1380,7 +1382,7 @@ mod tests {
                 }
             }
         }
-        recent.sort_by(|left, right| right.0.cmp(&left.0));
+        recent.sort_by_key(|s| std::cmp::Reverse(s.0));
         if recent.is_empty() {
             return format!(
                 "{}: <no files modified since {}>",

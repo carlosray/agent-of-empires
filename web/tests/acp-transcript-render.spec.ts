@@ -86,19 +86,22 @@ test.describe("chat bubble overflow", () => {
     // targets p/li/blockquote/a only, so the code container is untouched).
     const codeScroller: Locator = viewport.locator(".acp-markdown .overflow-x-auto").first();
     await expect(codeScroller).toBeVisible();
-    const codeOverflowX = await codeScroller.evaluate((el) => getComputedStyle(el).overflowX);
-    expect(["auto", "scroll"]).toContain(codeOverflowX);
+    await expect
+      .poll(async () => codeScroller.evaluate((el) => getComputedStyle(el).overflowX))
+      .toMatch(/^(auto|scroll)$/);
 
     // The wrap rule must NOT leak into code: the long line stays a single
     // unwrapped line, so the code <pre>'s content is wider than its box.
-    // (scrollWidth reports the full content width even though the bubble's
-    // `pre { overflow: hidden }` clips it.) If overflow-wrap leaked here the
-    // line would wrap and scrollWidth would collapse to clientWidth.
     const codePre: Locator = codeScroller.locator("pre").first();
-    const codeLineUnwrapped = await codePre.evaluate(
-      (el) => (el as HTMLElement).scrollWidth > (el as HTMLElement).clientWidth,
-    );
-    expect(codeLineUnwrapped).toBe(true);
+    await expect
+      .poll(async () => codePre.evaluate((el) => (el as HTMLElement).scrollWidth > (el as HTMLElement).clientWidth))
+      .toBe(true);
+
+    // #2443: the code <pre> must be horizontally scrollable, not clipped. The
+    // global `.acp-markdown pre` rule used to force `overflow: hidden`, which
+    // outranks the `overflow-x-auto` utility and, on the shiki path, clips the
+    // inner <pre> before its wrapper can scroll. The line was then unreadable.
+    await expect.poll(async () => codePre.evaluate((el) => getComputedStyle(el).overflowX)).toMatch(/^(auto|scroll)$/);
   });
 });
 

@@ -19,13 +19,20 @@
 use serde::{Deserialize, Serialize};
 
 mod merge;
+mod plugin;
 mod policy;
 mod registry;
+mod resolved;
 mod validate;
 
 pub use merge::{clear_path, merge_json};
-pub use policy::{strip_local_only, validate_patch, PatchRejection, Scope};
-pub use registry::{descriptor, schema};
+pub use plugin::{
+    plugin_field_descriptors, plugin_section_id, rewrite_plugin_sections, section_plugin_id,
+    storage_leaf as plugin_storage_leaf, storage_value as plugin_storage_value, PLUGIN_CATEGORY,
+};
+pub use policy::{strip_local_only, validate_patch, validate_patch_with, PatchRejection, Scope};
+pub use registry::{descriptor, runtime_schema, schema};
+pub use resolved::{resolve, resolve_all, Candidate, ResolvedSetting, SettingSource};
 pub use validate::{validate_value, ValidationError};
 
 /// Widget the surfaces render for a field. The variant carries everything a
@@ -101,15 +108,6 @@ pub enum WebWritePolicy {
     LocalOnly { reason: String },
 }
 
-impl WebWritePolicy {
-    pub fn is_web_writable(&self) -> bool {
-        matches!(
-            self,
-            WebWritePolicy::Allow | WebWritePolicy::RequiresElevation { .. }
-        )
-    }
-}
-
 /// Server-authoritative validation applied to an incoming value before it is
 /// merged. Min/max in [`WidgetKind`] is advisory UI metadata; this is the gate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -132,6 +130,12 @@ pub enum ValidationKind {
     EnvList,
     /// Each list entry must be a `host:container` port mapping (digits only).
     PortMappingList,
+    /// Value must be one of a closed set of strings. Used by plugin `select`
+    /// settings so an off-menu value cannot be persisted (core selects encode
+    /// their options in the widget and need no separate rule).
+    OneOf {
+        options: Vec<String>,
+    },
 }
 
 /// One configurable field, emitted by the `SettingsSection` derive. Owned
@@ -159,6 +163,13 @@ pub struct FieldDescriptor {
     /// renders them after the primary fields under an "Advanced" divider.
     #[serde(default)]
     pub advanced: bool,
+    /// The field's default value, shown when no value is stored yet. Core
+    /// fields leave this `None` (their value always exists in the serialized
+    /// `Config` via the struct's `Default`); plugin fields carry the
+    /// manifest-declared default so the surfaces and the resolution chain show
+    /// it before the user has saved anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default: Option<serde_json::Value>,
 }
 
 impl FieldDescriptor {

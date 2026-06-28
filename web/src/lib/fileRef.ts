@@ -8,8 +8,8 @@
 // mailto, ...) are left untouched. See #1718.
 
 /** A parsed local file reference. `line`/`column` are 1-based when the
- *  href carried a suffix; they are parsed but not yet wired to viewer
- *  scroll-to-line (follow-up). */
+ *  href carried a suffix. `line` is threaded through to the diff viewer to
+ *  scroll the cited line into view (#1809); `column` is parsed but unused. */
 export interface FileRef {
   path: string;
   line?: number;
@@ -159,4 +159,19 @@ export function resolveToRepoRelative(
   }
 
   return null;
+}
+
+/**
+ * Display form of a tool-card file path: strip the session's repo root so
+ * an edit of `/Users/me/wt/src/hooks/mod.rs` shows `src/hooks/mod.rs`. In a
+ * multi-repo workspace the repo name is prefixed (`api/src/h.ts`) so paths
+ * from different repos stay unambiguous. Falls back to the raw path when
+ * there is no session or the path is outside every known root (e.g.
+ * `/etc/hosts`), so a path is never silently mangled. See #2143.
+ */
+export function relativeDisplayPath(raw: string, session: FileRefSession | null | undefined): string {
+  if (!session || !raw) return raw;
+  const resolved = resolveToRepoRelative(raw, session);
+  if (!resolved) return raw;
+  return resolved.repoName ? `${resolved.repoName}/${resolved.relativePath}` : resolved.relativePath;
 }

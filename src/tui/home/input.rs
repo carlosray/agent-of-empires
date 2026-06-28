@@ -17,7 +17,8 @@ use crate::tui::dialogs::{
     DeleteDialogConfig, DialogResult, GroupDeleteOptionsDialog, HooksInstallDialog, InfoDialog,
     IntroOutcome, NewSessionData, NewSessionDialog, NoAgentsAction, PaletteAction, PaletteCommand,
     PaletteGroup, ProfilePickerAction, ProjectsDialog, RenameDialog, RenameMode, RepoTrustAction,
-    RestartDialog, SendMessageDialog, UnifiedDeleteDialog, WorktreeNameDialog,
+    RestartDialog, SendMessageDialog, TipsDialog, TipsOutcome, UnifiedDeleteDialog,
+    WorktreeNameDialog,
 };
 use crate::tui::diff::{DiffAction, DiffView};
 use crate::tui::responsive;
@@ -187,6 +188,120 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
     vec![live_send::TmuxKey::HexBytes(bytes)]
 }
 
+/// Map a hovered screen cell `(col, row)` into a forwarded app's 1-based
+/// mouse coordinate space, relative to its pane `pane` (the live-send target
+/// is sized to the preview output rect, so this maps directly), clamped
+/// inside the pane. An unpopulated rect falls back to the top-left cell.
+/// Shared by the wheel- and click-forward byte builders.
+fn map_pane_cell(pane: ratatui::layout::Rect, col: u16, row: u16) -> (u16, u16) {
+    if pane.width == 0 || pane.height == 0 {
+        (1u16, 1u16)
+    } else {
+        let cx = col.saturating_sub(pane.x).min(pane.width - 1) + 1;
+        let cy = row.saturating_sub(pane.y).min(pane.height - 1) + 1;
+        (cx, cy)
+    }
+}
+
+/// Build the mouse-wheel byte sequence to forward to a full-screen app
+/// under the live preview. `up` selects wheel-up (button 64) vs wheel-down
+/// (65); `sgr` selects the SGR (1006) encoding vs the legacy X10 encoding,
+/// matching whatever the app has enabled.
+fn wheel_mouse_bytes(
+    up: bool,
+    sgr: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let (cx, cy) = map_pane_cell(pane, col, row);
+    let button: u16 = if up { 64 } else { 65 };
+    if sgr {
+        // SGR (1006): textual, press marker `M`. No coordinate limit.
+        format!("\x1b[<{button};{cx};{cy}M").into_bytes()
+    } else {
+        // Legacy X10: `ESC [ M` then three bytes, each the value + 32.
+        // Bytes top out at 255, so coordinates above 223 can't be
+        // encoded; clamp there (preview cells are far below that anyway).
+        let enc = |v: u16| (v.min(223) + 32) as u8;
+        vec![0x1b, b'[', b'M', enc(button), enc(cx), enc(cy)]
+    }
+}
+
+/// Build the byte sequence for a single forwarded mouse button event at
+/// screen cell `(col, row)`, mapped into the app's pane. `base_button` is the
+/// SGR low-bits code (left=0, middle=1, right=2); `release` is a button-up;
+/// `motion` is a drag (button held while moving). `sgr` picks SGR (1006) vs
+/// the legacy X10 encoding, matching the app. Mirrors `wheel_mouse_bytes`,
+/// which is just the wheel buttons (64/65).
+fn mouse_event_bytes(
+    base_button: u16,
+    release: bool,
+    motion: bool,
+    sgr: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Vec<u8> {
+    let (cx, cy) = map_pane_cell(pane, col, row);
+    // The motion bit (32) rides on press/drag reports in both encodings.
+    let cb = base_button + if motion { 32 } else { 0 };
+    if sgr {
+        // SGR (1006): press/drag end with `M`, release with `m`; the button
+        // identity survives on release (unlike X10).
+        let end = if release { 'm' } else { 'M' };
+        format!("\x1b[<{cb};{cx};{cy}{end}").into_bytes()
+    } else {
+        // Legacy X10: `ESC [ M` then three bytes, each value + 32 (clamped at
+        // 223). A release can't carry a button, so it uses the agnostic 3.
+        let enc = |v: u16| (v.min(223) + 32) as u8;
+        let btn = if release { 3 } else { cb };
+        vec![0x1b, b'[', b'M', enc(btn), enc(cx), enc(cy)]
+    }
+}
+
+/// Page presses delivered per wheel notch for a no-mouse full-screen app.
+/// One page per notch: full-screen apps that scroll on `PageUp`/`PageDown`
+/// (Claude Code's fullscreen renderer is the motivating case) have no finer
+/// keyboard step, and a page per notch reads as a normal "flick to scroll".
+const WHEEL_PAGE_STEP: usize = 1;
+
+/// Decide what to forward to the previewed full-screen pane for one wheel
+/// notch, or `None` to fall back to the capture-window scroll. Pure so the
+/// branch the fix turns on (page keys vs. raw mouse bytes vs. no forward) is
+/// asserted directly, without standing up a worker. See
+/// `forward_wheel_to_preview` for the full rationale.
+fn wheel_forward_key(
+    cursor: &crate::tmux::PaneCursor,
+    up: bool,
+    pane: ratatui::layout::Rect,
+    col: u16,
+    row: u16,
+) -> Option<live_send::TmuxKey> {
+    if !cursor.alternate_on {
+        return None;
+    }
+    if cursor.mouse_tracking {
+        Some(live_send::TmuxKey::HexBytes(wheel_mouse_bytes(
+            up,
+            cursor.mouse_sgr,
+            pane,
+            col,
+            row,
+        )))
+    } else {
+        // No mouse tracking: send `PageUp`/`PageDown`, NOT arrow keys. A
+        // full-screen app reads arrow keys as cursor / input-history
+        // navigation, not scroll (Claude Code 2.1.x even surfaces "Scroll
+        // wheel is sending arrow keys, use PgUp/PgDn to scroll"). The page
+        // keys scroll its transcript regardless of cursor-key mode.
+        Some(live_send::TmuxKey::NamedRepeat {
+            name: if up { "PageUp" } else { "PageDown" }.to_string(),
+            count: WHEEL_PAGE_STEP,
+        })
+    }
+}
+
 fn resolve_hook_install_agent(
     tool_name: &str,
     session_config: &crate::session::config::SessionConfig,
@@ -333,6 +448,64 @@ impl HomeView {
 
     pub fn hit_list(&self, col: u16, row: u16) -> bool {
         self.list_area.contains(Position::from((col, row)))
+    }
+
+    /// The `KeyEvent` a footer-toolbar button at `(col, row)` synthesizes,
+    /// or `None` when the click misses every button. The caller routes the
+    /// returned key through the normal key handler so a click behaves
+    /// exactly like pressing the shortcut. Returns `None` while a non-live
+    /// overlay (dialog, context menu, help, search) is open: the footer is
+    /// drawn underneath it, but the overlay owns clicks, so a footer button
+    /// must not fire a shortcut behind it.
+    pub fn footer_button_at(&self, col: u16, row: u16) -> Option<KeyEvent> {
+        if self.has_non_live_send_overlay() {
+            return None;
+        }
+        let pos = Position::from((col, row));
+        self.footer_buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(pos))
+            .map(|(_, key)| *key)
+    }
+
+    /// Handle a left-click on the sidebar collapse/expand affordances:
+    /// the collapse button on the expanded list's top-right border, or
+    /// anywhere in the collapsed strip. Returns true when the click landed
+    /// on one (and toggled), so the caller can stop before the row-click
+    /// path. The collapse button sits on the list's top border, which is
+    /// inside `list_area`, so this MUST run before `hit_list` or the click
+    /// falls through to `handle_empty_list_click` and opens a new session.
+    /// No-op while a non-live overlay is open so a click can't toggle the
+    /// sidebar behind a modal (the rects are cleared for the full-screen
+    /// takeover views, so a dialog overlay is the case left to guard).
+    pub fn handle_sidebar_collapse_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        let pos = Position::from((col, row));
+        if self.collapse_button_area.contains(pos) || self.expand_strip_area.contains(pos) {
+            self.toggle_sidebar_collapsed();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Click on the footer tips badge: open the tips overlay. Returns true when
+    /// the click was on the badge (so the caller stops routing it). Gated on no
+    /// overlay being open, the badge rect is captured behind any modal, so this
+    /// keeps a click in the bottom-right corner from punching through.
+    pub fn handle_tips_badge_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() || self.diff_view.is_some() {
+            return false;
+        }
+        let hit = self
+            .tips_badge_rect
+            .is_some_and(|r| r.contains(Position::from((col, row))));
+        if hit {
+            self.open_tips_dialog();
+        }
+        hit
     }
 
     /// True when `(col, row)` lands on the side-by-side list/preview
@@ -524,42 +697,68 @@ impl HomeView {
             self.preview_autoscroll_at = None;
             return false;
         }
-        // Pace the scroll to a steady cadence regardless of how often the
-        // loop woke this iteration, so the speed is even instead of racing
-        // with capture-worker activity.
+        // Pace the scroll to a steady cadence regardless of how often the loop
+        // woke this iteration, so the speed is even instead of racing with
+        // capture-worker activity. The aoe-side line scroll and the wheel
+        // forward to a mouse agent are both fine-grained (one line / one wheel
+        // notch), so they run at the fast cadence and read as smooth, like the
+        // native wheel forward when the live pane is active. The no-mouse
+        // page-key fallback stays slow: each press scrolls a WHOLE page, so a
+        // held edge at the fast cadence would rocket through the transcript.
         const AUTOSCROLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(40);
+        const PAGE_FORWARD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         let now = std::time::Instant::now();
-        if let Some(prev) = self.preview_autoscroll_at {
-            if now.duration_since(prev) < AUTOSCROLL_INTERVAL {
-                return false;
+        let forward_interval = if self.preview_forwards_mouse().is_some() {
+            AUTOSCROLL_INTERVAL
+        } else {
+            PAGE_FORWARD_INTERVAL
+        };
+        let line_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= AUTOSCROLL_INTERVAL);
+        let forward_ready = self
+            .preview_autoscroll_at
+            .is_none_or(|prev| now.duration_since(prev) >= forward_interval);
+        // First try the aoe-side capture-window scroll (normal-buffer panes
+        // with real scrollback).
+        if line_ready {
+            let scrolled = if at_top {
+                self.scroll_preview_offset(1)
+            } else {
+                self.scroll_preview_offset(-1)
+            };
+            if scrolled {
+                self.preview_autoscroll_at = Some(now);
+                let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
+                // Pin the extent to the now-revealed edge line in `from_bottom`
+                // terms, which the new scroll offset gives directly: the bottom
+                // visible line sits `offset` lines up from the newest line, the
+                // top visible line `offset + height - 1`. Deriving it from the
+                // offset (not the stale pre-scroll `total_lines`) keeps it
+                // correct even before the next frame re-captures.
+                let offset = self.preview_scroll_offset as usize;
+                let from_bottom = if at_top {
+                    offset + (pane.height as usize).saturating_sub(1)
+                } else {
+                    offset
+                };
+                if let Some(sel) = self.preview_selection.as_mut() {
+                    sel.extent = (col_off, from_bottom);
+                }
+                return true;
             }
         }
-        let scrolled = if at_top {
-            self.scroll_preview_offset(1)
-        } else {
-            self.scroll_preview_offset(-1)
-        };
-        if !scrolled {
-            return false;
+        // The capture-window scroll is inert: a full-screen (alternate-screen)
+        // agent has no aoe-side scrollback, so forward the same scroll input a
+        // wheel notch would to the agent instead, scrolling its OWN transcript
+        // the way the wheel forward does (#2421). The extent stays pinned to the
+        // screen edge; the agent's redraw is what reveals more text under the
+        // held selection.
+        if forward_ready && self.forward_scroll_to_preview(at_top, col, row) {
+            self.preview_autoscroll_at = Some(now);
+            return true;
         }
-        self.preview_autoscroll_at = Some(now);
-        let col_off = col.clamp(pane.x, pane.right().saturating_sub(1)) - pane.x;
-        // Pin the extent to the now-revealed edge line in `from_bottom`
-        // terms, which the new scroll offset gives directly: the bottom
-        // visible line sits `offset` lines up from the newest line, the top
-        // visible line `offset + height - 1`. Deriving it from the offset
-        // (not the stale pre-scroll `total_lines`) keeps it correct even
-        // before the next frame re-captures.
-        let offset = self.preview_scroll_offset as usize;
-        let from_bottom = if at_top {
-            offset + (pane.height as usize).saturating_sub(1)
-        } else {
-            offset
-        };
-        if let Some(sel) = self.preview_selection.as_mut() {
-            sel.extent = (col_off, from_bottom);
-        }
-        true
+        false
     }
 
     /// Shift the preview scroll offset by `delta` lines (positive scrolls
@@ -568,9 +767,18 @@ impl HomeView {
     /// handlers so the edge auto-scroll can move the pane without dragging
     /// the whole `handle_scroll_*` routing along with it.
     fn scroll_preview_offset(&mut self, delta: i32) -> bool {
-        let cache = self.active_preview_cache();
-        let visible_height = cache.dimensions.1.saturating_sub(1) as usize;
-        let real_max = cache.captured_lines.saturating_sub(visible_height) as i32;
+        // Use the same rendered output-body height the per-frame clamp uses
+        // (`clamp_scroll_to_capture`), NOT `dimensions.1 - 1`. The raw-height
+        // `- 1` over-counts the max offset by a row, so on an alternate-screen
+        // agent with no scrollback this would grant a phantom 1-row offset that
+        // render erases every frame: the offset oscillates 0->1->0, the view
+        // never moves, and because it returns `true` the caller never falls
+        // through to the agent scroll-forward fallback.
+        let visible_height = self.preview_visible_rows;
+        let real_max = self
+            .active_preview_cache()
+            .captured_lines
+            .saturating_sub(visible_height) as i32;
         let new = (self.preview_scroll_offset as i32 + delta).clamp(0, real_max) as u16;
         if new == self.preview_scroll_offset {
             return false;
@@ -853,7 +1061,7 @@ impl HomeView {
                         // No pending_intro_theme: the live preview
                         // already applied the chosen theme to
                         // `app.theme`; re-applying would force a
-                        // terminal.clear() (the close-flash). Same
+                        // `clear_terminal` (the close-flash). Same
                         // rationale as the keyboard Submit branch.
                     }
                 }
@@ -887,6 +1095,23 @@ impl HomeView {
             // hit rect (e.g. on the title or border): swallow it so
             // the underlying list doesn't shift selection out from
             // under the modal.
+            return true;
+        }
+        if let Some(dialog) = &mut self.tips_dialog {
+            if let Some(result) = dialog.handle_click(col, row) {
+                match result {
+                    DialogResult::Continue => {}
+                    DialogResult::Cancel => {
+                        self.tips_dialog = None;
+                    }
+                    DialogResult::Submit(outcome) => {
+                        self.tips_dialog = None;
+                        self.persist_tips_outcome(outcome);
+                    }
+                }
+            }
+            // Swallow every click while the overlay is open so it can't fall
+            // through to the list underneath.
             return true;
         }
         if let Some(dialog) = &mut self.new_dialog {
@@ -1114,9 +1339,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(order) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_order(order);
                 }
             }
             return true;
@@ -1328,7 +1551,7 @@ impl HomeView {
                 SettingsAction::Close => {
                     self.settings_view = None;
                     // Refresh config-dependent state in case settings changed
-                    self.refresh_from_config();
+                    self.refresh_from_config(crate::tui::home::ConfigRefreshOrigin::Interactive);
                     // Reload the theme from the global config (theme is a global
                     // preference, not profile-merged) so the repaint matches boot.
                     return Some(Action::SetTheme(
@@ -1455,7 +1678,7 @@ impl HomeView {
                     // applied the chosen theme to `app.theme` while the
                     // user was on the picker page. Re-dispatching here
                     // would only re-trigger `set_theme → needs_redraw`,
-                    // which forces a `terminal.clear()` on the next loop
+                    // which forces a `clear_terminal` on the next loop
                     // iteration — the close-flash the user sees.
                     return None;
                 }
@@ -1484,6 +1707,20 @@ impl HomeView {
                 DialogResult::Cancel => {
                     self.telemetry_consent_dialog = None;
                     persist_telemetry_consent(false);
+                }
+            }
+            return None;
+        }
+
+        if let Some(dialog) = &mut self.tips_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel => {
+                    self.tips_dialog = None;
+                }
+                DialogResult::Submit(outcome) => {
+                    self.tips_dialog = None;
+                    self.persist_tips_outcome(outcome);
                 }
             }
             return None;
@@ -1703,6 +1940,12 @@ impl HomeView {
                         self.cancel_creation();
                     } else {
                         self.new_dialog = None;
+                        // Backing out of `n` with a selection is the most
+                        // contextual moment to surface the new-from-selection
+                        // tip; queue it (no-op until it's earned). On submit we
+                        // skip the pop so it doesn't interrupt session creation;
+                        // the badge still carries it. See #2262.
+                        self.queue_earned_tip_pop();
                     }
                 }
                 DialogResult::Submit(data) => {
@@ -1853,6 +2096,7 @@ impl HomeView {
                                 &data.title,
                                 data.group.as_deref(),
                                 data.profile.as_deref(),
+                                data.rename_branch,
                             ) {
                                 tracing::error!(target: "tui.input", "Failed to rename session: {}", e);
                             }
@@ -1932,6 +2176,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.plugin_manager_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -1973,9 +2227,7 @@ impl HomeView {
                 }
                 DialogResult::Submit(order) => {
                     self.sort_picker_dialog = None;
-                    if order != self.sort_order {
-                        self.apply_sort_order(order);
-                    }
+                    self.apply_sort_order(order);
                 }
             }
             return None;
@@ -2020,9 +2272,7 @@ impl HomeView {
                     ProfilePickerAction::Deleted(name) => {
                         match crate::session::delete_profile(&name) {
                             Ok(()) => {
-                                if let Some(entry) = self.disk_watch_handles.remove(&name) {
-                                    super::drop_disk_watch_entry(entry);
-                                }
+                                self.rewire_after_profile_delete(&name);
                                 self.show_profile_picker();
                             }
                             Err(e) => {
@@ -2078,6 +2328,14 @@ impl HomeView {
                     return Some(Action::SpawnUpdate(method, version));
                 }
             }
+            return None;
+        }
+
+        // Drain a queued earned-tip pop now that the home view is idle: every
+        // overlay-routing block above has returned, so nothing is open here.
+        // Skip while searching so it can't interrupt a query. Opening the pop
+        // consumes this keystroke (it's a one-time, dismissable nudge). #2262
+        if !self.search_active && self.pending_tip_pop.is_some() && self.drain_pending_tip_pop() {
             return None;
         }
 
@@ -2205,8 +2463,22 @@ impl HomeView {
             has_search: !self.search_matches.is_empty(),
             project_group_selected: self.project_group_at_cursor().is_some(),
         };
-        if let Some(id) = bindings::resolve(&key, self.strict_hotkeys, &ctx) {
-            return self.run_action(id, update_info);
+        match bindings::resolve_action(&key, self.strict_hotkeys, &ctx) {
+            Some(bindings::ResolvedAction::Core(id)) => return self.run_action(id, update_info),
+            Some(bindings::ResolvedAction::Plugin(action)) => {
+                // Tier 0 has no plugin executor; the binding resolves and is
+                // inspectable, but running it waits for the runtime host (#2095).
+                self.info_dialog = Some(InfoDialog::sized_to_fit(
+                    "Plugin action",
+                    &format!(
+                        "{} is a plugin action. Running plugin actions needs the plugin runtime, \
+                         which is not available yet.",
+                        action.canonical()
+                    ),
+                ));
+                return None;
+            }
+            None => {}
         }
 
         // Navigation / structural keys: identical in both modes, never relocate.
@@ -2419,6 +2691,9 @@ impl HomeView {
                 let profile = self.config_profile();
                 self.projects_dialog = Some(ProjectsDialog::new(&profile));
             }
+            ActionId::Plugins => {
+                self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
+            }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
             ActionId::ToggleArchive => {
@@ -2438,6 +2713,11 @@ impl HomeView {
                     tracing::error!("toggle_snooze_at_cursor failed: {}", e);
                 }
             }
+            ActionId::ToggleUnread => {
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor failed: {}", e);
+                }
+            }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::SortPicker => self.show_sort_picker(),
@@ -2445,6 +2725,7 @@ impl HomeView {
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
             ActionId::NextWaiting => self.jump_to_next_waiting(),
             ActionId::RegenerateSummary => self.open_regenerate_summary_dialog(),
+            ActionId::Tips => self.open_tips_dialog(),
         }
         None
     }
@@ -2521,6 +2802,9 @@ impl HomeView {
                 dialog.focus_title();
             }
             self.new_dialog = Some(dialog);
+            // The user just used N, so they've discovered it; suppress the tip
+            // that teaches it.
+            self.record_used_new_from_selection();
         }
     }
 
@@ -2619,6 +2903,18 @@ impl HomeView {
             .worktree_info
             .as_ref()
             .and_then(|w| w.base_branch.clone());
+
+        // A session on a non-git project runs in place, so there is no repo to
+        // diff against. Show a clear message instead of letting the git layer
+        // surface a raw "could not open repository" error.
+        if !crate::git::GitWorktree::is_git_repo(&repo_path) {
+            self.info_dialog = Some(InfoDialog::new(
+                "No Git Repository",
+                "This session runs in place in a non-git directory, so there is no diff to show.",
+            ));
+            return;
+        }
+
         match DiffView::new_for_session(
             repo_path,
             Some(session_id_owned),
@@ -2644,19 +2940,32 @@ impl HomeView {
     fn open_serve(&mut self) {
         #[cfg(feature = "serve")]
         {
+            let web_disabled = crate::plugin::registry()
+                .get("aoe.web")
+                .is_some_and(|p| !p.enabled);
+            if web_disabled {
+                self.info_dialog = Some(InfoDialog::new(
+                    "Web dashboard disabled",
+                    "The aoe.web plugin is disabled, so the web dashboard cannot \
+                     be served.\n\n\
+                     Re-enable it in Settings > Plugins (or run \
+                     `aoe plugin enable aoe.web`), then press R again.",
+                ));
+                return;
+            }
             self.serve_view = Some(crate::tui::dialogs::ServeView::new());
         }
         #[cfg(not(feature = "serve"))]
         {
             self.info_dialog = Some(InfoDialog::new(
                 "Serve unavailable",
-                "This `aoe` binary was built without the `serve` feature, \
-                 so the web dashboard, local network serving, and \
-                 Cloudflare Tunnel integration are not included.\n\n\
+                "This `aoe` binary was built without the web dashboard \
+                 (a `--no-default-features` source build), so local network \
+                 serving and Cloudflare Tunnel integration are not included.\n\n\
                  To serve to your phone (LAN / Tailscale / tunnel):\n\
                    \u{2022} Install a release build from GitHub Releases, or\n\
-                   \u{2022} Build from source with:\n\
-                     cargo build --release --features serve\n\n\
+                   \u{2022} Build from source with default features:\n\
+                     cargo build --release\n\n\
                  Once you have a `serve`-enabled binary, press R again to \
                  open the serve dialog.",
             ));
@@ -2798,7 +3107,9 @@ impl HomeView {
                     // surface the sentinel path or invite Jump-to-group
                     // navigation that the rest of the codebase
                     // intentionally disarms.
-                    if crate::session::is_within_archived_section(path) {
+                    if crate::session::is_within_archived_section(path)
+                        || crate::session::is_within_trash_section(path)
+                    {
                         continue;
                     }
                     let label = if name == path {
@@ -2887,6 +3198,7 @@ impl HomeView {
                 self.tool_preview_cache = super::PreviewCache::default();
                 None
             }
+            PaletteAction::Cheat(message) => Some(Action::SetTransientStatus(message)),
         }
     }
 
@@ -2911,7 +3223,8 @@ impl HomeView {
             };
             if let Some(inst) = self.get_instance(&id) {
                 let is_actionable = inst.status == Status::Waiting
-                    || matches!(inst.idle_age(), Some(age) if age < window);
+                    || matches!(inst.idle_age(), Some(age) if age < window)
+                    || (crate::session::unread_enabled() && inst.is_unread());
                 if is_actionable {
                     self.cursor = idx;
                     self.update_selected();
@@ -3007,7 +3320,7 @@ impl HomeView {
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with default features to attach".to_string(),
                     ));
                 }
             }
@@ -3037,6 +3350,7 @@ impl HomeView {
                 ) {
                     self.start_live_send()
                 } else {
+                    self.exit_live_send_before_attach();
                     Some(Action::AttachSession(id))
                 }
             }
@@ -3061,9 +3375,14 @@ impl HomeView {
                 } else {
                     TerminalMode::Host
                 };
+                self.exit_live_send_before_attach();
                 Some(Action::AttachTerminal(id, terminal_mode))
             }
-            ViewMode::Tool(ref tool_name) => Some(Action::AttachToolSession(id, tool_name.clone())),
+            ViewMode::Tool(ref tool_name) => {
+                let tool_name = tool_name.clone();
+                self.exit_live_send_before_attach();
+                Some(Action::AttachToolSession(id, tool_name))
+            }
         }
     }
 
@@ -3087,7 +3406,7 @@ impl HomeView {
                 #[cfg(not(feature = "serve"))]
                 {
                     return Some(Action::SetTransientStatus(
-                        "Acp session: rebuild with --features serve to attach".to_string(),
+                        "Acp session: rebuild with default features to attach".to_string(),
                     ));
                 }
             }
@@ -3121,7 +3440,9 @@ impl HomeView {
                 }
                 Item::Group { path, .. } => {
                     self.selected_session = None;
-                    if crate::session::is_within_archived_section(path) {
+                    if crate::session::is_within_archived_section(path)
+                        || crate::session::is_within_trash_section(path)
+                    {
                         // The synthetic Archived section (and any
                         // project sub-folder rendered under it in
                         // Project mode) is not a real group: it can't
@@ -3141,6 +3462,12 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.preview_scroll_offset = 0;
+                // Moving off a hand-flagged row ends its manual-unread hold, so
+                // returning to it later dwell-clears like any other unread. Done
+                // here at the cursor->selection sync (every navigation path runs
+                // through it) so the release doesn't hinge on a dwell tick
+                // happening to fire during a quick hop to another row.
+                self.manual_unread_hold = None;
             }
         } else {
             self.selected_session = None;
@@ -3215,6 +3542,10 @@ impl HomeView {
             self.toggle_archived_section();
             return;
         }
+        if crate::session::is_trash_section_path(path) {
+            self.toggle_trashed_section();
+            return;
+        }
         if self.group_by == GroupByMode::Project {
             let collapsed = self
                 .project_group_collapsed
@@ -3224,6 +3555,7 @@ impl HomeView {
             self.project_group_collapsed
                 .insert(path.to_string(), !collapsed);
             self.flat_items = self.build_flat_items();
+            self.save_project_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree
@@ -3239,12 +3571,180 @@ impl HomeView {
         }
     }
 
-    /// Route a mouse-wheel-up at (col, row) to the pane under the cursor:
-    /// diff view (if open) → diff scroll; list pane → list cursor up;
-    /// preview pane → preview scroll. Returns `true` if the UI should
-    /// redraw. Scrolls do not cross pane boundaries: a wheel over the
-    /// preview never moves the list cursor, even when the preview is at
-    /// its scroll boundary or has no session selected.
+    /// Forward one wheel notch to the previewed full-screen (alternate-screen)
+    /// pane so it scrolls its OWN content, exactly as a terminal does on
+    /// direct attach. Active in BOTH live-send and passive preview: the
+    /// alternate screen has no scrollback, so the preview's capture-window
+    /// scroll is inert there (growing the window only exposes the unrelated
+    /// normal-buffer history and bottoms out at the session start), and
+    /// forwarding is the only way to reach the agent's history. Branched on
+    /// what the app asked for (see `wheel_forward_key`):
+    ///
+    /// * **Mouse tracking on**: forward the wheel as a mouse event, encoding
+    ///   following the app (SGR 1006 when `mouse_sgr` is set, else legacy
+    ///   X10). The previewed pane is sized to the preview rect in both modes
+    ///   (`preview_pane_synced` / the live-send sync resize), so the mapped
+    ///   coordinates land inside it.
+    /// * **Mouse tracking off**: send `PageUp`/`PageDown`, not arrow keys. A
+    ///   full-screen app reads arrows as cursor / input-history navigation,
+    ///   not scroll; the page keys scroll its transcript regardless of mode.
+    ///   Claude Code's fullscreen renderer is the motivating case (#2407).
+    ///
+    /// Normal-buffer panes get `None` from `wheel_forward_key`, so the caller
+    /// keeps the capture-window scroll (which reaches real scrollback there).
+    ///
+    /// In live-send the key rides the ordered `LiveSendWorker` so it stays in
+    /// sequence with typed keystrokes. In passive preview there is no worker,
+    /// so it goes out as a one-shot fork to the previewed pane's tmux target.
+    /// Returns true when the event was forwarded.
+    fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        let cursor = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor());
+        let Some(cursor) = cursor else { return false };
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
+        else {
+            return false;
+        };
+        self.send_to_preview_pane(key)
+    }
+
+    /// During an edge-held preview selection over a full-screen
+    /// (alternate-screen) agent, the aoe capture-window scroll is inert (the
+    /// alternate screen has no scrollback, so `scroll_preview_offset` can't
+    /// move), so forward the SAME scroll input one wheel notch would, scrolling
+    /// the agent's OWN transcript. Mirrors `forward_wheel_to_preview` by reusing
+    /// `wheel_forward_key`: a mouse-tracking app gets a wheel-up/down mouse
+    /// report at the held cell (PageUp does nothing while it owns the mouse), a
+    /// no-mouse app gets `PageUp`/`PageDown`. `wheel_forward_key` also enforces
+    /// the alternate-screen gate, so a normal-buffer pane that has merely
+    /// bottomed out its scrollback never gets scroll input injected into its
+    /// shell. `up` selects the top-edge (scroll back) vs bottom-edge (scroll
+    /// forward) direction; `col`/`row` is the held pointer cell, mapped into the
+    /// pane for the mouse-byte encoding. Returns true when something was sent.
+    fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
+        let Some(cursor) = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())
+        else {
+            return false;
+        };
+        let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
+        else {
+            return false;
+        };
+        self.send_to_preview_pane(key)
+    }
+
+    /// Send a forwarded key/mouse-byte payload to the pane the preview is
+    /// showing (`preview_capture_target`). The cursor and mapped coordinates
+    /// describe THAT pane, so the bytes must go there. Route through the
+    /// ordered live-send worker only when the displayed pane is also the
+    /// live-send target, so the event stays in sequence with typed
+    /// keystrokes; otherwise (passive preview, or live-send aimed at a
+    /// different pane than the one on screen) fork a one-shot send. Returns
+    /// true when something was dispatched.
+    fn send_to_preview_pane(&self, key: live_send::TmuxKey) -> bool {
+        let Some(target) = self.preview_capture_target.as_deref() else {
+            return false;
+        };
+        if let (Some(worker), Some(live)) = (&self.live_send_worker, &self.live_send) {
+            if live.tmux_name.as_str() == target {
+                worker.send(key);
+                return true;
+            }
+        }
+        live_send::send_key_oneshot(target, key);
+        true
+    }
+
+    /// The previewed agent's cursor when a mouse button event over the preview
+    /// should be forwarded to it instead of driving aoe's own UI: the pane must
+    /// be a full-screen app with mouse tracking on (the same gate as the wheel's
+    /// mouse-byte branch). Works in passive preview too, not just live-send,
+    /// mirroring `forward_wheel_to_preview`: hovering a mouse agent and dragging
+    /// drives its native selection/scroll, and `send_to_preview_pane` forks a
+    /// one-shot send when there's no live-send worker. `None` means let the
+    /// event fall through to aoe's handlers (selection, etc.); Shift is the
+    /// caller's escape hatch back to aoe-side selection / copy. Returns the
+    /// cursor so the caller can read `mouse_sgr` for the encoding.
+    fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
+        let cursor = self
+            .preview_capture_worker
+            .as_ref()
+            .and_then(|w| w.current_cursor())?;
+        (cursor.alternate_on && cursor.mouse_tracking).then_some(cursor)
+    }
+
+    /// Forward a mouse button event (press / release / drag) over the preview
+    /// straight to the previewed agent, the way a direct tmux attach would.
+    /// `Shift` is the escape hatch: a Shift-held event returns `false` so it
+    /// falls through to aoe's own preview text-selection. Returns `true` when
+    /// the event was forwarded (and should be consumed). Wheel and bare-motion
+    /// events are not handled here (the wheel has its own path; bare motion is
+    /// not forwarded).
+    ///
+    /// A button held down is tracked in `mouse_forward_btn` so its drag and
+    /// release reach the agent even if the pointer leaves the preview rect
+    /// mid-drag, which keeps the agent from seeing a stuck button.
+    pub fn forward_mouse_to_preview(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let base = |b: MouseButton| match b {
+            MouseButton::Left => 0u16,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        };
+        // Decide (button, release, motion) and whether this event even starts
+        // or continues a forwarded gesture.
+        let (base_button, release, motion) = match kind {
+            MouseEventKind::Down(b) => {
+                if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+                    return false; // Shift+press => aoe selection
+                }
+                // A modal over the preview owns the click (dismiss / button).
+                if self.has_non_live_send_overlay() {
+                    return false;
+                }
+                if !self.hit_preview(col, row) {
+                    return false;
+                }
+                (base(b), false, false)
+            }
+            // A drag / release only forwards if its press was forwarded (we're
+            // mid-gesture); position is no longer gated so the release lands.
+            MouseEventKind::Drag(b) if self.mouse_forward_btn.is_some() => (base(b), false, true),
+            MouseEventKind::Up(b) if self.mouse_forward_btn.is_some() => (base(b), true, false),
+            _ => return false,
+        };
+        // The single mouse-forwarding gate, shared by press/drag/release: a
+        // press over a non-mouse pane bails here, and a gesture whose pane
+        // stopped being a mouse agent mid-drag drops its tracked button so we
+        // don't strand it.
+        let Some(cursor) = self.preview_forwards_mouse() else {
+            self.mouse_forward_btn = None;
+            return false;
+        };
+        self.mouse_forward_btn = if release { None } else { Some(base_button) };
+        let bytes = mouse_event_bytes(
+            base_button,
+            release,
+            motion,
+            cursor.mouse_sgr,
+            self.preview_text_view.pane,
+            col,
+            row,
+        );
+        self.send_to_preview_pane(live_send::TmuxKey::HexBytes(bytes))
+    }
+
     pub fn handle_scroll_up(&mut self, col: u16, row: u16) -> bool {
         const STEP: u16 = 3;
         // A preview selection is anchored to absolute scrollback lines,
@@ -3279,6 +3779,13 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        // Full-screen (alternate-screen) app: send the wheel to the app
+        // instead of scrolling the (irrelevant) normal-buffer capture. Fires
+        // in both live-send and passive preview.
+        if self.forward_wheel_to_preview(true, col, row) {
+            self.preview_scroll_offset = 0;
+            return true;
         }
 
         let active_cache = match self.view_mode {
@@ -3418,7 +3925,7 @@ impl HomeView {
             } else if is_group {
                 ContextMenuDialog::for_group(anchor)
             } else {
-                let (is_archived, is_snoozed, can_regen) = match &self.flat_items[idx] {
+                let (is_archived, is_snoozed, can_regen, is_unread) = match &self.flat_items[idx] {
                     super::Item::Session { id, .. } => self
                         .get_instance(id)
                         .map(|inst| {
@@ -3426,10 +3933,11 @@ impl HomeView {
                                 inst.is_archived(),
                                 inst.is_snoozed(),
                                 crate::session::tool_session::tracking_enabled(inst),
+                                inst.is_unread(),
                             )
                         })
-                        .unwrap_or((false, false, false)),
-                    super::Item::Group { .. } => (false, false, false),
+                        .unwrap_or((false, false, false, false)),
+                    super::Item::Group { .. } => (false, false, false, false),
                 };
                 // Snooze is an Attention-sort triage primitive: the `'h'`
                 // keybinding only fires in Attention sort, so the menu omits
@@ -3437,7 +3945,10 @@ impl HomeView {
                 // paths in step.
                 let snooze = (self.sort_order == crate::session::config::SortOrder::Attention)
                     .then_some(is_snoozed);
-                ContextMenuDialog::for_session(anchor, is_archived, snooze, can_regen)
+                // The unread toggle is always-on (any sort), so it shows
+                // whenever the feature is enabled.
+                let unread = crate::session::unread_enabled().then_some(is_unread);
+                ContextMenuDialog::for_session(anchor, is_archived, snooze, can_regen, unread)
             });
             return true;
         }
@@ -3514,12 +4025,18 @@ impl HomeView {
                     tracing::error!("toggle_snooze_at_cursor (context menu) failed: {}", e);
                 }
             }
+            ContextMenuAction::ToggleUnread => {
+                // Same cursor-on-the-clicked-row guarantee as ToggleArchive.
+                if let Err(e) = self.toggle_unread_at_cursor() {
+                    tracing::error!("toggle_unread_at_cursor (context menu) failed: {}", e);
+                }
+            }
             ContextMenuAction::NewSession => self.open_new_session_dialog(),
-            // The right-click already moved the cursor onto the group row, so
-            // reuse the "new from selection" path: with a group selected it
-            // prefills the project's repo path (and group) the same way `'N'`
-            // does on a session.
-            ContextMenuAction::NewFromGroup => self.open_new_from_selection(),
+            // The right-click already moved the cursor onto the row, so reuse
+            // the "new from selection" path: a session row prefills its own repo
+            // path and group, a group/project row borrows a member's path, the
+            // same way `'N'` does.
+            ContextMenuAction::NewFromSelection => self.open_new_from_selection(),
             ContextMenuAction::OpenSortPicker => self.show_sort_picker(),
             ContextMenuAction::OpenGroupPicker => self.show_group_picker(),
             ContextMenuAction::TogglePin => {
@@ -3553,6 +4070,13 @@ impl HomeView {
             self.show_no_agents();
             return;
         }
+        // Earned-tip signal: opening `n` with a row/group selected is exactly
+        // the situation where `N` (new-from-selection) would have helped, so
+        // count it. Once it crosses the threshold the "new from selection" tip
+        // earns its way into the badge/list and a one-time pop (#2262).
+        if self.selected_session.is_some() || self.selected_group.is_some() {
+            self.record_new_session_with_selection();
+        }
         let existing_groups: Vec<String> =
             self.all_groups().iter().map(|g| g.path.clone()).collect();
         let current_profile = self.config_profile();
@@ -3563,6 +4087,130 @@ impl HomeView {
             &current_profile,
             profiles,
         ));
+    }
+
+    /// Open the tips overlay (the browsable list from `crate::tips`). Shared by
+    /// the command palette, the `?` help screen, and the tips badge so they
+    /// can't drift. Always opens, even with no eligible tips, so an explicit
+    /// "Show tips" gives feedback (an empty state) rather than silently doing
+    /// nothing.
+    pub(super) fn open_tips_dialog(&mut self) {
+        let config = load_config().ok().flatten().unwrap_or_default();
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
+        self.tips_dialog = Some(TipsDialog::new(
+            eligible,
+            config.app_state.tips_seen.clone(),
+            !config.session.show_tips,
+            self.strict_hotkeys,
+        ));
+    }
+
+    /// Persist what the tips overlay reported on close: merge newly-seen ids
+    /// into `tips_seen` and apply a "don't show tips" toggle if the user
+    /// flipped it. Merging (rather than overwriting) preserves seen ids for
+    /// tips that aren't currently eligible.
+    pub(super) fn persist_tips_outcome(&mut self, outcome: TipsOutcome) {
+        if outcome.newly_seen.is_empty() && outcome.disabled.is_none() {
+            return;
+        }
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            for id in outcome.newly_seen {
+                if !config.app_state.tips_seen.iter().any(|s| s == &id) {
+                    config.app_state.tips_seen.push(id);
+                }
+            }
+            if let Some(disabled) = outcome.disabled {
+                config.session.show_tips = !disabled;
+            }
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tips state: {}", e);
+            }
+        }
+    }
+
+    /// Bump the "opened new-session with a selection" counter that earns the
+    /// new-from-selection tip (#2262), persist it, and refresh the badge.
+    fn record_new_session_with_selection(&mut self) {
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            config.app_state.new_session_with_selection_count = config
+                .app_state
+                .new_session_with_selection_count
+                .saturating_add(1);
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            }
+        }
+    }
+
+    /// Record that the user has used `N` (new-from-selection). They've found the
+    /// feature, so the tip teaching it is suppressed from now on; also cancel a
+    /// queued pop and refresh the badge. Writes once (idempotent).
+    fn record_used_new_from_selection(&mut self) {
+        // They know about N now; don't pop the tip that teaches it.
+        if self.pending_tip_pop.map(|t| t.id) == Some("new-from-selection") {
+            self.pending_tip_pop = None;
+        }
+        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
+            if config.app_state.used_new_from_selection {
+                return;
+            }
+            config.app_state.used_new_from_selection = true;
+            self.tips_unseen = super::tips_unseen_count(&config);
+            if let Err(e) = save_config(&config) {
+                tracing::warn!(target: "tui.input", "Failed to persist tip signal: {}", e);
+            }
+        }
+    }
+
+    /// After the new-session dialog closes, queue an earned tip to pop gently
+    /// if one just became eligible and tips aren't disabled. Drained on the
+    /// next keystroke by `drain_pending_tip_pop`, so it never interrupts an
+    /// in-flight action.
+    pub(super) fn queue_earned_tip_pop(&mut self) {
+        if self.pending_tip_pop.is_some() {
+            return;
+        }
+        let config = load_config().ok().flatten().unwrap_or_default();
+        if !config.session.show_tips {
+            return;
+        }
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        self.pending_tip_pop = crate::tips::next_earned_pop(
+            crate::tips::TipSurface::Tui,
+            &config.app_state.tips_seen,
+            &signals,
+        );
+    }
+
+    /// Open the queued earned tip as a small one-tip overlay, if any. Called
+    /// when the home view is idle (no other overlay) so the pop never
+    /// interrupts an action. Returns true if a pop was opened, so the caller
+    /// can treat the triggering keystroke as consumed.
+    pub(super) fn drain_pending_tip_pop(&mut self) -> bool {
+        let Some(tip) = self.pending_tip_pop.take() else {
+            return false;
+        };
+        let config = load_config().ok().flatten().unwrap_or_default();
+        // Re-check: the user may have disabled tips between queueing and now.
+        if !config.session.show_tips {
+            return false;
+        }
+        self.tips_dialog = Some(TipsDialog::new(
+            vec![tip],
+            config.app_state.tips_seen.clone(),
+            !config.session.show_tips,
+            self.strict_hotkeys,
+        ));
+        true
     }
 
     /// Left-click on the empty area of the sidebar (below the last
@@ -3605,27 +4253,49 @@ impl HomeView {
     /// Shared by the `'r'` / `'R'` key handlers and the right-click
     /// context menu so all three entry points stay byte-identical.
     pub(super) fn open_rename_for_selected(&mut self) {
-        if let Some(id) = &self.selected_session {
-            if let Some(inst) = self.get_instance(id) {
-                if matches!(inst.status, Status::Deleting | Status::Creating) {
-                    return;
-                }
-                // Rename is anchored to the selected session, so the dialog
-                // must open against that session's profile, not the
-                // view-level active/config profile (which can differ in
-                // all-profiles mode).
-                let current_profile = inst.source_profile.clone();
-                let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-                let existing_groups: Vec<String> =
-                    self.all_groups().iter().map(|g| g.path.clone()).collect();
-                self.rename_dialog = Some(RenameDialog::new(
-                    &inst.title,
-                    &inst.group_path,
-                    &current_profile,
-                    profiles,
-                    existing_groups,
-                ));
+        if let Some(id) = self.selected_session.clone() {
+            let Some(inst) = self.get_instance(&id) else {
+                return;
+            };
+            if matches!(inst.status, Status::Deleting | Status::Creating) {
+                return;
             }
+            // Rename is anchored to the selected session, so the dialog
+            // must open against that session's profile, not the
+            // view-level active/config profile (which can differ in
+            // all-profiles mode).
+            let current_profile = inst.source_profile.clone();
+            let title = inst.title.clone();
+            let group_path = inst.group_path.clone();
+            // Capture branch context up front; a tied aoe-managed worktree
+            // can opt to rename the branch alongside the directory.
+            let branch_ctx = inst
+                .worktree_info
+                .as_ref()
+                .map(|w| (w.branch.clone(), w.main_repo_path.clone()));
+
+            let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
+            let existing_groups: Vec<String> =
+                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            let mut dialog = RenameDialog::new(
+                &title,
+                &group_path,
+                &current_profile,
+                profiles,
+                existing_groups,
+            );
+            if self.tie_workdir_applies_for(&id) {
+                if let Some((branch, main_repo)) = branch_ctx {
+                    // The upstream probe is a quick `git for-each-ref`; this
+                    // is a one-shot on dialog open, not a hot path.
+                    let upstream =
+                        crate::git::GitWorktree::new(std::path::PathBuf::from(&main_repo))
+                            .ok()
+                            .and_then(|g| g.branch_upstream(&branch));
+                    dialog = dialog.with_worktree_branch(&branch, upstream);
+                }
+            }
+            self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
             if self.group_by == GroupByMode::Project {
                 let hint = if self.strict_hotkeys {
@@ -3642,8 +4312,16 @@ impl HomeView {
                 .clone()
                 .unwrap_or_else(|| self.config_profile());
             let profiles = list_profiles().unwrap_or_else(|_| vec![current_profile.clone()]);
-            let existing_groups: Vec<String> =
-                self.all_groups().iter().map(|g| g.path.clone()).collect();
+            // Duplicate-name validation is per-profile (rename_selected_group
+            // checks only the target profile's tree), so the dialog's existing
+            // names must be scoped to this group's profile too. Spanning all
+            // profiles would falsely block renaming to a name that only
+            // collides with a same-named group in a different profile.
+            let existing_groups: Vec<String> = self
+                .group_trees
+                .get(&current_profile)
+                .map(|t| t.get_all_groups().iter().map(|g| g.path.clone()).collect())
+                .unwrap_or_default();
             self.group_rename_context = Some(super::GroupRenameContext {
                 old_path: group_path.clone(),
                 old_profile: current_profile.clone(),
@@ -3754,6 +4432,26 @@ impl HomeView {
                     return;
                 }
 
+                // Trash-first: when session.delete_to_trash is enabled (the
+                // default) and the session is not already trashed, move it to
+                // the trash instead of opening the permanent-delete dialog. A
+                // session already in the Trash section falls through so `D`
+                // there deletes it permanently. See #2489.
+                let already_trashed = inst.is_trashed();
+                // Resolve the policy from the SELECTED session's profile, not
+                // the active filter: in all-profiles view `config_profile()`
+                // can differ from the row's `source_profile`, which would
+                // trash/purge under the wrong profile's retention policy.
+                // See #2489.
+                let delete_to_trash = crate::session::resolve_config_or_warn(&inst.source_profile)
+                    .session
+                    .delete_to_trash;
+                if delete_to_trash && !already_trashed {
+                    let sid = session_id.clone();
+                    self.trash_session_by_id(&sid);
+                    return;
+                }
+
                 let config = DeleteDialogConfig {
                     worktree_branch: inst
                         .worktree_info
@@ -3788,16 +4486,31 @@ impl HomeView {
                 self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
                 return;
             }
+            // Scope the count to the selected group's profile: two groups in
+            // different profiles can share a path, and counting by path alone
+            // would pop the "delete N sessions" options dialog for an empty
+            // group whose same-named twin in another profile still has rows.
+            let owning_profile = self.selected_group_profile.clone();
             let prefix = format!("{}/", group_path);
             let session_count = self
                 .instances
                 .iter()
-                .filter(|i| i.group_path == *group_path || i.group_path.starts_with(&prefix))
+                .filter(|i| {
+                    (i.group_path == *group_path || i.group_path.starts_with(&prefix))
+                        && owning_profile
+                            .as_ref()
+                            .is_none_or(|p| &i.source_profile == p)
+                })
                 .count();
 
             if session_count > 0 {
-                let has_managed_worktrees = self.group_has_managed_worktrees(group_path, &prefix);
-                let has_containers = self.group_has_containers(group_path, &prefix);
+                let has_managed_worktrees = self.group_has_managed_worktrees(
+                    group_path,
+                    &prefix,
+                    owning_profile.as_deref(),
+                );
+                let has_containers =
+                    self.group_has_containers(group_path, &prefix, owning_profile.as_deref());
                 self.group_delete_options_dialog = Some(GroupDeleteOptionsDialog::new(
                     group_path.clone(),
                     session_count,
@@ -3941,6 +4654,69 @@ impl HomeView {
         }
     }
 
+    /// A double-click on the preview pane opens/attaches the previewed session,
+    /// producing the SAME `Action` a sidebar double-click (or `Enter`) would, so
+    /// the two gestures match. Mirrors `handle_click`'s double-click detection
+    /// but keyed to the preview rect via its own `last_preview_click`, and gated
+    /// to a plain (no-Shift) left press over the preview with no overlay on top.
+    /// The previewed pane is always `selected_session`, so it activates the
+    /// right row without touching `cursor`. Returns the activation `Action` on
+    /// the second qualifying press on the SAME cell within
+    /// `DOUBLE_CLICK_THRESHOLD`, else `None` (a single press, whose timing it
+    /// records; the caller still forwards that press to a mouse-tracking
+    /// agent). Shift falls through so aoe's own preview selection runs, matching
+    /// the mouse-forward gate.
+    pub fn preview_double_click_action(
+        &mut self,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> Option<Action> {
+        self.preview_double_click_action_at(std::time::Instant::now(), kind, modifiers, col, row)
+    }
+
+    /// Same as `preview_double_click_action`, but the caller supplies `now` so
+    /// unit tests can drive double-click detection deterministically.
+    pub(super) fn preview_double_click_action_at(
+        &mut self,
+        now: std::time::Instant,
+        kind: crossterm::event::MouseEventKind,
+        modifiers: crossterm::event::KeyModifiers,
+        col: u16,
+        row: u16,
+    ) -> Option<Action> {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        if !matches!(kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+        if modifiers.contains(crossterm::event::KeyModifiers::SHIFT) {
+            return None;
+        }
+        if self.has_non_live_send_overlay() || !self.hit_preview(col, row) {
+            return None;
+        }
+        // Match the SAME cell, not just the row: the sidebar can key by row
+        // because a row identifies an item, but a preview row is just a line of
+        // text, so two unrelated presses on the same line (different columns)
+        // must not count as a double-click.
+        let is_double = matches!(
+            self.last_preview_click,
+            Some((prev_time, prev_col, prev_row))
+                if prev_col == col
+                    && prev_row == row
+                    && now.duration_since(prev_time) <= DOUBLE_CLICK_THRESHOLD
+        );
+        if is_double {
+            // Reset so a triple-click doesn't immediately re-fire activation.
+            self.last_preview_click = None;
+            self.activate_selected_session()
+        } else {
+            self.last_preview_click = Some((now, col, row));
+            None
+        }
+    }
+
     /// Record the mouse position from a `MouseEventKind::Moved` event so
     /// the list can render a hover highlight on the row under the cursor.
     /// `mouse_pos` is cleared when the cursor leaves `list_inner_area`.
@@ -4019,6 +4795,18 @@ impl HomeView {
             overlay_changed |= dialog.handle_hover(col, row);
         }
 
+        // Footer-toolbar hover: the hovered button's shortcut drives the
+        // inverted-chip highlight on the next render. Recomputed against the
+        // current button rects so it clears the moment the pointer leaves a
+        // button.
+        let prev_footer_hover = self.footer_hover;
+        self.footer_hover = self
+            .footer_buttons
+            .iter()
+            .find(|(rect, _)| rect.contains(Position::from((col, row))))
+            .map(|(_, key)| *key);
+        let footer_changed = prev_footer_hover != self.footer_hover;
+
         let new_pos = if self.list_inner_area.contains(Position::from((col, row))) {
             Some((col, row))
         } else {
@@ -4027,7 +4815,18 @@ impl HomeView {
         let prev_idx = self.hovered_index();
         self.mouse_pos = new_pos;
         let new_idx = self.hovered_index();
-        overlay_changed || prev_idx != new_idx
+
+        // Footer tips badge: highlight on hover like a session row. Gated to no
+        // overlay being open (the badge isn't clickable then), matching
+        // `handle_tips_badge_click`.
+        let badge_hover = !self.has_non_live_send_overlay()
+            && self
+                .tips_badge_rect
+                .is_some_and(|r| r.contains(Position::from((col, row))));
+        let badge_changed = badge_hover != self.tips_badge_hovered;
+        self.tips_badge_hovered = badge_hover;
+
+        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
@@ -4058,6 +4857,12 @@ impl HomeView {
         }
         if self.selected_session.is_none() {
             return false;
+        }
+        // Mirror handle_scroll_up: a full-screen app gets the wheel
+        // forwarded rather than moving the preview's capture window.
+        if self.forward_wheel_to_preview(false, col, row) {
+            self.preview_scroll_offset = 0;
+            return true;
         }
         if self.preview_scroll_offset == 0 {
             return false;
@@ -4357,6 +5162,23 @@ impl HomeView {
         }
     }
 
+    /// Exit live-send before an activation hands the terminal to a tmux
+    /// attach. The double-click (and Enter) activation path resolves
+    /// through `default_attach_mode`, so when `click_action = LiveSend`
+    /// the *first* click of a double-click already entered live-send for
+    /// the row; the second click then resolves to a tmux attach
+    /// (`default_attach_mode = Tmux`). Without this teardown the
+    /// just-spawned worker keeps dispatching against a pane we're
+    /// leaving, the attach inherits the preview-pinned window size
+    /// instead of growing to the client, and detaching drops the user
+    /// back into live mode rather than the home list (#2290). No-op when
+    /// not live-sending.
+    fn exit_live_send_before_attach(&mut self) {
+        if let Some(state) = self.live_send.clone() {
+            self.exit_live_send_and_restore_sizing(&state);
+        }
+    }
+
     /// Tear down live-send state and restore the tmux window's
     /// automatic sizing policy. live-send's per-keystroke resize loop
     /// forces tmux into manual sizing; if we leave it that way, the
@@ -4373,11 +5195,12 @@ impl HomeView {
         // previewed after exit, just at the idle cadence. The render
         // reconcile retunes it (and retargets if the view later changes).
         self.live_send_last_resize = None;
-        // The leader menu and sidebar collapse are live-mode-only: drop
-        // any half-entered leader chord and re-reveal the session list so
-        // the normal home view is never left in a collapsed or armed state.
+        // The leader menu is live-mode-only: drop any half-entered chord so
+        // the home view is never left armed. The sidebar collapse is now a
+        // general, persisted home-view state (the collapsed strip stays
+        // clickable here), so exiting live mode deliberately leaves it as
+        // the user set it rather than force-revealing the list.
         self.live_send_pending_leader = false;
-        self.sidebar_collapsed = false;
         // Live mode just owned the pane's size; the non-live preview must
         // re-assert its geometry on the next render now that the header is
         // visible again (and so the agent reflows back to the previewed size).
@@ -4545,6 +5368,10 @@ impl HomeView {
     }
 
     /// Re-score matches after a reload without moving the cursor.
+    fn search_haystack_for(inst: &crate::session::Instance) -> String {
+        format!("{} {}", inst.title, inst.project_path)
+    }
+
     pub(super) fn refresh_search_matches(&mut self) {
         let query = self.search_query.value();
         if query.is_empty() {
@@ -4571,8 +5398,8 @@ impl HomeView {
         for (idx, item) in self.flat_items.iter().enumerate() {
             let haystack = match item {
                 Item::Session { id, .. } => {
-                    if let Some(inst) = self.get_display_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                    if let Some(inst) = self.get_instance(id) {
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }
@@ -4626,7 +5453,7 @@ impl HomeView {
             let haystack = match item {
                 Item::Session { id, .. } => {
                     if let Some(inst) = self.get_instance(id) {
-                        format!("{} {}", inst.title, inst.project_path)
+                        Self::search_haystack_for(inst)
                     } else {
                         continue;
                     }
@@ -4838,6 +5665,179 @@ impl HomeView {
 mod tests {
     use super::*;
     use crate::session::config::{SessionConfig, ToolSessionConfig};
+
+    #[test]
+    fn wheel_mouse_bytes_sgr_maps_cell_and_button() {
+        use ratatui::layout::Rect;
+        // Pane at (10,5), 80x24. Wheel up over screen cell (12,7) maps to
+        // 1-based pane cell (3,3): cx = 12-10+1, cy = 7-5+1.
+        let pane = Rect::new(10, 5, 80, 24);
+        assert_eq!(
+            wheel_mouse_bytes(true, true, pane, 12, 7),
+            b"\x1b[<64;3;3M".to_vec()
+        );
+        // Wheel down flips the button to 65.
+        assert_eq!(
+            wheel_mouse_bytes(false, true, pane, 12, 7),
+            b"\x1b[<65;3;3M".to_vec()
+        );
+        // A cell past the pane edge clamps to the last column/row.
+        assert_eq!(
+            wheel_mouse_bytes(true, true, pane, 999, 999),
+            b"\x1b[<64;80;24M".to_vec()
+        );
+        // An unpopulated rect falls back to the top-left cell.
+        assert_eq!(
+            wheel_mouse_bytes(true, true, Rect::new(0, 0, 0, 0), 40, 40),
+            b"\x1b[<64;1;1M".to_vec()
+        );
+    }
+
+    #[test]
+    fn wheel_mouse_bytes_legacy_encodes_x10() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(10, 5, 80, 24);
+        // Legacy X10: ESC [ M then (button+32, col+32, row+32). Cell (3,3),
+        // wheel up (button 64) => 0x60, 0x23, 0x23.
+        assert_eq!(
+            wheel_mouse_bytes(true, false, pane, 12, 7),
+            vec![0x1b, b'[', b'M', 64 + 32, 3 + 32, 3 + 32]
+        );
+        // Wheel down => button 65 => 0x61.
+        assert_eq!(
+            wheel_mouse_bytes(false, false, pane, 12, 7),
+            vec![0x1b, b'[', b'M', 65 + 32, 3 + 32, 3 + 32]
+        );
+        // Coordinates above 223 can't be encoded in one byte; clamp there.
+        let wide = Rect::new(0, 0, 400, 400);
+        assert_eq!(
+            wheel_mouse_bytes(true, false, wide, 300, 300),
+            vec![0x1b, b'[', b'M', 64 + 32, 223 + 32, 223 + 32]
+        );
+    }
+
+    #[test]
+    fn mouse_event_bytes_sgr_press_release_and_drag() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        // Cell (10,5) maps to 1-based (11,6). SGR: press `M`, release `m`,
+        // keeping the button identity; a drag adds the motion bit (+32).
+        assert_eq!(
+            mouse_event_bytes(0, false, false, true, pane, 10, 5),
+            b"\x1b[<0;11;6M"
+        ); // left press
+        assert_eq!(
+            mouse_event_bytes(0, true, false, true, pane, 10, 5),
+            b"\x1b[<0;11;6m"
+        ); // left release
+        assert_eq!(
+            mouse_event_bytes(2, false, false, true, pane, 10, 5),
+            b"\x1b[<2;11;6M"
+        ); // right press
+        assert_eq!(
+            mouse_event_bytes(0, false, true, true, pane, 10, 5),
+            b"\x1b[<32;11;6M"
+        ); // left drag (0 + motion 32)
+    }
+
+    #[test]
+    fn mouse_event_bytes_x10_press_button_release_agnostic() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        // Legacy X10: ESC [ M then (button+32, cx+32, cy+32). Cell (10,5) =>
+        // (11,6). A release is the button-agnostic 3.
+        assert_eq!(
+            mouse_event_bytes(0, false, false, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 32, 11 + 32, 6 + 32]
+        ); // left press
+        assert_eq!(
+            mouse_event_bytes(0, true, false, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 3 + 32, 11 + 32, 6 + 32]
+        ); // release => button 3
+        assert_eq!(
+            mouse_event_bytes(0, false, true, false, pane, 10, 5),
+            vec![0x1b, b'[', b'M', 32 + 32, 11 + 32, 6 + 32]
+        ); // left drag => button 0 + motion bit 32
+    }
+
+    fn cursor_for(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 24,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+            position_reliable: true,
+        }
+    }
+
+    /// The fix for #2407: a full-screen pane with no mouse tracking must
+    /// forward `PageUp`/`PageDown`, NOT arrow keys (which an app reads as
+    /// cursor / input-history navigation, not scroll) and NOT raw mouse
+    /// bytes. Asserting the key variant guards against a regression to
+    /// either that the preview-offset behavioral test can't catch.
+    #[test]
+    fn wheel_forward_key_no_mouse_alt_screen_is_page_key() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        let cursor = cursor_for(true, false, false);
+        assert_eq!(
+            wheel_forward_key(&cursor, true, pane, 10, 10),
+            Some(live_send::TmuxKey::NamedRepeat {
+                name: "PageUp".into(),
+                count: WHEEL_PAGE_STEP,
+            })
+        );
+        assert_eq!(
+            wheel_forward_key(&cursor, false, pane, 10, 10),
+            Some(live_send::TmuxKey::NamedRepeat {
+                name: "PageDown".into(),
+                count: WHEEL_PAGE_STEP,
+            })
+        );
+    }
+
+    /// A mouse-tracking full-screen pane still gets a forwarded mouse event
+    /// (SGR or legacy X10 bytes), never arrow keys.
+    #[test]
+    fn wheel_forward_key_mouse_tracking_is_hex_bytes() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        match wheel_forward_key(&cursor_for(true, true, true), true, pane, 10, 10) {
+            Some(live_send::TmuxKey::HexBytes(b)) => assert_eq!(b[0], 0x1b),
+            other => panic!("expected SGR HexBytes, got {other:?}"),
+        }
+        match wheel_forward_key(&cursor_for(true, true, false), true, pane, 10, 10) {
+            Some(live_send::TmuxKey::HexBytes(b)) => {
+                assert_eq!(&b[..3], &[0x1b, b'[', b'M'])
+            }
+            other => panic!("expected legacy HexBytes, got {other:?}"),
+        }
+    }
+
+    /// A normal-screen pane is never forwarded; the caller keeps the
+    /// capture-window scroll, which can reach real scrollback there.
+    #[test]
+    fn wheel_forward_key_normal_screen_is_none() {
+        use ratatui::layout::Rect;
+        let pane = Rect::new(0, 0, 80, 24);
+        assert_eq!(
+            wheel_forward_key(&cursor_for(false, false, false), true, pane, 10, 10),
+            None
+        );
+        assert_eq!(
+            wheel_forward_key(&cursor_for(false, true, true), true, pane, 10, 10),
+            None
+        );
+    }
 
     #[test]
     fn format_target_label_distinguishes_terminal_panes() {

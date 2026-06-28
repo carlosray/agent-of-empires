@@ -1,6 +1,7 @@
 //! Rendering for HomeView
 
 use chrono::{DateTime, Utc};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use std::time::{Duration, Instant};
@@ -9,7 +10,7 @@ use rattles::presets::prelude as spinners;
 
 use super::{
     get_indent, live_send, HomeView, TerminalMode, ViewMode, ICON_COLLAPSED, ICON_DELETING,
-    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN,
+    ICON_ERROR, ICON_EXPANDED, ICON_IDLE, ICON_PINNED, ICON_STOPPED, ICON_UNKNOWN, ICON_UNREAD,
 };
 use crate::containers::image_update::ImageUpdate;
 use crate::session::config::{GroupByMode, SortOrder};
@@ -218,7 +219,7 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
         Status::Deleting => ICON_DELETING,
         Status::Creating => spinner_starting(&inst.created_at),
     };
-    if inst.is_archived() || inst.is_snoozed() {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() {
         ICON_STOPPED
     } else {
         icon
@@ -468,6 +469,18 @@ impl HomeView {
         update_status: Option<&str>,
         image_update: Option<&ImageUpdate>,
     ) {
+        // Start each frame with no footer buttons and no sidebar
+        // collapse/expand hit rects; the home-view render paths
+        // (`render_status_bar`, `render_list` / `render_collapsed_strip`)
+        // repopulate them. The takeover views (settings/diff/serve) return
+        // before those run, so clearing here keeps a stale rect from a prior
+        // home frame from swallowing a click on the diff/serve surface (the
+        // collapse handler runs ahead of `hit_diff`). The live-send banner
+        // likewise replaces the footer, leaving the list empty.
+        self.footer_buttons.clear();
+        self.collapse_button_area = Rect::default();
+        self.expand_strip_area = Rect::default();
+
         // Settings view takes over the whole screen
         if let Some(ref mut settings) = self.settings_view {
             self.divider_col = None;
@@ -539,20 +552,28 @@ impl HomeView {
         // stacking gives the preview the full width.
         let available_width = main_chunks[0].width;
         self.main_area_width = available_width;
-        // Collapsed sidebar (live mode only): hand the whole main area to
-        // the preview so the agent pane fills the terminal. The live-send
-        // resize loop then reflows the agent to the wider geometry. Reset
-        // on live-send exit, so the list always returns in the home view.
-        if self.live_send.is_some() && self.sidebar_collapsed {
+        // Collapsed sidebar: the list shrinks to a narrow click-to-expand
+        // strip on the left and the preview takes the rest of the width
+        // (in live mode the resize loop then reflows the agent pane). This
+        // path is width-independent: a collapsed list is narrow enough that
+        // re-imposing the stacked breakpoint would only waste space.
+        if self.sidebar_collapsed {
             self.divider_col = None;
-            // render_list is skipped, so its hit-test rects would otherwise
-            // keep last frame's values and a click in the now-preview area
-            // could resolve to an invisible list row (and switch the live
-            // target). Zero them so mouse hit-testing can't target the
-            // hidden sidebar.
+            let strip_width = responsive::COLLAPSED_STRIP_WIDTH.min(available_width);
+            let chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Length(strip_width), Constraint::Min(0)])
+                .split(main_chunks[0]);
+            // The full list isn't drawn, so its hit-test rects would
+            // otherwise keep last frame's values and a click in the now-
+            // preview area could resolve to an invisible list row (and
+            // switch the live target). Zero them so mouse hit-testing can't
+            // target the hidden sidebar; `render` already cleared the
+            // collapse button rect, and the strip sets its own.
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
-            self.render_preview(frame, main_chunks[0], theme);
+            self.render_collapsed_strip(frame, chunks[0], theme);
+            self.render_preview(frame, chunks[1], theme);
         } else if available_width < responsive::STACKED_BREAKPOINT {
             let main_height = main_chunks[0].height;
             let list_height = responsive::stacked_list_height(main_height);
@@ -660,6 +681,7 @@ impl HomeView {
             no_agents_dialog,
             changelog_dialog,
             telemetry_consent_dialog,
+            tips_dialog,
             info_dialog,
             snooze_duration_dialog,
             profile_picker_dialog,
@@ -667,6 +689,7 @@ impl HomeView {
             sort_picker_dialog,
             project_session_picker_dialog,
             projects_dialog,
+            plugin_manager_dialog,
             command_palette,
             tool_picker_dialog,
             send_message_dialog,
@@ -704,6 +727,47 @@ impl HomeView {
             ])
             .split(content_area);
         Block::default().borders(Borders::ALL).inner(panes[1])
+    }
+
+    /// Render the collapsed sidebar: a narrow bordered strip standing in
+    /// for the full list. The whole strip is the click target (stored in
+    /// `expand_strip_area`) and re-expands the sidebar. A `»` glyph hints
+    /// the expand direction; the session count sits below it so the strip
+    /// still conveys "there are N sessions here".
+    fn render_collapsed_strip(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        self.expand_strip_area = area;
+        let border_color = match self.view_mode {
+            ViewMode::Structured => theme.border,
+            ViewMode::Terminal | ViewMode::Tool(_) => theme.terminal_border,
+        };
+        // Drop the right border so the preview's left border is the single
+        // shared seam, matching the expanded list and DESIGN.md's
+        // "eliminate the double-border between list and preview" rule.
+        let block = Block::default()
+            .borders(Borders::TOP | Borders::LEFT | Borders::BOTTOM)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+        let mut lines = vec![
+            Line::from(Span::styled(
+                "\u{00BB}",
+                Style::default().fg(theme.hint).bold(),
+            )),
+            Line::from(""),
+        ];
+        // Session count stacked one digit per row, since the strip is a
+        // single cell wide.
+        for ch in self.instances().len().to_string().chars() {
+            lines.push(Line::from(Span::styled(
+                ch.to_string(),
+                Style::default().fg(theme.dimmed),
+            )));
+        }
+        frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), inner);
     }
 
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
@@ -753,6 +817,34 @@ impl HomeView {
         frame.render_widget(block, area);
 
         let visible_count = self.instances().len();
+        // Collapse affordance on the top-right border. Clicking it shrinks
+        // the list to the click-to-expand strip. Drawn as an overlay on the
+        // border (after the block) so its clickable rect is known exactly,
+        // and skipped on a list too narrow to spare the columns without
+        // colliding with the title (`render` already zeroed the rect, so the
+        // narrow case needs no else).
+        const COLLAPSE_LABEL: &str = " \u{00AB} ";
+        const COLLAPSE_LABEL_WIDTH: u16 = 3;
+        // Columns kept clear for the title that shares this top border row, so
+        // the collapse affordance only draws when it won't collide with it.
+        const COLLAPSE_LABEL_TITLE_RESERVE: u16 = 6;
+        if area.width > COLLAPSE_LABEL_WIDTH + COLLAPSE_LABEL_TITLE_RESERVE {
+            let btn_rect = Rect {
+                x: area.right() - COLLAPSE_LABEL_WIDTH,
+                y: area.y,
+                width: COLLAPSE_LABEL_WIDTH,
+                height: 1,
+            };
+            self.collapse_button_area = btn_rect;
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    COLLAPSE_LABEL,
+                    Style::default().fg(theme.hint).bold(),
+                )),
+                btn_rect,
+            );
+        }
+
         if visible_count == 0 && !self.has_any_groups_for_view() {
             let empty_text = vec![
                 Line::from(""),
@@ -899,12 +991,14 @@ impl HomeView {
             || self.no_agents_dialog.is_some()
             || self.changelog_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || self.info_dialog.is_some()
             || self.profile_picker_dialog.is_some()
             || self.group_picker_dialog.is_some()
             || self.sort_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
@@ -952,6 +1046,7 @@ impl HomeView {
                 // keyed by the header label.
                 let pinned = self.group_by == GroupByMode::Project
                     && !crate::session::is_within_archived_section(path)
+                    && !crate::session::is_within_trash_section(path)
                     && self.is_project_label_pinned(name);
                 let text = if pinned {
                     Cow::Owned(format!("{} ({}) {}", name, session_count, ICON_PINNED))
@@ -959,7 +1054,9 @@ impl HomeView {
                     Cow::Owned(format!("{} ({})", name, session_count))
                 };
                 let mut style = Style::default().fg(theme.group).bold();
-                if crate::session::is_within_archived_section(path) {
+                if crate::session::is_within_archived_section(path)
+                    || crate::session::is_within_trash_section(path)
+                {
                     // Synthetic Archived section header (and any
                     // project sub-folder rendered under it in Project
                     // mode): muted + italic + dim so it reads as a
@@ -1016,12 +1113,24 @@ impl HomeView {
                                 Status::Deleting => ICON_DELETING,
                                 Status::Creating => spinner_starting(&inst.created_at),
                             };
+                            // Unread paints only on resting rows
+                            // (Idle/Unknown): a live status (Running/Waiting/
+                            // Starting/...) supersedes it and keeps its own
+                            // color AND spinner. Auto-unread only ever lands
+                            // on Idle; a manual flag on a live row defers to
+                            // the live state. Archived/snoozed/urgent below
+                            // still override on top.
+                            let unread_resting = crate::session::unread_enabled()
+                                && inst.is_unread()
+                                && matches!(inst.status, Status::Idle | Status::Unknown);
                             let color = match inst.status {
                                 Status::Running => theme.running,
                                 Status::Waiting => theme.waiting,
+                                Status::Idle if unread_resting => theme.unread,
                                 Status::Idle => {
                                     theme.idle_color_at_age(idle_age, self.idle_decay_window)
                                 }
+                                Status::Unknown if unread_resting => theme.unread,
                                 Status::Unknown => theme.waiting,
                                 Status::Stopped => theme.dimmed,
                                 Status::Error => theme.error,
@@ -1030,9 +1139,18 @@ impl HomeView {
                                 Status::Creating => theme.accent,
                             };
                             let mut style = Style::default().fg(color);
-                            if inst.is_archived() {
-                                // Archived rows render with one uniform
-                                // muted glyph regardless of underlying
+                            if unread_resting {
+                                // Make unread unmistakable: a solid dot glyph
+                                // plus bold, on top of the `theme.unread`
+                                // color set above. A plain color swap read as
+                                // too subtle (#2088 review). Sink/urgent
+                                // states below still override icon + style.
+                                icon = ICON_UNREAD;
+                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                            }
+                            if inst.is_archived() || inst.is_trashed() {
+                                // Archived and trashed rows render with one
+                                // uniform muted glyph regardless of underlying
                                 // status. The pane is dead, so painting
                                 // the persisted Running/Waiting status
                                 // would be misleading. The Archived
@@ -1075,7 +1193,7 @@ impl HomeView {
                             // prefixes are Attention-mode-only so users
                             // in Newest / AZ / etc. don't see decoration
                             // for state they didn't opt into managing.
-                            let title_text = if inst.is_archived() {
+                            let title_text = if inst.is_archived() || inst.is_trashed() {
                                 Cow::Owned(inst.title.clone())
                             } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
@@ -1105,14 +1223,21 @@ impl HomeView {
                                     .map(|s| s.exists())
                                     .unwrap_or(false),
                             };
+                            let unread_overlay =
+                                crate::session::unread_enabled() && inst.is_unread();
                             let (mut icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
+                            } else if unread_overlay {
+                                (ICON_UNREAD, theme.unread)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
                             let mut style = Style::default().fg(color);
-                            if inst.is_archived() {
-                                // Archive lifecycle override mirrors the
+                            if unread_overlay && !terminal_running {
+                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                            }
+                            if inst.is_archived() || inst.is_trashed() {
+                                // Archive/trash lifecycle override mirrors the
                                 // Agent-view path: dim color, stopped
                                 // icon, no italic/dim modifier; the
                                 // Archived section header is the cue.
@@ -1134,7 +1259,7 @@ impl HomeView {
                                     .add_modifier(ratatui::style::Modifier::BOLD)
                                     .add_modifier(ratatui::style::Modifier::UNDERLINED);
                             }
-                            let title_text = if inst.is_archived() {
+                            let title_text = if inst.is_archived() || inst.is_trashed() {
                                 Cow::Owned(inst.title.clone())
                             } else if in_attention && inst.is_snoozed() {
                                 Cow::Owned(format!("z {}", inst.title))
@@ -1637,8 +1762,16 @@ impl HomeView {
                         .and_then(|inst| inst.tmux_session().ok())
                         .filter(|s| s.exists())
                     {
-                        session.resize_window(width, height);
-                        self.preview_pane_synced = Some(want);
+                        // Defer to an active size owner (a phone/desktop live
+                        // client, or this TUI's own live-send below). The
+                        // detached preview is a passive display, so it only
+                        // sizes a session nobody else is driving and never
+                        // claims the lock itself; leaving the dedup unset
+                        // retries once the owner disconnects.
+                        if !session.has_active_size_owner() {
+                            session.resize_window(width, height);
+                            self.preview_pane_synced = Some(want);
+                        }
                     }
                 }
             }
@@ -1653,12 +1786,12 @@ impl HomeView {
         }
 
         // Cold-start / fallback capture via the fork-based path
-        // (`Session::capture_pane_with_size` via the instance helper). The
+        // (`Session::capture_pane` via the instance helper). The
         // 250ms gate in `refresh_preview_cache_core` keeps this from forking
         // every frame; in steady state the worker above satisfies the render.
         //
         // Live vs. non-live failure semantics differ. In live mode an empty
-        // capture (which is what `Session::capture_pane_with_size` returns when
+        // capture (which is what `Session::capture_pane` returns when
         // the session is gone OR tmux had a transient hiccup) preserves the
         // last-known-good capture so the preview doesn't flash blank (the
         // kill-switch behavior introduced in #1501). The capture closure
@@ -1685,10 +1818,9 @@ impl HomeView {
                 // always overwrite, falling back to an empty body (the same
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
-                let fork_capture = s.get_instance(id).and_then(|inst| {
-                    inst.capture_output_with_size(capture_lines, width, height)
-                        .ok()
-                });
+                let fork_capture = s
+                    .get_instance(id)
+                    .and_then(|inst| inst.capture_output(capture_lines).ok());
                 if in_live {
                     match fork_capture {
                         Some(content) if !content.is_empty() => Some(content),
@@ -2012,7 +2144,16 @@ impl HomeView {
         // Tool / Terminal views show a different, independently-live pane (a tool
         // session can be running while the agent has exited), so the placeholder
         // must not hide that pane's output there.
+        // A trashed session's pane was also killed (on trash). Same calm
+        // placeholder treatment as archived, with a restore hint.
+        let selected_trashed = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .is_some_and(|inst| inst.is_trashed());
+
         let selected_stopped = !selected_archived
+            && !selected_trashed
             && matches!(self.view_mode, ViewMode::Structured)
             && self
                 .selected_session
@@ -2027,7 +2168,7 @@ impl HomeView {
         // refresh reads from it. Done once here, not per-branch, so the
         // creating / no-selection / archived / stopped paths also retarget or
         // tear it down (no live pane feeds `None` so the worker stops capturing).
-        let desired = if selected_archived || selected_stopped {
+        let desired = if selected_archived || selected_trashed || selected_stopped {
             None
         } else {
             self.displayed_pane_tmux_name()
@@ -2036,6 +2177,12 @@ impl HomeView {
 
         if selected_archived {
             self.render_archived_preview(frame, inner, theme);
+            self.paint_preview_selection(frame, theme);
+            return;
+        }
+
+        if selected_trashed {
+            self.render_trashed_preview(frame, inner, theme);
             self.paint_preview_selection(frame, theme);
             return;
         }
@@ -2324,14 +2471,20 @@ impl HomeView {
     ///
     /// Only fires while live-send is active and the preview is at the live
     /// tail (`preview_scroll_offset == 0`): over scrolled-back history the
-    /// live cursor would land on the wrong row. The capture worker only
-    /// publishes a cursor when the displayed pane IS the live-send target, so
-    /// a `Some` here already means "this pane is the one being driven."
+    /// live cursor would land on the wrong row. The capture worker now
+    /// publishes a cursor for every previewed pane (the wheel forward reads its
+    /// mode flags), so this gates on `live_send` to keep painting confined to
+    /// the driven pane, and on `position_reliable` (false while the pane
+    /// scrolled mid-capture) to avoid painting on a row the cursor no longer
+    /// indexes.
     fn live_preview_cursor_pos(&self) -> Option<Position> {
         if self.live_send.is_none() || self.preview_scroll_offset != 0 {
             return None;
         }
         let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        if !cursor.position_reliable {
+            return None;
+        }
         map_live_preview_cursor(self.preview_pane_area, self.preview_visible_rows, cursor)
     }
 
@@ -2560,6 +2713,61 @@ impl HomeView {
         frame.render_widget(para, area);
     }
 
+    /// Calm placeholder shown when the selected session is in the trash. Its
+    /// agent was stopped on trash but its transcript and workspace are kept;
+    /// it can be restored or permanently purged from here.
+    fn render_trashed_preview(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let title = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .map(|inst| inst.title.clone())
+            .unwrap_or_default();
+        let body = if title.is_empty() {
+            "This session is in the trash. Its agent was stopped; its transcript and workspace are kept.".to_string()
+        } else {
+            format!(
+                "\"{}\" is in the trash. Its agent was stopped; its transcript and workspace are kept.",
+                title
+            )
+        };
+        let restore_key = if self.strict_hotkeys { "Z" } else { "z" };
+        // The permanent-delete keybind is blocked in Terminal view (it routes
+        // to a "Cannot delete terminal" dialog), so only advertise it in
+        // Structured view. Restore works in either. See #2489.
+        let hint = if self.view_mode == ViewMode::Terminal {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(restore_key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restore.", Style::default().fg(theme.dimmed)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("Press ", Style::default().fg(theme.dimmed)),
+                Span::styled(restore_key, Style::default().fg(theme.hint).bold()),
+                Span::styled(" to restore, or ", Style::default().fg(theme.dimmed)),
+                Span::styled(
+                    if self.strict_hotkeys { "D" } else { "d" },
+                    Style::default().fg(theme.hint).bold(),
+                ),
+                Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
+            ])
+        };
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Trash",
+                Style::default().fg(theme.text).bold(),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
+            Line::from(""),
+            hint,
+        ];
+        let para = Paragraph::new(lines).alignment(Alignment::Center);
+        frame.render_widget(para, area);
+    }
+
     /// Calm placeholder shown when the selected session's pane is simply gone
     /// (the generic gone-error, no diagnostic detail). Replaces the red crash
     /// error with a "Stopped, enter to start" message; the row's real status
@@ -2604,7 +2812,11 @@ impl HomeView {
         frame.render_widget(para, area);
     }
 
-    fn render_status_bar(&self, frame: &mut Frame, area: Rect, theme: &Theme) {
+    fn render_status_bar(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        // Cleared each frame and only set when the badge is actually drawn, so
+        // a stale rect can't make a footer click open tips when the badge is
+        // hidden (live-send, nothing unseen, or no room).
+        self.tips_badge_rect = None;
         // Live-send banner takes over the status bar so the user has an
         // always-visible reminder that keystrokes are being relayed to
         // the pane (and how to get out). Distinct color + bold so it
@@ -2754,7 +2966,17 @@ impl HomeView {
         let mk_key =
             |key: &str| -> Vec<Span<'static>> { vec![Span::styled(key.to_string(), key_style)] };
 
-        let mut groups: Vec<(u8, Vec<Span<'static>>)> = Vec::new();
+        // Key a footer button synthesizes on click. The registry matches on
+        // the bare keycode (Shift implied by an uppercase char, Ctrl by the
+        // flag), so a plain char and a Ctrl char cover every footer chord.
+        let kc = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let kctrl = |c: char| Some(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+        let kenter = Some(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        // (priority, click-key, spans). `click-key` is `None` for the
+        // non-actionable status indicators (Serve / watching), which render
+        // but aren't clickable.
+        let mut groups: Vec<(u8, Option<KeyEvent>, Vec<Span<'static>>)> = Vec::new();
 
         // Serve indicator: shown only when the `aoe serve` daemon is live.
         // The TUI does not own the daemon, so we probe the PID file each
@@ -2770,6 +2992,7 @@ impl HomeView {
                 };
                 groups.push((
                     0,
+                    None,
                     vec![Span::styled(
                         label,
                         Style::default().fg(theme.running).bold(),
@@ -2786,6 +3009,7 @@ impl HomeView {
         if self.active_tui_count > 1 {
             groups.push((
                 0,
+                None,
                 vec![Span::styled(
                     format!(" \u{25C9} {} watching ", self.active_tui_count),
                     Style::default().fg(theme.accent).bold(),
@@ -2804,7 +3028,7 @@ impl HomeView {
                 let desc = format!("send {} buffered", buf.chars().count());
                 let mut spans = mk(key, &desc);
                 spans[1] = Span::styled(desc, Style::default().fg(theme.running).bold());
-                groups.push((0, spans));
+                groups.push((0, kc(if strict { 'M' } else { 'm' }), spans));
             }
         }
 
@@ -2824,29 +3048,45 @@ impl HomeView {
             // visual gap before the description — at most fonts the arrow
             // glyph fills its cell tightly and a single mk-internal space
             // looks too close to the desc.
-            groups.push((0, mk("↵ ", enter_action_text)));
+            groups.push((0, kenter, mk("↵ ", enter_action_text)));
         }
 
-        groups.push((2, mk(if strict { "T" } else { "t" }, "View")));
+        groups.push((
+            2,
+            kc(if strict { 'T' } else { 't' }),
+            mk(if strict { "T" } else { "t" }, "View"),
+        ));
         if matches!(self.view_mode, ViewMode::Tool(_)) {
-            groups.push((1, mk(";", "Back")));
+            groups.push((1, kc(';'), mk(";", "Back")));
         } else if !self.tool_configs.is_empty() {
-            groups.push((2, mk(";", "Tools")));
+            groups.push((2, kc(';'), mk(";", "Tools")));
         }
-        groups.push((3, mk(if strict { "^G" } else { "g" }, "Group")));
+        groups.push((
+            3,
+            if strict { kctrl('g') } else { kc('g') },
+            mk(if strict { "^G" } else { "g" }, "Group"),
+        ));
 
         // c: container/host toggle hint for sandboxed sessions in Terminal view
         if self.view_mode == ViewMode::Terminal {
             if let Some(id) = &self.selected_session {
                 if let Some(inst) = self.get_instance(id) {
                     if inst.is_sandboxed() {
-                        groups.push((4, mk(if strict { "C" } else { "c" }, "Mode")));
+                        groups.push((
+                            4,
+                            kc(if strict { 'C' } else { 'c' }),
+                            mk(if strict { "C" } else { "c" }, "Mode"),
+                        ));
                     }
                 }
             }
         }
 
-        groups.push((2, mk(if strict { "N" } else { "n" }, "New")));
+        groups.push((
+            2,
+            kc(if strict { 'N' } else { 'n' }),
+            mk(if strict { "N" } else { "n" }, "New"),
+        ));
 
         // Priority 1: user's core daily workflow (message / del).
         // These survive the greedy pack under narrow-pane widths (iPad
@@ -2854,10 +3094,18 @@ impl HomeView {
         // reaches for most often. Del stays at p3, less frequent,
         // OK to drop first.
         if self.selected_session.is_some() {
-            groups.push((1, mk(if strict { "M" } else { "m" }, "Msg")));
+            groups.push((
+                1,
+                kc(if strict { 'M' } else { 'm' }),
+                mk(if strict { "M" } else { "m" }, "Msg"),
+            ));
         }
         if !self.flat_items.is_empty() {
-            groups.push((3, mk(if strict { "D" } else { "d" }, "Del")));
+            groups.push((
+                3,
+                kc(if strict { 'D' } else { 'd' }),
+                mk(if strict { "D" } else { "d" }, "Del"),
+            ));
         }
         // Attention-workflow shortcuts (Archive / Fav / Snooze) only render
         // when the user is in Attention sort. They are only useful for
@@ -2865,27 +3113,71 @@ impl HomeView {
         // they just take footer space without changing what the user sees.
         if self.sort_order == SortOrder::Attention {
             if !self.flat_items.is_empty() {
-                groups.push((1, mk(if strict { "Z" } else { "z" }, "Archive")));
+                groups.push((
+                    1,
+                    kc(if strict { 'Z' } else { 'z' }),
+                    mk(if strict { "Z" } else { "z" }, "Archive"),
+                ));
             }
             if self.selected_session.is_some() {
-                groups.push((1, mk(if strict { "F" } else { "f" }, "Fav")));
-                groups.push((1, mk(if strict { "H" } else { "h" }, "Snooze")));
+                groups.push((
+                    1,
+                    kc(if strict { 'F' } else { 'f' }),
+                    mk(if strict { "F" } else { "f" }, "Fav"),
+                ));
+                groups.push((
+                    1,
+                    kc(if strict { 'H' } else { 'h' }),
+                    mk(if strict { "H" } else { "h" }, "Snooze"),
+                ));
             }
         }
 
-        groups.push((4, mk_key("/")));
-        groups.push((4, mk(if strict { "^D" } else { "D" }, "Diff")));
-        groups.push((1, mk("^K", "Cmds")));
-        groups.push((0, mk_key("?")));
+        groups.push((4, kc('/'), mk_key("/")));
+        groups.push((
+            4,
+            if strict { kctrl('d') } else { kc('D') },
+            mk(if strict { "^D" } else { "D" }, "Diff"),
+        ));
+        groups.push((1, kctrl('k'), mk("^K", "Cmds")));
+        groups.push((0, kc('?'), mk_key("?")));
 
         // Greedy pack by priority. Width of a group = sum of span char counts;
         // separator between kept groups adds 3 cols each (" · "). Reserve 1
         // col for the leading space margin.
+        // Display-cell width (not `chars().count()`) so the greedy pack and
+        // the click rects line up with the cells ratatui actually paints.
         let widths: Vec<usize> = groups
             .iter()
-            .map(|(_, g)| g.iter().map(|s| s.content.chars().count()).sum::<usize>())
+            .map(|(_, _, g)| g.iter().map(|s| s.width()).sum::<usize>())
             .collect();
-        let avail = (area.width as usize).saturating_sub(1);
+
+        // Tips badge: pinned to the bottom-right of the footer and clickable. It
+        // takes priority over the keybind hints, the greedy pack below reserves
+        // its width first, so on a thin terminal the hints drop rather than
+        // collide with it. Hidden when nothing is unseen / tips disabled
+        // (`tips_unseen` is zero then) or when even the badge can't fit.
+        // Hover highlight mirrors a session row, but the footer's own bg is
+        // already `theme.selection`, so hover uses the brighter
+        // `session_selection` to actually stand out.
+        let badge_bg = if self.tips_badge_hovered {
+            theme.session_selection
+        } else {
+            theme.selection
+        };
+        let badge_line = (self.tips_unseen > 0).then(|| {
+            Line::from(Span::styled(
+                format!(" \u{1f4a1} {} tips ", self.tips_unseen),
+                Style::default().fg(theme.accent).bold().bg(badge_bg),
+            ))
+        });
+        let badge_width = badge_line.as_ref().map(|l| l.width()).unwrap_or(0);
+        let badge_fits = badge_width > 0 && badge_width <= area.width as usize;
+        let badge_reserve = if badge_fits { badge_width + 1 } else { 0 };
+
+        let avail = (area.width as usize)
+            .saturating_sub(1)
+            .saturating_sub(badge_reserve);
 
         let mut order: Vec<usize> = (0..groups.len()).collect();
         order.sort_by_key(|&i| groups[i].0);
@@ -2902,21 +3194,73 @@ impl HomeView {
             }
         }
 
+        // Inverted-chip highlight for the button under the pointer, matching
+        // the LIVE chip's fg/bg swap so hover reads as "this is clickable".
+        let hover_style = Style::default()
+            .fg(theme.background)
+            .bg(theme.accent)
+            .bold();
+
         let mut spans: Vec<Span> = vec![Span::raw(" ")];
         let mut first = true;
-        for (i, (_, group)) in groups.into_iter().enumerate() {
+        // Column of the next span; starts past the leading space margin. Used
+        // to record each clickable button's hit rect as it's laid out.
+        let mut col = area.x.saturating_add(1);
+        for (i, (_, key, group)) in groups.into_iter().enumerate() {
             if !keep[i] {
                 continue;
             }
             if !first {
                 spans.push(Span::styled(" · ", sep_style));
+                col = col.saturating_add(3);
             }
-            spans.extend(group);
+            let width = widths[i] as u16;
+            match key {
+                Some(key) => {
+                    self.footer_buttons.push((
+                        Rect {
+                            x: col,
+                            y: area.y,
+                            width,
+                            height: area.height,
+                        },
+                        key,
+                    ));
+                    if self.footer_hover == Some(key) {
+                        for s in group {
+                            spans.push(Span::styled(s.content, hover_style));
+                        }
+                    } else {
+                        spans.extend(group);
+                    }
+                }
+                None => spans.extend(group),
+            }
+            col = col.saturating_add(width);
             first = false;
         }
 
         let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(theme.selection));
         frame.render_widget(status, area);
+
+        // Draw the badge over the reserved right edge and remember its rect so
+        // a click there opens the tips overlay.
+        if badge_fits {
+            if let Some(line) = badge_line {
+                let bw = badge_width as u16;
+                let rect = Rect {
+                    x: area.x + area.width.saturating_sub(bw),
+                    y: area.y,
+                    width: bw,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(line).style(Style::default().bg(badge_bg)),
+                    rect,
+                );
+                self.tips_badge_rect = Some(rect);
+            }
+        }
     }
 
     fn render_update_bar(
@@ -2929,6 +3273,10 @@ impl HomeView {
         image_update: Option<&ImageUpdate>,
     ) {
         let update_style = Style::default().fg(theme.waiting).bold();
+        // The Update key is `u` (`Ctrl+u` in strict mode); pull the label from
+        // the binding registry so this hint can't drift from the dispatcher.
+        let update_key =
+            super::bindings::label(super::bindings::ActionId::Update, self.strict_hotkeys);
         // Precedence (highest first): transient status, app update, then the
         // sandbox-image update. Only one banner shows at a time, so its keys
         // ([u]/[Ctrl+x]) are unambiguous; a lower-priority banner surfaces once
@@ -2936,12 +3284,15 @@ impl HomeView {
         let text = if let Some(s) = status {
             format!(" {s}  [Ctrl+x] dismiss")
         } else if let Some(info) = info {
+            // Reassure users (issue #2220) that updating is safe: it never
+            // tears down or interrupts running sessions. Kept after the keys so
+            // the action hints stay visible first on narrow terminals.
             format!(
-                " update available {} → {}  [u] update  [Ctrl+x] dismiss",
+                " update available {} → {}  [{update_key}] update  [Ctrl+x] dismiss  ·  running sessions stay safe",
                 info.current_version, info.latest_version
             )
         } else if image_update.is_some() {
-            " sandbox image update available  [u] pull  [Ctrl+x] dismiss".to_string()
+            format!(" sandbox image update available  [{update_key}] pull  [Ctrl+x] dismiss")
         } else {
             return;
         };
@@ -2968,6 +3319,12 @@ mod tests {
             y,
             visible,
             pane_height,
+            history_size: 0,
+            pane_width: 0,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
+            position_reliable: true,
         }
     }
 

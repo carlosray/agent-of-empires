@@ -647,6 +647,34 @@ last_seen_version = "{}"
             .expect("failed to run aoe CLI")
     }
 
+    /// Like [`Self::run_cli`], but writes `stdin` to the child before
+    /// collecting output. Used by the plugin-worker tests, which speak
+    /// ndjson JSON-RPC on stdio and exit on EOF.
+    pub fn run_cli_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        use std::io::Write;
+        let mut child = Command::new(&self.binary_path)
+            .args(args)
+            .env("HOME", self.home_dir.path())
+            .env("XDG_CONFIG_HOME", self.home_dir.path().join(".config"))
+            .env("PATH", self.env_path())
+            .env_remove("AGENT_OF_EMPIRES_DEBUG")
+            .env_remove("AOE_LOG_LEVEL")
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn aoe CLI");
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
+        // Dropping stdin closes the pipe; the worker exits on EOF.
+        child.wait_with_output().expect("collect aoe CLI output")
+    }
+
     /// Path to the isolated home directory for custom test setup.
     pub fn home_path(&self) -> &Path {
         self.home_dir.path()
@@ -657,6 +685,54 @@ last_seen_version = "{}"
         let p = self.home_dir.path().join("test-project");
         std::fs::create_dir_all(&p).expect("create project dir");
         p
+    }
+
+    /// Set `AOE_E2E_DEBUG=1` so the spawned TUI exports its
+    /// watcher-config-refresh counter to
+    /// `<app_dir>/.aoe_e2e_refresh_count` after every watcher-driven
+    /// `apply_config_to_state`. Tests that poll the counter via
+    /// `wait_for_watcher_config_refresh_above` must call this before
+    /// `spawn_tui`; the env var is read by the TUI process.
+    pub fn enable_e2e_debug_signals(&mut self) {
+        self.set_env("AOE_E2E_DEBUG", "1");
+    }
+
+    /// Read the current watcher-config-refresh counter exported by the
+    /// TUI. Returns 0 when the file is missing (TUI has not run any
+    /// watcher refresh yet, or `AOE_E2E_DEBUG` was not set on the
+    /// process).
+    pub fn read_watcher_config_refresh_count(&self) -> u64 {
+        let path = app_dir_in(self.home_dir.path()).join(".aoe_e2e_refresh_count");
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|c| c.trim().parse().ok())
+            .unwrap_or(0)
+    }
+
+    /// Poll the watcher-config-refresh counter until it exceeds
+    /// `baseline` or `timeout` elapses. Returns the new count on
+    /// success and panics on timeout. Tests must take the baseline
+    /// before triggering the config write so a subsequent
+    /// watcher-driven refresh is the only way the counter climbs
+    /// above it. Requires `enable_e2e_debug_signals` before
+    /// `spawn_tui`.
+    pub fn wait_for_watcher_config_refresh_above(&self, baseline: u64, timeout: Duration) -> u64 {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let current = self.read_watcher_config_refresh_count();
+            if current > baseline {
+                return current;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "timed out after {:?} waiting for watcher_config_refresh_count > {} (current = {}); \
+                     check that enable_e2e_debug_signals() was called before spawn_tui and that the watcher \
+                     subscription is wired",
+                    timeout, baseline, current
+                );
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     /// Check whether the tmux session is still alive.

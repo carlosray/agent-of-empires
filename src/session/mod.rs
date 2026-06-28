@@ -19,13 +19,17 @@ pub mod project_mcp;
 pub mod projects;
 pub(crate) mod recovery;
 pub mod repo_config;
+pub mod restart;
 pub mod scratch;
 pub(crate) mod serde_helpers;
 pub mod settings_schema;
+pub mod smart_rename;
 pub mod stop;
 mod storage;
 pub mod summary;
+pub(crate) mod sync;
 pub(crate) mod tool_session;
+pub mod trash;
 pub mod worktree_edit;
 
 pub use crate::sound::SoundConfig;
@@ -33,25 +37,48 @@ pub use crate::status_hooks::StatusHookConfig;
 pub(crate) use capture::is_valid_session_id;
 pub use config::{
     get_telemetry_settings, get_update_settings, load_config, save_config,
-    validate_snooze_duration, ClickAction, Config, ContainerRuntimeName, DefaultTerminalMode,
-    GroupByMode, LlmConfig, NewSessionAttachMode, RowTagMode, SandboxConfig, SessionConfig,
-    TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxConfig, TmuxMouseMode, TmuxStatusBarMode,
-    UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
+    validate_snooze_duration, CapabilityGrant, ClickAction, Config, ContainerRuntimeName,
+    DefaultTerminalMode, GroupByMode, LlmConfig, NewSessionAttachMode, PluginConfig, RowTagMode,
+    SandboxConfig, SessionConfig, TelemetryConfig, ThemeConfig, TmuxClipboardMode, TmuxConfig,
+    TmuxMouseMode, TmuxStatusBarMode, UpdatesConfig, VolumeIgnoresStrategy, WorktreeConfig,
 };
 pub(crate) use environment::user_shell;
 pub use environment::{validate_env_entries, validate_env_entry};
 pub use groups::{
-    append_archived_section, append_archived_section_by_project, archived_project_sub_path,
-    flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles,
-    is_archived_section_path, is_within_archived_section, Group, GroupTree, Item,
-    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH,
+    append_archived_section, append_archived_section_by_project, append_trash_section,
+    archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
+    flatten_tree_all_profiles, is_archived_section_path, is_trash_section_path,
+    is_within_archived_section, is_within_trash_section, Group, GroupTree, Item,
+    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME, TRASH_SECTION_PATH,
 };
 pub(crate) use instance::{persist_session_to_storage, ResumeIntent, SidWrite};
 pub use instance::{
-    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, StartOutcome,
-    Status, SummaryState, TerminalInfo, ToolSession, ToolSessionProbe, ToolSessionProbeState,
-    ToolSessionSummary, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, TMUX_SESSION_GONE_ERROR,
+    EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome, SandboxInfo, SessionBucket,
+    StartOutcome, Status, SummaryState, TerminalInfo, ToolSession, ToolSessionProbe,
+    ToolSessionProbeState, ToolSessionSummary, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo,
+    TMUX_SESSION_GONE_ERROR,
 };
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide cache of the `session.unread_indicator` toggle (default on).
+/// The TUI refreshes it via [`set_unread_enabled`] on startup and whenever
+/// config is re-applied, so a runtime settings change takes effect without a
+/// restart. Defaults to `true` so the feature is on out of the box before the
+/// first config apply. Read on the hot Attention-sort path, hence a plain
+/// atomic load rather than threading the flag through every sort helper.
+static UNREAD_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Whether the unread-session indicator feature is enabled.
+pub fn unread_enabled() -> bool {
+    UNREAD_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Update the cached unread-indicator flag from resolved config.
+pub fn set_unread_enabled(on: bool) {
+    UNREAD_ENABLED.store(on, Ordering::Relaxed);
+}
+
 pub use profile_config::{
     load_profile_config, merge_configs, resolve_config, resolve_config_or_warn,
     save_profile_config, validate_check_interval, validate_env_format, validate_memory_limit,
@@ -62,11 +89,14 @@ pub use recovery::HookTimeoutScope;
 pub use repo_config::{
     check_repo_trust, execute_hooks, execute_hooks_in_container, load_repo_config,
     merge_repo_config, profile_to_repo_config, repo_config_to_profile, resolve_config_with_repo,
-    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HooksConfig, RepoConfig,
-    RepoTrust, TrustSurface,
+    resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
+    RepoConfig, RepoTrust, TrustSurface,
 };
-pub(crate) use storage::atomic_write;
-pub use storage::{load_workspace_ordering, update_workspace_ordering, Storage, WorkspaceOrdering};
+pub(crate) use storage::{atomic_write, atomic_write_following_symlinks, resolve_symlink_chain};
+pub use storage::{
+    load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
+    update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,
+};
 
 use anyhow::Result;
 use std::fs;
@@ -304,6 +334,14 @@ pub fn get_profile_dir_path(profile: &str) -> Result<PathBuf> {
 }
 
 pub fn list_profiles() -> Result<Vec<String>> {
+    // Test-only failure injection: when set, the next call returns
+    // Err and the flag clears. Used by the file-watch regression test
+    // that locks the rewire-after-mutation error-handling path
+    // without requiring a platform-fragile permission denial.
+    #[cfg(test)]
+    if FAIL_NEXT_LIST_PROFILES.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        anyhow::bail!("list_profiles failure injected for test");
+    }
     let base = get_app_dir()?;
     let profiles_dir = base.join("profiles");
 
@@ -312,6 +350,32 @@ pub fn list_profiles() -> Result<Vec<String>> {
     }
 
     list_profile_names_in(&profiles_dir)
+}
+
+#[cfg(test)]
+pub(crate) static FAIL_NEXT_LIST_PROFILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// RAII guard for the `FAIL_NEXT_LIST_PROFILES` test seam. `new` sets
+/// the flag; `drop` clears it unconditionally so a panic between set
+/// and the next `list_profiles` call does not leak the seam into a
+/// subsequent test that picks up the stale `true` value.
+#[cfg(test)]
+pub(crate) struct FailNextListProfilesGuard;
+
+#[cfg(test)]
+impl FailNextListProfilesGuard {
+    pub(crate) fn new() -> Self {
+        FAIL_NEXT_LIST_PROFILES.store(true, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for FailNextListProfilesGuard {
+    fn drop(&mut self) {
+        FAIL_NEXT_LIST_PROFILES.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Enumerate profile directory names in `profiles_dir`, skipping symlinks.

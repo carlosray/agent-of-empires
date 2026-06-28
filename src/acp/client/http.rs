@@ -12,10 +12,12 @@ use reqwest::{header, StatusCode};
 use thiserror::Error;
 
 use super::discovery::DaemonEndpoint;
+use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::{
-    ApprovalDecisionWire, ContextPrimerResponse, FilesResponse, PromptRequest, ReplayResponse,
-    ResolveApprovalRequest, SwitchAgentRequest, SwitchAgentResponse,
+    ApprovalDecisionWire, FilesResponse, PromptRequest, ReplayResponse, ResolveApprovalRequest,
+    SwitchAgentRequest, SwitchAgentResponse,
 };
+use crate::plugin::ui_state::UiSnapshot;
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -73,10 +75,6 @@ impl HttpClient {
             .user_agent(concat!("aoe-acp-client/", env!("CARGO_PKG_VERSION")))
             .build()?;
         Ok(Self { http, endpoint })
-    }
-
-    pub fn endpoint(&self) -> &DaemonEndpoint {
-        &self.endpoint
     }
 
     /// `GET /api/sessions/{id}/acp/replay?since=N`. Unbounded fetch
@@ -163,21 +161,6 @@ impl HttpClient {
         })
     }
 
-    /// `GET /api/sessions/{id}/acp/context-primer?before_seq=N`.
-    pub async fn context_primer(
-        &self,
-        session_id: &str,
-        before_seq: u64,
-    ) -> Result<ContextPrimerResponse, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/acp/context-primer?before_seq={}",
-            self.endpoint.base_url, session_id, before_seq
-        );
-        let res = self.auth(self.http.get(&url)).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json::<ContextPrimerResponse>().await?)
-    }
-
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
     /// the composer's `@`-mention picker.
     pub async fn files(&self, session_id: &str) -> Result<FilesResponse, HttpError> {
@@ -220,6 +203,18 @@ impl HttpClient {
             crate::session::config::QueueDrainMode::parse(&about.acp_queue_drain_mode)
                 .unwrap_or_default(),
         )
+    }
+
+    /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
+    /// (host-rendered slots + notifications) the web dashboard polls; the
+    /// native structured view renders the TUI-applicable subset (#2402).
+    /// Global, not session-scoped, so a miss must not be classified as a
+    /// session-not-found.
+    pub async fn plugin_ui_state(&self) -> Result<UiSnapshot, HttpError> {
+        let url = format!("{}/api/plugins/ui-state", self.endpoint.base_url);
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_global_status(res).await?;
+        Ok(res.json::<UiSnapshot>().await?)
     }
 
     /// `POST /api/sessions/{id}/acp/cancel`.
@@ -271,6 +266,33 @@ impl HttpClient {
         );
         let body = ResolveApprovalRequest { decision };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let text = res.text().await.unwrap_or_default();
+        Err(classify_resolve_error(status, &text, nonce, session_id))
+    }
+
+    /// `POST /api/sessions/{id}/acp/elicitations/{nonce}`. The native TUI
+    /// only ever sends decline/cancel (the rich answer form is web-only),
+    /// but the body is the full `ElicitationResolution` so the same client
+    /// could submit answers.
+    pub async fn resolve_elicitation(
+        &self,
+        session_id: &str,
+        nonce: &str,
+        resolution: &ElicitationResolution,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/elicitations/{}",
+            self.endpoint.base_url, session_id, nonce
+        );
+        let res = self
+            .auth(self.http.post(&url))
+            .json(resolution)
+            .send()
+            .await?;
         let status = res.status();
         if status.is_success() {
             return Ok(());
@@ -334,6 +356,25 @@ async fn check_status(
     Err(classify_error(status, &body, session_id))
 }
 
+/// Status check for daemon-wide (non-session) endpoints. Like
+/// [`check_status`] but never mints `SessionNotFound`: a 404 here means the
+/// route is absent (e.g. an older daemon without the plugin UI endpoint),
+/// not a missing session, so it maps to a plain `Server` error.
+async fn check_global_status(res: reqwest::Response) -> Result<reqwest::Response, HttpError> {
+    let status = res.status();
+    if status.is_success() {
+        return Ok(res);
+    }
+    let body = res.text().await.unwrap_or_default();
+    match status {
+        StatusCode::UNAUTHORIZED => Err(HttpError::Unauthorized),
+        StatusCode::FORBIDDEN if body.contains("read-only") || body.contains("read_only") => {
+            Err(HttpError::ReadOnly)
+        }
+        _ => Err(HttpError::Server { status, body }),
+    }
+}
+
 /// Map a non-success daemon response onto a typed error. Split out from
 /// `check_status` so the status/body dispatch is unit-testable without a
 /// live `reqwest::Response`.
@@ -351,21 +392,23 @@ fn classify_error(status: StatusCode, body: &str, session_id: &str) -> HttpError
     }
 }
 
-/// Classify the response of an approval-resolve POST. Scoped to that
-/// endpoint (not the shared `check_status`, which replay/prompt/cancel use
-/// too) so only this path can mint `ApprovalGone`. A 404 whose body names
-/// *this* nonce means the approval already resolved server-side; anything
-/// else folds back into the generic classifier. See #1821.
+/// Classify the response of an approval- or elicitation-resolve POST.
+/// Scoped to those endpoints (not the shared `check_status`, which
+/// replay/prompt/cancel use too) so only this path can mint `ApprovalGone`.
+/// A 404 whose body names *this* nonce means the pending approval or
+/// elicitation already resolved server-side (a concurrent decision, a
+/// watchdog, or a torn-down request); the caller clears the card quietly
+/// rather than surfacing an error. Anything else folds back into the
+/// generic classifier. See #1821.
 fn classify_resolve_error(
     status: StatusCode,
     body: &str,
     nonce: &str,
     session_id: &str,
 ) -> HttpError {
-    if status == StatusCode::NOT_FOUND
-        && body.contains("no pending approval")
-        && body.contains(nonce)
-    {
+    let names_gone_target =
+        body.contains("no pending approval") || body.contains("no pending elicitation");
+    if status == StatusCode::NOT_FOUND && names_gone_target && body.contains(nonce) {
         HttpError::ApprovalGone
     } else {
         classify_error(status, body, session_id)
@@ -391,13 +434,13 @@ mod tests {
         // Smoke-check by reading endpoint back; full header inspection
         // requires a live request and lives in the integration tests
         // alongside the axum mock.
-        assert_eq!(client.endpoint().token.as_deref(), Some("tok"));
+        assert_eq!(client.endpoint.token.as_deref(), Some("tok"));
     }
 
     #[test]
     fn auth_skips_bearer_when_no_token() {
         let client = HttpClient::new(endpoint("http://127.0.0.1:8080", None)).unwrap();
-        assert!(client.endpoint().token.is_none());
+        assert!(client.endpoint.token.is_none());
     }
 
     // Regression test for #1525. The startup toast on a 401 from the
@@ -437,6 +480,16 @@ mod tests {
                 "s-1"
             ),
             HttpError::SessionNotFound(s) if s == "s-1"
+        ));
+        // A gone elicitation nonce is classified the same as a gone approval.
+        assert!(matches!(
+            classify_resolve_error(
+                StatusCode::NOT_FOUND,
+                "no pending elicitation with nonce abc-123",
+                "abc-123",
+                "s-1"
+            ),
+            HttpError::ApprovalGone
         ));
     }
 

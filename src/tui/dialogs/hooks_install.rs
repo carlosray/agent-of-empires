@@ -37,17 +37,22 @@ impl HooksInstallDialog {
                     .map(crate::session::profile_config::resolve_config_or_warn)
                     .map(|config| config.environment)
                     .unwrap_or_default();
-                if agent.name == "codex" {
-                    needs_codex_trust_note = true;
-                    settings_paths.push(
-                        crate::hooks::codex_config_path_display_for_host_environment(&host_env),
-                    );
-                } else {
-                    settings_paths.push(
-                        crate::hooks::agent_settings_path_display_for_host_environment(
-                            hook_cfg, &host_env,
-                        ),
-                    );
+                match hook_cfg.format {
+                    crate::agents::HookFormat::CodexJson => {
+                        needs_codex_trust_note = true;
+                        settings_paths.push(
+                            crate::hooks::codex_hooks_json_path_display_for_host_environment(
+                                &host_env,
+                            ),
+                        );
+                    }
+                    crate::agents::HookFormat::JsonSettings => {
+                        settings_paths.push(
+                            crate::hooks::agent_settings_path_display_for_host_environment(
+                                hook_cfg, &host_env,
+                            ),
+                        );
+                    }
                 }
                 for event in hook_cfg.events {
                     let label = match event.status {
@@ -157,9 +162,14 @@ impl HooksInstallDialog {
             "Each hook runs:",
             Style::default().bold(),
         )));
-        lines.push(Line::from(
-            "  printf {status} > /tmp/aoe-hooks/$AOE_INSTANCE_ID/status",
-        ));
+        // The euid in the displayed path matches the runtime path baked into
+        // the hook command and is already exposed via `id -u` and `ps`. The
+        // alternative (a placeholder) would mislead users about what is
+        // actually installed.
+        lines.push(Line::from(format!(
+            "  printf {{status}} > {}/$AOE_INSTANCE_ID/status",
+            crate::hooks::hook_base_path().display()
+        )));
 
         lines.push(Line::from(""));
         lines.push(Line::from(
@@ -435,12 +445,19 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.contains("/tmp/aoe-hooks/$AOE_INSTANCE_ID/status"),
-            "example command must reference the real env var: {text}"
+            text.contains(&format!(
+                "{}/$AOE_INSTANCE_ID/status",
+                crate::hooks::hook_base_path().display()
+            )),
+            "example command must reference the per-user (issue #1844) path: {text}"
         );
         assert!(
             !text.contains("/tmp/aoe-hooks/$ID/"),
             "example command must not use the bogus $ID placeholder: {text}"
+        );
+        assert!(
+            !text.contains("/tmp/aoe-hooks/$AOE_INSTANCE_ID/status"),
+            "example must not use the legacy multi-tenant-vulnerable path: {text}"
         );
     }
 
@@ -467,8 +484,8 @@ mod tests {
             .map(|l| l.to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains(".codex/config.toml"));
-        assert!(!text.contains(".codex/hooks.json"));
+        assert!(text.contains(".codex/hooks.json"));
+        assert!(!text.contains(".codex/config.toml"));
         assert!(text.contains("trust these hooks in /hooks"));
         assert!(text.contains("pane-based status detection"));
     }
@@ -482,8 +499,8 @@ mod tests {
         let dialog = HooksInstallDialog::new("codex");
         let text = content_text(&dialog);
 
-        assert!(text.contains(&tmp.path().join("config.toml").display().to_string()));
-        assert!(!text.contains(".codex/hooks.json"));
+        assert!(text.contains(&tmp.path().join("hooks.json").display().to_string()));
+        assert!(!text.contains(&tmp.path().join("config.toml").display().to_string()));
     }
 
     #[test]
@@ -506,8 +523,8 @@ mod tests {
         let dialog = HooksInstallDialog::new_for_profile("codex", Some("codex-profile"));
         let text = content_text(&dialog);
 
-        assert!(text.contains(&codex_home.join("config.toml").display().to_string()));
-        assert!(!text.contains(".codex/hooks.json"));
+        assert!(text.contains(&codex_home.join("hooks.json").display().to_string()));
+        assert!(!text.contains(&codex_home.join("config.toml").display().to_string()));
     }
 
     #[test]

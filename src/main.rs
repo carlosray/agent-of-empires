@@ -5,7 +5,7 @@ use agent_of_empires::logging::{self, LogConfig, ProcessContext, SubscriberTarge
 use agent_of_empires::migrations;
 use agent_of_empires::tui;
 use anyhow::Result;
-use clap::{CommandFactory, Parser};
+use clap::{CommandFactory, FromArgMatches, Parser};
 use clap_complete::generate;
 
 /// Did the user invoke `aoe serve`? Feature-gated because `Commands::Serve`
@@ -40,7 +40,34 @@ fn is_serve_daemon_child(_cli: &Cli) -> bool {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    // Hidden internal helper for the `AOE_VT_LIVE` live-preview path (default
+    // on): `aoe __vt-pipe <socket>` forwards a tmux pipe-pane stream to a unix
+    // socket. Handled before clap so it never appears on the CLI/docs surface.
+    {
+        let mut a = std::env::args();
+        let _ = a.next();
+        if a.next().as_deref() == Some("__vt-pipe") {
+            let sock = a.next().unwrap_or_default();
+            return agent_of_empires::tui::run_vt_pipe(&sock).map_err(Into::into);
+        }
+    }
+
+    // Parse the core clap tree first. On success (every valid core command,
+    // including the app-data-free ones like completion/init/agents) this never
+    // touches the plugin registry. Only an error, --help/--version, or an
+    // unknown subcommand falls through to the augmented tree, which grafts
+    // active plugins' commands (loading the registry); there a grafted plugin
+    // command is dispatched to the plugin handler, and core wins name conflicts.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(_) => {
+            let matches = cli::graft::augmented_command().get_matches();
+            match Cli::from_arg_matches(&matches) {
+                Ok(cli) => cli,
+                Err(_) => return cli::graft::dispatch_plugin_command(&matches),
+            }
+        }
+    };
 
     // If the user passed --daemon-url, mirror the value into the env
     // var so the acp::client::discovery layer (used by both the
@@ -255,6 +282,7 @@ async fn main() -> Result<()> {
                 ThemeCommands::Dir => cli::theme::run_dir(),
             };
         }
+        Some(Commands::Settings { command }) => return cli::settings::run(command),
         Some(Commands::Telemetry { command }) => return cli::telemetry::run(command),
         Some(Commands::Mcp { command }) => {
             let profile = cli.profile.clone().unwrap_or_default();
@@ -262,6 +290,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Uninstall(args)) => return cli::uninstall::run(args).await,
         Some(Commands::Update(args)) => return cli::update::run(args).await,
+        // Pure redirect; needs no app data, so it must short-circuit before
+        // config/migration prework that can fail in constrained environments.
+        Some(Commands::Stop { .. }) => return cli::killall::stop_trap(),
         _ => {}
     }
 
@@ -307,8 +338,10 @@ async fn main() -> Result<()> {
         Some(Commands::Remove(args)) => cli::remove::run(&profile, args).await,
         Some(Commands::Send(args)) => cli::send::run(&profile, args).await,
         Some(Commands::Status(args)) => cli::status::run(&profile, args).await,
+        Some(Commands::Killall(args)) => cli::killall::run(args).await,
         Some(Commands::Session { command }) => cli::session::run(&profile, command).await,
         Some(Commands::Group { command }) => cli::group::run(&profile, command).await,
+        Some(Commands::Plugin { command }) => cli::plugin::run(command).await,
         Some(Commands::Profile { command }) => cli::profile::run(command).await,
         Some(Commands::Project { command }) => {
             cli::project::run(&profile, profile_explicit, command).await

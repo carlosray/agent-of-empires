@@ -9,12 +9,13 @@ pub mod acp_reconciler;
 pub mod acp_ws;
 pub mod api;
 pub mod auth;
+pub mod live_ws;
 pub mod login;
+mod pane;
 pub mod push;
 pub mod push_send;
 pub mod rate_limit;
 pub mod tunnel;
-pub mod ws;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -294,6 +295,17 @@ pub struct AppState {
     /// first use and live for the lifetime of the process — there are only
     /// as many as the user has sessions.
     pub instance_locks: RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Session ids with an in-flight smart-rename one-shot, so a burst of rapid
+    /// first prompts cannot spawn concurrent title generators for the same
+    /// session. Synchronous mutex: critical sections are tiny and never span an
+    /// `await`. See `session::smart_rename`.
+    pub smart_rename_inflight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Session ids that have already had a smart-rename one-shot attempt this
+    /// process lifetime (success or failure). A failed or unusable first try
+    /// leaves the name default, so without this every later prompt would
+    /// respawn a one-shot agent; one attempt per session bounds that cost and
+    /// clears the `pending` sidebar chip once an attempt has run.
+    pub smart_rename_attempted: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Suppression set for the startup-recovery cascade. While an entry is
     /// present and younger than `recovery::RECENTLY_RESTARTED_TTL`, the
     /// `status_poll_loop` skips `update_status_with_metadata` for that
@@ -356,18 +368,14 @@ pub struct AppState {
     #[cfg(feature = "serve")]
     pub acp_supervisor:
         Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
-    /// Per-tmux-session primary WebSocket client. Maps tmux session name
-    /// to the client ID that most recently sent keyboard input. Only the
-    /// primary client's resize messages are applied to its PTY, preventing
-    /// multiple browser viewports from fighting over the tmux window size.
-    pub session_primaries: Arc<RwLock<std::collections::HashMap<String, String>>>,
-    /// Per-tmux-session refcount of clients currently asking the pane's
-    /// process tree to be paused (SIGSTOP). Incremented by `pause_output`,
-    /// decremented by `resume_output` and on WebSocket disconnect. The
-    /// pane's process is SIGSTOP-ed on 0→N transitions and SIGCONT-ed on
-    /// N→0, so two mobile clients scrolling concurrently don't have one's
-    /// `resume_output` un-pause the other's scrollback read.
-    pub session_pause_counts: Arc<tokio::sync::Mutex<std::collections::HashMap<String, u32>>>,
+    /// The Tier 1 plugin worker host. `None` in test harnesses that do not
+    /// stand up a host; `Some` in a live daemon.
+    #[cfg(feature = "serve")]
+    pub plugin_host: Option<Arc<crate::plugin::host::PluginHost>>,
+    /// Tracks in-flight web plugin install / update / uninstall jobs so the
+    /// dashboard can tail their host-side log. In-memory; see
+    /// `api::plugins::PluginJobRegistry`.
+    pub plugin_jobs: Arc<crate::server::api::plugins::PluginJobRegistry>,
     /// Epoch-millis timestamp of the most recent authenticated API request.
     /// Updated by auth middleware on every successful auth. The push consumer
     /// checks this to suppress notifications when someone is actively using
@@ -649,6 +657,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         token_grace,
     ));
     let config = crate::session::profile_config::resolve_config_or_warn(profile);
+    // Feed the unread-feature gate from this daemon's resolved config. Like
+    // `push_enabled`, this is read once at startup; a config change needs a
+    // restart to take effect. The TUI process maintains its own copy.
+    crate::session::set_unread_enabled(config.session.unread_indicator);
 
     // Login sessions persist across daemon restarts by default (#1235) so
     // signed-in devices are not re-prompted for the passphrase on every
@@ -743,6 +755,31 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         // silently drop it.
         supervisor.hydrate_seqs(acp_event_store.all_session_seqs());
         supervisor
+    };
+    // The Tier 1 plugin worker host. Opening it (the plugin event-bus database,
+    // the worker log dir) is cheap and side-effect-free until workers launch,
+    // which happens after the daemon is up. A failure here is logged, not fatal:
+    // the daemon serves fine without plugin workers.
+    // The host API includes mutating session.meta.set/cas, so a read-only
+    // daemon must not run plugin workers at all: gate the host on !read_only.
+    #[cfg(feature = "serve")]
+    let plugin_host = if read_only {
+        tracing::info!(target: "plugin.host", "plugin host disabled in read-only serve mode");
+        None
+    } else {
+        match crate::session::get_app_dir() {
+            Ok(app_dir) => match crate::plugin::host::PluginHost::new(&app_dir, profile) {
+                Ok(host) => Some(host),
+                Err(e) => {
+                    tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(target: "plugin.host", "plugin host disabled: {e:#}");
+                None
+            }
+        }
     };
 
     // Telemetry (opt-in, no-op otherwise): announce the serve surface on boot.
@@ -954,6 +991,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         auth_mode,
         serve_mode,
         instance_locks: RwLock::new(std::collections::HashMap::new()),
+        smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+        smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -964,8 +1003,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         }),
         remote_owner_cache: RwLock::new(std::collections::HashMap::new()),
         changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
-        session_primaries: Arc::new(RwLock::new(std::collections::HashMap::new())),
-        session_pause_counts: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
         status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
         #[cfg(feature = "serve")]
         acp_events_tx: acp_events_tx.clone(),
@@ -973,6 +1010,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_event_store: acp_event_store.clone(),
         #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
+        #[cfg(feature = "serve")]
+        plugin_host: plugin_host.clone(),
+        plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
@@ -1038,6 +1078,35 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     tokio::select! {
                         _ = interval.tick() => {
                             crate::session::recovery::gc_recently_restarted(&gc_map);
+                        }
+                        _ = shutdown.cancelled() => break,
+                    }
+                }
+            },
+        );
+    }
+
+    // Trash retention sweep: auto-purge trashed sessions past their
+    // retention window. First tick fires immediately (startup sweep), then
+    // hourly. The daemon is the sole enforcer so there is no multi-process
+    // purge race; without a daemon, expired trash is purged on the next
+    // daemon start or by an explicit manual purge. Skipped entirely in
+    // read-only mode: a read-only daemon must not permanently delete
+    // sessions in the background, since that bypasses every handler's
+    // read-only guard. See #2489.
+    if !state.read_only {
+        let sweep_state = state.clone();
+        let shutdown = state.shutdown.clone();
+        crate::task_util::spawn_supervised(
+            "server.trash_retention_sweep",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            crate::server::api::purge_expired_trash(&sweep_state).await;
                         }
                         _ = shutdown.cancelled() => break,
                     }
@@ -1142,6 +1211,28 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // dwell + cooldown, sends pushes. No-op when push_state is None
     // (feature disabled via web.notifications_enabled=false).
     push::spawn_consumer(state.clone());
+
+    // Launch plugin workers for every active plugin that declares a runtime.
+    // Non-blocking: each worker runs in its own supervised task. A daemon with
+    // no community plugin workers (the common case) does nothing here.
+    #[cfg(feature = "serve")]
+    if let Some(host) = state.plugin_host.clone() {
+        host.start(&crate::plugin::registry()).await;
+    }
+
+    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
+    // non-blocking so daemon startup never waits on git/network; freshly applied
+    // updates are picked up on the next daemon restart. The plugin host (when
+    // running) is passed as the notifier so a consent-needed skip surfaces as a
+    // dashboard notification, not just a log line.
+    let update_notifier = state
+        .plugin_host
+        .clone()
+        .map(|h| h as std::sync::Arc<dyn crate::plugin::auto_update::UpdateNotifier>);
+    crate::plugin::auto_update::spawn_if_enabled(
+        &crate::session::Config::load_or_warn(),
+        update_notifier,
+    );
 
     rate_limiter.spawn_cleanup_task(state.shutdown.clone());
     login_manager.spawn_cleanup_task(state.shutdown.clone());
@@ -1293,6 +1384,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             tracing::info!(target: "serve.shutdown", "received ctrl-c, shutting down");
         }
         shutdown_state.shutdown.cancel();
+        // Reap plugin workers before the force-exit deadline so no worker tree
+        // is left behind when the daemon stops.
+        #[cfg(feature = "serve")]
+        if let Some(host) = shutdown_state.plugin_host.clone() {
+            host.shutdown().await;
+        }
         tokio::spawn(async {
             tokio::time::sleep(SHUTDOWN_GRACE).await;
             tracing::warn!(
@@ -1346,6 +1443,10 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions",
             get(api::list_sessions).post(api::create_session),
         )
+        // Static segment; registered before /api/sessions/{id} so the
+        // literal "search" never resolves as a session id. See #2515.
+        .route("/api/sessions/search", get(api::search_sessions))
+        .route("/api/recent-projects", get(api::get_recent_projects))
         .route(
             "/api/workspace-ordering",
             put(api::update_workspace_ordering),
@@ -1392,7 +1493,22 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/snooze",
             patch(api::update_session_snooze),
         )
-        .route("/api/sessions/{id}/terminal", post(api::ensure_terminal))
+        .route("/api/sessions/{id}/trash", post(api::trash_session))
+        .route("/api/sessions/{id}/restore", post(api::restore_session))
+        .route(
+            "/api/sessions/{id}/unread",
+            patch(api::update_session_unread),
+        )
+        .route("/api/sessions/{id}/stop", post(api::stop_session))
+        .route(
+            "/api/sessions/{id}/smart-rename",
+            post(api::force_smart_rename),
+        )
+        .route("/api/sessions/{id}/start", post(api::start_session))
+        .route(
+            "/api/sessions/{id}/terminal",
+            post(api::ensure_terminal).delete(api::kill_terminal),
+        )
         .route(
             "/api/sessions/{id}/container-terminal",
             post(api::ensure_container_terminal),
@@ -1431,9 +1547,50 @@ fn build_router(state: Arc<AppState>) -> Router {
             get(api::get_settings).patch(api::update_settings),
         )
         .route("/api/settings/schema", get(api::get_settings_schema))
+        .route("/api/settings/resolved", get(api::get_settings_resolved))
+        .route("/api/tips", get(api::get_tips))
+        .route("/api/tips/show", post(api::set_show_tips))
+        .route("/api/app-state/tip-seen", post(api::mark_tip_seen))
+        // Plugin management. The enable/disable toggle gates on read-only +
+        // elevation inside the handler.
+        .route("/api/plugins", get(api::list_plugins))
+        .route("/api/plugins/commands", get(api::plugin_commands))
+        .route("/api/plugins/ui-state", get(api::plugin_ui_state))
+        .route("/api/plugins/updates", get(api::plugin_updates))
+        .route("/api/plugins/discover", get(api::plugin_discover))
+        .route("/api/plugins/details", get(api::plugin_details))
+        .route("/api/plugins/{id}/enabled", post(api::set_plugin_enabled))
+        .route("/api/plugins/{id}/action", post(api::invoke_plugin_action))
+        .route(
+            "/api/plugins/install/preview",
+            post(api::preview_plugin_install),
+        )
+        .route("/api/plugins/install", post(api::start_plugin_install))
+        .route(
+            "/api/plugins/{id}/uninstall",
+            post(api::start_plugin_uninstall),
+        )
+        .route("/api/plugins/jobs/{job_id}", get(api::plugin_job_status))
+        .route(
+            "/api/plugins/{id}/update/preview",
+            get(api::plugin_update_preview),
+        )
+        .route(
+            "/api/plugins/{id}/update/apply",
+            post(api::apply_plugin_update),
+        )
+        .route(
+            "/api/plugins/{id}/update/dismiss",
+            post(api::dismiss_plugin_update),
+        )
         .route(
             "/api/app-state/web-tour-seen",
             post(api::mark_web_tour_seen),
+        )
+        .route("/api/app-state/dismiss-update", post(api::dismiss_update))
+        .route(
+            "/api/app-state/web-ui-state",
+            get(api::get_web_ui_state).patch(api::patch_web_ui_state),
         )
         .route(
             "/api/app-state/volume-ignores-globs-acknowledged",
@@ -1493,18 +1650,26 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/telemetry/structured-interaction",
             post(api::post_telemetry_structured_interaction),
         )
-        // Terminal WebSockets
-        .route("/sessions/{id}/ws", get(ws::terminal_ws))
-        .route("/sessions/{id}/terminal/ws", get(ws::paired_terminal_ws))
+        // Terminal WebSockets (capture-streaming live view; the agent pane and
+        // the paired host/container shells). The xterm PTY relay was removed.
+        .route("/sessions/{id}/live-ws", get(live_ws::live_terminal_ws))
         .route(
-            "/sessions/{id}/container-terminal/ws",
-            get(ws::container_terminal_ws),
+            "/sessions/{id}/terminal/live-ws",
+            get(live_ws::live_paired_terminal_ws),
+        )
+        .route(
+            "/sessions/{id}/container-terminal/live-ws",
+            get(live_ws::live_container_terminal_ws),
         );
 
     #[cfg(feature = "serve")]
     let app = app
         .route("/sessions/{id}/acp/ws", get(acp_ws::acp_ws))
         .route("/api/sessions/{id}/acp/spawn", post(api::spawn_acp))
+        .route(
+            "/api/sessions/{id}/acp/install-agent",
+            post(api::install_agent),
+        )
         .route("/api/sessions/{id}/acp", delete(api::shutdown_acp))
         .route(
             "/api/sessions/{id}/acp/switch-agent",
@@ -1554,7 +1719,12 @@ fn build_router(state: Arc<AppState>) -> Router {
             "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
         )
-        .route("/api/acp/agents", get(api::list_acp_agents));
+        .route(
+            "/api/sessions/{id}/acp/elicitations/{nonce}",
+            post(api::resolve_elicitation),
+        )
+        .route("/api/acp/agents", get(api::list_acp_agents))
+        .route("/api/claude-sessions", get(api::list_claude_sessions));
 
     app
         // Static assets (Vite build output: assets/, manifest.json, sw.js, icons)
@@ -1638,10 +1808,12 @@ async fn http_request_span(
 ///   runtime (terminal font-size updates) and Tailwind v4 emits inline
 ///   `<style>` blocks in dev. Blocking inline styles breaks xterm.js's
 ///   rendered viewport.
-/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com`:
+/// - `img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com`:
 ///   repo-owner avatars are loaded from `github.com/{user}.png` which 302s
 ///   to `avatars.githubusercontent.com`; CSP checks both URLs across the
 ///   redirect, so both hosts must be allowed. `data:` covers inline icons.
+///   `raw.githubusercontent.com` serves plugin screenshots resolved by the
+///   plugin detail endpoint (#2484).
 /// - `font-src 'self'`: Geist fonts are bundled under /fonts/.
 /// - `connect-src 'self' ws: wss:`: REST + PTY WebSocket to same origin.
 /// - `frame-ancestors 'none'`: CSP-native equivalent of X-Frame-Options.
@@ -1650,7 +1822,7 @@ async fn http_request_span(
 const CSP: &str = "default-src 'self'; \
     script-src 'self' 'wasm-unsafe-eval'; \
     style-src 'self' 'unsafe-inline'; \
-    img-src 'self' data: https://github.com https://avatars.githubusercontent.com; \
+    img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com; \
     font-src 'self'; \
     connect-src 'self' ws: wss:; \
     frame-ancestors 'none'; \
@@ -2637,7 +2809,6 @@ pub struct StructuredTelemetryCounters {
     pub approvals_allow_always: std::sync::atomic::AtomicU32,
     pub approvals_deny: std::sync::atomic::AtomicU32,
     pub agent_switches: std::sync::atomic::AtomicU32,
-    pub view_toggles: std::sync::atomic::AtomicU32,
     pub plan_mode_seen: std::sync::atomic::AtomicU32,
     pub prompts_queued: std::sync::atomic::AtomicU32,
 }
@@ -2663,7 +2834,6 @@ struct ReportedAcpCounts {
     approvals_allow_always: u32,
     approvals_deny: u32,
     agent_switches: u32,
-    view_toggles: u32,
     plan_mode: u32,
     prompts_queued: u32,
 }
@@ -2694,7 +2864,6 @@ async fn build_serve_snapshot(
         approvals_allow_always: c.approvals_allow_always.load(Ordering::Relaxed),
         approvals_deny: c.approvals_deny.load(Ordering::Relaxed),
         agent_switches: c.agent_switches.load(Ordering::Relaxed),
-        view_toggles: c.view_toggles.load(Ordering::Relaxed),
         plan_mode: c.plan_mode_seen.load(Ordering::Relaxed),
         prompts_queued: c.prompts_queued.load(Ordering::Relaxed),
     };
@@ -2703,7 +2872,6 @@ async fn build_serve_snapshot(
         approvals_allow_always: reported_acp.approvals_allow_always,
         approvals_deny: reported_acp.approvals_deny,
         agent_switches: reported_acp.agent_switches,
-        view_toggles: reported_acp.view_toggles,
         plan_mode_seen: reported_acp.plan_mode > 0,
         prompts_queued: reported_acp.prompts_queued,
     };
@@ -2762,7 +2930,6 @@ fn clear_reported_serve_signals(state: &AppState, outcome: crate::telemetry::Sen
     decrement_reported_count(&c.approvals_allow_always, rc.approvals_allow_always);
     decrement_reported_count(&c.approvals_deny, rc.approvals_deny);
     decrement_reported_count(&c.agent_switches, rc.agent_switches);
-    decrement_reported_count(&c.view_toggles, rc.view_toggles);
     decrement_reported_count(&c.plan_mode_seen, rc.plan_mode);
     decrement_reported_count(&c.prompts_queued, rc.prompts_queued);
 }
@@ -2796,7 +2963,11 @@ fn decrement_reported_count(counter: &std::sync::atomic::AtomicU32, reported: u3
 /// leaves the session module free of any broadcast-channel dependency
 /// and keeps TUI/CLI callers unchanged.
 async fn status_poll_loop(state: Arc<AppState>) {
+    // `Delay` re-arms the next tick `period` after the current one returns,
+    // so a stall (suspend, scheduler stall, flock contention) does not drain
+    // queued ticks and collapse the 2s cooldown the per-tick work expects.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     #[cfg(feature = "serve")]
     let mut attempted_acp_spawns: std::collections::HashSet<String> =
         std::collections::HashSet::new();
@@ -2847,7 +3018,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
         })
         .await;
 
-        if let Ok(instances) = updated {
+        if let Ok(mut instances) = updated {
             // Diff BEFORE the helper: status_tx must observe the raw
             // post-suppression, post-tmux-scrape values, never the acp
             // overlay applied by the helper.
@@ -2865,7 +3036,93 @@ async fn status_poll_loop(state: Arc<AppState>) {
                     }
                 }
             }
+
+            // Auto-mark unread on a finished turn (Running -> Idle), the same
+            // transition the TUI marks on. This is what lets a web-only user
+            // (no TUI process polling) accrue the indicator. There's no
+            // server-side "is being viewed" exemption: the client suppresses
+            // the chip on the session it is actively viewing and clears the
+            // auto marker on open. Mutate the in-memory rows we're about to
+            // install AND persist per profile so the next disk reload keeps it.
+            if crate::session::unread_enabled() {
+                let mut newly_idle: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for inst in &mut instances {
+                    let finished_turn = prev.get(&inst.id) == Some(&Status::Running)
+                        && inst.status == Status::Idle
+                        && !inst.unread;
+                    if finished_turn {
+                        inst.mark_unread();
+                        newly_idle
+                            .entry(inst.source_profile.clone())
+                            .or_default()
+                            .push(inst.id.clone());
+                    }
+                }
+                for (profile, ids) in newly_idle {
+                    let _ = api::persist_session_update(
+                        profile,
+                        "auto-unread",
+                        state.file_watch.clone(),
+                        move |insts| {
+                            for inst in insts.iter_mut() {
+                                if ids.contains(&inst.id) {
+                                    inst.mark_unread();
+                                }
+                            }
+                        },
+                    )
+                    .await;
+                }
+            }
+
             reload_state_instances_from_disk(&state, instances, StatusSource::TmuxApplied).await;
+
+            // Drain poller observations into sessions.json so daemon-only
+            // sessions (no attached TUI) persist post-`/clear` sids (#2291).
+            // Snapshot + spawn_blocking + reapply, never holding AppState
+            // across the flock or tmux exec, per storage.rs:46.
+            let snapshot = state.instances.read().await.clone();
+            let drain_state = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                let mut snapshot = snapshot;
+                let outcome = crate::session::sync::drain_and_persist_session_ids(
+                    &mut snapshot,
+                    &drain_state.file_watch,
+                );
+                (outcome, snapshot)
+            })
+            .await
+            {
+                Ok((outcome, mutated)) if outcome.touched() => {
+                    // Reapply only for ids the helper actually touched, so a
+                    // peer that wrote `agent_session_id` (e.g. the restart-
+                    // completion path) on the live state during the
+                    // spawn_blocking window is not silently reverted.
+                    let touched: std::collections::HashSet<&str> = outcome
+                        .applied
+                        .iter()
+                        .chain(outcome.rolled_back.iter())
+                        .map(String::as_str)
+                        .collect();
+                    if !touched.is_empty() {
+                        let mut guard = state.instances.write().await;
+                        for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
+                            if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
+                                dst.agent_session_id = src.agent_session_id.clone();
+                                dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+                            }
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::error!(
+                        target: "session.sync",
+                        "drain_and_persist task failed: {e}",
+                    );
+                }
+            }
 
             #[cfg(feature = "serve")]
             acp_reconciler::reconcile_acp_workers(
@@ -3281,7 +3538,7 @@ async fn daemon_startup_recovery_cascade(
                         &id,
                     );
                 }
-                Ok((mut updated, Err(e))) => {
+                Ok((updated, Err(e))) => {
                     tracing::warn!(
                         target: "session.startup_recovery",
                         instance_id = %id,
@@ -3289,28 +3546,6 @@ async fn daemon_startup_recovery_cascade(
                         error = %e,
                         "recovery cascade failed",
                     );
-                    // The cascade leaves last_error=None on every Err exit
-                    // (no failure path sets it) and self.status as either
-                    // `Status::Starting` (the common case: probe_settle
-                    // returned Dead, or Tier-2 failed after finalize_launch
-                    // ran at instance.rs:1403) or `Status::Idle` (rare:
-                    // kill_clean failed, or Tier-1 start_with_size_opts
-                    // failed before finalize_launch). In either case,
-                    // without an explicit Error transition the next
-                    // status_poll_loop tick falls through to
-                    // update_status_with_metadata and generates a generic
-                    // "tmux session is gone" message, hiding the
-                    // cascade-specific error.
-                    updated.status = crate::session::Status::Error;
-                    updated.last_error = Some(format!("recovery cascade: {}", e));
-                    // Stamp last_error_check so the in-memory error overlay
-                    // in status_poll_loop arms the 30s stickiness in
-                    // update_status_with_metadata_inner. Without this
-                    // (#[serde(skip)] would otherwise leave it None on the
-                    // next disk reload), the cascade-specific message is
-                    // overwritten by the generic "tmux session is gone" on
-                    // the very next poll tick.
-                    updated.last_error_check = Some(std::time::Instant::now());
                     let mut instances = inst_state.instances.write().await;
                     if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
                         *slot = updated;
@@ -3470,14 +3705,62 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let session_id = frame.session_id.clone();
             let approval_title = approval.tool_call.name.clone();
             let destructive = approval.destructive;
+            let seq = frame.seq;
             tokio::spawn(async move {
                 acp_ws::trigger_approval_push(
                     &state_for_push,
                     &session_id,
                     &approval_title,
                     destructive,
+                    seq,
                 )
                 .await;
+            });
+        }
+
+        // Clear push: when the approval is handled (on any device), retract
+        // the "needs approval" notification that the request push raised, so
+        // a backgrounded phone or second computer does not keep showing a
+        // stale alert for an already-resolved request. See #2491.
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::ApprovalResolved { .. }
+        ) {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_approval_clear_push(&state_for_push, &session_id, seq).await;
+            });
+        }
+
+        // Question push: an `AskUserQuestion` (ElicitationRequested) blocks
+        // the turn on the user just like an approval, so it gets the same
+        // dedicated, suppression-bypassing push instead of only the generic
+        // Waiting one. Same live-event-only path as the approval push above.
+        // See #2146.
+        if let crate::acp::state::Event::ElicitationRequested { elicitation } = frame.event.as_ref()
+        {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let question = elicitation.message.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_question_push(&state_for_push, &session_id, &question, seq).await;
+            });
+        }
+
+        // Clear push for an answered question, mirroring the approval clear
+        // above. See #2491.
+        if matches!(
+            frame.event.as_ref(),
+            crate::acp::state::Event::ElicitationResolved { .. }
+        ) {
+            let state_for_push = state.clone();
+            let session_id = frame.session_id.clone();
+            let seq = frame.seq;
+            tokio::spawn(async move {
+                acp_ws::trigger_question_clear_push(&state_for_push, &session_id, seq).await;
             });
         }
 
@@ -3572,13 +3855,24 @@ pub(crate) async fn seed_acp_statuses(state: Arc<AppState>) {
         let Some(event) = state.acp_event_store.latest_status_event(&id) else {
             continue;
         };
-        let intent = derive_acp_status(&event);
-        if intent.is_none() {
+        let Some(intent) = derive_acp_status(&event) else {
             continue;
-        }
+        };
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            apply_status_intent(inst, intent, &state.status_tx);
+            // At startup the on-disk event log is the whole truth: nothing
+            // is racing the apply, unlike the live stream. If the latest
+            // lifecycle event shows a turn was in flight when the previous
+            // daemon died, a stale persisted Stopped must not trap the dot
+            // grey, so clear it before the Running/Waiting intent applies.
+            // A latest Idle/Error (clean or deliberate stop) is left as
+            // Stopped by apply_status_intent's guard. See #2248.
+            if inst.status == Status::Stopped
+                && matches!(intent, StatusIntent::Set(Status::Running | Status::Waiting))
+            {
+                inst.status = Status::Idle;
+            }
+            apply_status_intent(inst, Some(intent), &state.status_tx);
         }
     }
 }
@@ -3594,22 +3888,32 @@ pub(crate) fn apply_status_intent(
     status_tx: &broadcast::Sender<StatusChange>,
 ) {
     let Some(intent) = intent else { return };
-    // Don't fight terminal lifecycle states. Acp events keep
-    // arriving for a few ticks after a Stop/Delete, and we don't
-    // want the spinner to flicker back to Running.
-    if matches!(
-        inst.status,
-        Status::Stopped | Status::Deleting | Status::Creating
-    ) {
+    // Genuine in-flight terminal states: never fight them.
+    if matches!(inst.status, Status::Deleting | Status::Creating) {
         return;
     }
     let target = match intent {
-        StatusIntent::Set(s) => s,
-        // HealError: only move from Error → Idle. Skip when the
-        // session is in a normal state so a respawn during an active
-        // Running turn doesn't stop the spinner.
+        StatusIntent::Set(s) => {
+            // A Stopped session must not be woken by a trailing worker
+            // event: acp events keep arriving for a few ticks after a
+            // Stop, and a deliberate Stop must keep showing Stopped. Only
+            // a fresh worker-epoch signal (HealError below) lifts Stopped;
+            // the live UserPromptSent that follows the respawn then drives
+            // Running. Without this, the chain Stopped -> (trailing prompt)
+            // Running -> (trailing stop) Idle would strand a deliberate
+            // Stop on Idle.
+            if inst.status == Status::Stopped {
+                return;
+            }
+            s
+        }
+        // HealError comes only from AcpSessionAssigned / RateLimitAuto
+        // Resumed, both emitted when a fresh worker attaches and never as
+        // trailing post-stop events. So heal a sticky Error AND wake a
+        // session out of a stale Stopped (idle-reap or manual stop, then
+        // re-prompt): the live worker is provably back. See #2248.
         StatusIntent::HealError => {
-            if inst.status != Status::Error {
+            if !matches!(inst.status, Status::Error | Status::Stopped) {
                 return;
             }
             Status::Idle
@@ -3648,8 +3952,41 @@ fn apply_acp_session_change(
 ) -> Option<String> {
     match change? {
         AcpSessionChange::Assigned(new_id) => {
-            if inst.acp_session_id.as_deref() == Some(new_id.as_str()) {
-                // Same id — already on disk, no need to rewrite.
+            // A worker just initialized (session/new or session/load), so the
+            // session is by definition no longer idle-dormant. Clear any
+            // marker now: a stale one left by a non-user respawn (e.g. the
+            // build-stale respawn #1754, which brings the worker back without
+            // a user wake) otherwise makes the reconciler's
+            // `!is_idle_dormant()` resume filter refuse to bring the session
+            // back after this worker later dies, deadlocking a queued prompt
+            // that the client parked waiting for a worker that never returns.
+            // See #2237.
+            let cleared_stale_dormant = inst.idle_dormant_since.take().is_some();
+            let same_acp_session = inst.acp_session_id.as_deref() == Some(new_id.as_str());
+            // #2276: clear import_pending only when the assigned id matches the
+            // imported one, i.e. the import's session/load actually landed and
+            // its replay is now in the event store. A fallback session/new (or
+            // a stale worker) reports a different id; consuming the marker then
+            // would block a later retry from re-seeding the transcript.
+            let cleared_import_pending = if same_acp_session {
+                inst.import_pending.take().unwrap_or(false)
+            } else {
+                false
+            };
+            if same_acp_session {
+                // Same id (a reattach / session/load reuses it). Only persist
+                // if we actually cleared a stale dormant marker or the import
+                // flag; otherwise the id is already on disk and there is
+                // nothing to rewrite.
+                if cleared_stale_dormant || cleared_import_pending {
+                    tracing::info!(
+                        target: "acp.event_listener",
+                        session = %session_id,
+                        cleared_import_pending,
+                        "cleared stale idle-dormant / import marker on worker (re)assign"
+                    );
+                    return Some(inst.source_profile.clone());
+                }
                 return None;
             }
             tracing::info!(
@@ -3711,10 +4048,23 @@ pub(crate) enum StatusIntent {
 pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusIntent> {
     use crate::acp::Event;
     match event {
-        Event::UserPromptSent { .. } | Event::ApprovalResolved { .. } => {
-            Some(StatusIntent::Set(Status::Running))
+        Event::UserPromptSent { .. }
+        | Event::ApprovalResolved { .. }
+        | Event::ElicitationResolved { .. } => Some(StatusIntent::Set(Status::Running)),
+        // Agent transcript output means a turn is live even when no
+        // UserPromptSent preceded it. A fired ScheduleWakeup or a background
+        // TaskOutput notification resumes the turn agent-side, streaming only
+        // these events; aoe never publishes a prompt for them, so without this
+        // the sidebar dot stayed grey through real work. apply_status_intent's
+        // guards keep a deliberate Stopped grey and no-op once already Running.
+        Event::ThinkingStarted
+        | Event::AgentMessageChunk { .. }
+        | Event::ToolCallStarted { .. } => Some(StatusIntent::Set(Status::Running)),
+        // A pending approval or elicitation both block the turn on the
+        // user, so the sidebar dot goes yellow either way.
+        Event::ApprovalRequested { .. } | Event::ElicitationRequested { .. } => {
+            Some(StatusIntent::Set(Status::Waiting))
         }
-        Event::ApprovalRequested { .. } => Some(StatusIntent::Set(Status::Waiting)),
         // All Stopped reasons surface as Idle, including the
         // rate-limit park: the worker is not crashed, the user just
         // hit a provider quota and the session is waiting for reset
@@ -3777,6 +4127,8 @@ pub mod test_support {
             auth_mode: "none",
             serve_mode: "local",
             instance_locks: RwLock::new(HashMap::new()),
+            smart_rename_inflight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            smart_rename_attempted: std::sync::Mutex::new(std::collections::HashSet::new()),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
@@ -3785,12 +4137,12 @@ pub mod test_support {
             }),
             changed_files_cache: std::sync::RwLock::new(std::collections::HashMap::new()),
             remote_owner_cache: RwLock::new(HashMap::new()),
-            session_primaries: Arc::new(RwLock::new(HashMap::new())),
-            session_pause_counts: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
             acp_events_tx,
             acp_event_store: event_store,
             acp_supervisor: supervisor,
+            plugin_host: None,
+            plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
             push: None,
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
@@ -3917,6 +4269,53 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
+    }
+
+    // #2237: a worker coming live (AcpSessionAssigned) must clear a stale
+    // idle-dormant marker, even when the acp_session_id is unchanged (a
+    // session/load reattach reuses it). Without this, a stale marker left by a
+    // non-user respawn keeps the reconciler's resume filter skipping the
+    // session forever once the worker dies, deadlocking a queued prompt.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn acp_session_assigned_clears_stale_dormant_marker_on_same_id() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = Some("sid-1".to_string());
+        inst.idle_dormant_since = Some(chrono::Utc::now());
+
+        // Same id as already stored: the only reason to persist is the
+        // stale-dormant clear, so the function must return Some(profile).
+        let persist = apply_acp_session_change(
+            &mut inst,
+            "seed",
+            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+        );
+        assert!(
+            inst.idle_dormant_since.is_none(),
+            "dormant marker must be cleared when a worker (re)assigns"
+        );
+        assert!(
+            persist.is_some(),
+            "clearing a stale marker must trigger a persist even on an unchanged id"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn acp_session_assigned_same_id_no_marker_is_noop() {
+        let mut inst = Instance::new("seed", "/tmp/seed");
+        inst.acp_session_id = Some("sid-1".to_string());
+        inst.idle_dormant_since = None;
+        // Same id, nothing stale to clear: must stay a no-op (no rewrite).
+        let persist = apply_acp_session_change(
+            &mut inst,
+            "seed",
+            Some(&AcpSessionChange::Assigned("sid-1".to_string())),
+        );
+        assert!(
+            persist.is_none(),
+            "unchanged id with no stale marker is a no-op"
+        );
     }
 
     #[test]
@@ -4412,6 +4811,31 @@ mod tests {
             }),
             Some(StatusIntent::Set(Status::Running))
         );
+        // A pending elicitation blocks the turn on the user just like an
+        // approval, so the sidebar dot must go yellow (Waiting) and recover
+        // to Running on resolution.
+        let elicitation = crate::acp::elicitations::Elicitation {
+            nonce: Nonce("e-1".into()),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        assert_eq!(
+            derive_acp_status(&Event::ElicitationRequested { elicitation }),
+            Some(StatusIntent::Set(Status::Waiting))
+        );
+        assert_eq!(
+            derive_acp_status(&Event::ElicitationResolved {
+                nonce: Nonce("e-1".into()),
+                outcome: crate::acp::elicitations::ElicitationOutcome::Accepted,
+                answers: Vec::new(),
+            }),
+            Some(StatusIntent::Set(Status::Running))
+        );
         assert_eq!(
             derive_acp_status(&Event::Stopped {
                 reason: "prompt_complete".into()
@@ -4498,15 +4922,171 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
-    fn derive_acp_status_ignores_streaming_and_string_events() {
+    fn derive_acp_status_running_on_agent_activity() {
+        use crate::acp::state::ToolCall;
         use crate::acp::Event;
-        // Mid-turn events that shouldn't move the session out of Running.
+        // A turn that resumes agent-side (fired ScheduleWakeup, background
+        // TaskOutput notification) streams only these events, never a
+        // UserPromptSent. They must drive Running so the sidebar dot recovers.
         assert_eq!(
             derive_acp_status(&Event::AgentMessageChunk { text: "x".into() }),
-            None
+            Some(StatusIntent::Set(Status::Running))
         );
-        assert_eq!(derive_acp_status(&Event::ThinkingStarted), None);
+        assert_eq!(
+            derive_acp_status(&Event::ThinkingStarted),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        assert_eq!(
+            derive_acp_status(&Event::ToolCallStarted {
+                tool_call: ToolCall {
+                    id: "t".into(),
+                    name: "shell".into(),
+                    kind: "execute".into(),
+                    args_preview: "{}".into(),
+                    started_at: chrono::Utc::now(),
+                    parent_tool_call_id: None,
+                    memory_recall: None,
+                    diffs: Vec::new(),
+                },
+            }),
+            Some(StatusIntent::Set(Status::Running))
+        );
+        // ThinkingEnded is a sub-phase terminator, not a work signal; leaving
+        // it None avoids needless intents (ThinkingStarted already set Running).
         assert_eq!(derive_acp_status(&Event::ThinkingEnded), None);
+    }
+
+    // --- #2248: a structured session must heal out of a stale Stopped ---
+
+    #[cfg(feature = "serve")]
+    fn stopped_structured_instance() -> Instance {
+        let mut inst = Instance::new("s", "/tmp/s");
+        inst.view = crate::session::View::Structured;
+        inst.status = Status::Stopped;
+        inst
+    }
+
+    #[cfg(feature = "serve")]
+    fn apply(inst: &mut Instance, intent: StatusIntent) {
+        let tx = broadcast::channel(8).0;
+        apply_status_intent(inst, Some(intent), &tx);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn heal_error_wakes_a_stopped_session() {
+        // AcpSessionAssigned / RateLimitAutoResumed -> HealError: a fresh
+        // worker attached, so a stale Stopped from idle-reap or a prior
+        // manual stop must heal. This is the #2248 trap: pre-fix the guard
+        // froze Stopped and the dot stayed grey through a live turn.
+        let mut inst = stopped_structured_instance();
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(inst.status, Status::Idle);
+        // The UserPromptSent that follows the respawn then drives Running.
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn agent_activity_wakes_an_idle_session_after_a_fired_wakeup() {
+        // A session that paused on ScheduleWakeup sits Idle. When the wake
+        // fires the turn resumes agent-side with activity events (no
+        // UserPromptSent), so the activity-derived Set(Running) must flip the
+        // dot green instead of leaving it grey.
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.idle_entered_at, None);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn heal_error_still_heals_a_sticky_error() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Error;
+        apply(&mut inst, StatusIntent::HealError);
+        assert_eq!(inst.status, Status::Idle);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn trailing_set_intents_do_not_wake_a_stopped_session() {
+        // A deliberate Stop, or a session mid-stop, keeps emitting acp
+        // events for a few ticks. None of those Set intents may revive it,
+        // or the chain Stopped -> Running -> Idle would strand a deliberate
+        // Stop on Idle.
+        for target in [Status::Running, Status::Waiting, Status::Idle] {
+            let mut inst = stopped_structured_instance();
+            apply(&mut inst, StatusIntent::Set(target));
+            assert_eq!(
+                inst.status,
+                Status::Stopped,
+                "target {target:?} woke Stopped"
+            );
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn deleting_and_creating_block_every_intent() {
+        for terminal in [Status::Deleting, Status::Creating] {
+            let mut inst = stopped_structured_instance();
+            inst.status = terminal;
+            apply(&mut inst, StatusIntent::Set(Status::Running));
+            assert_eq!(inst.status, terminal);
+            apply(&mut inst, StatusIntent::HealError);
+            assert_eq!(inst.status, terminal);
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn seed_unblocks_a_stopped_session_with_an_in_flight_turn() {
+        use crate::acp::Event;
+        // Daemon restart: session persisted Stopped, but the last lifecycle
+        // event was a UserPromptSent (a turn was in flight when the prior
+        // daemon died). Seed must reflect the live turn, not the stale dot.
+        let inst = stopped_structured_instance();
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .expect("record");
+        seed_acp_statuses(state.clone()).await;
+        assert_eq!(state.instances.read().await[0].status, Status::Running);
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn seed_preserves_a_deliberate_stop_across_restart() {
+        use crate::acp::Event;
+        // Latest event is a Stopped (clean / deliberate stop), so the seed
+        // leaves the persisted Stopped intact rather than downgrading it.
+        let inst = stopped_structured_instance();
+        let id = inst.id.clone();
+        let state = test_support::build_test_app_state(vec![inst]);
+        state
+            .acp_event_store
+            .record(
+                &id,
+                1,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .expect("record");
+        seed_acp_statuses(state.clone()).await;
+        assert_eq!(state.instances.read().await[0].status, Status::Stopped);
     }
 
     #[test]
@@ -4593,7 +5173,7 @@ mod tests {
         for needle in [
             "default-src 'self'",
             "script-src 'self' 'wasm-unsafe-eval'",
-            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com",
+            "img-src 'self' data: https://github.com https://avatars.githubusercontent.com https://raw.githubusercontent.com",
             "connect-src 'self' ws: wss:",
             "frame-ancestors 'none'",
         ] {
@@ -4688,5 +5268,27 @@ mod tests {
     async fn token_manager_no_auth_mode() {
         let mgr = TokenManager::new(None, Duration::from_secs(3600));
         assert!(mgr.is_no_auth().await);
+    }
+
+    // Pins the `MissedTickBehavior::Delay` contract on `tokio::time::interval`;
+    // the prod callsite (`status_poll_loop`) is not exercised by this test.
+    #[tokio::test]
+    async fn status_poll_loop_interval_delays_after_stall() {
+        let period = Duration::from_millis(100);
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        interval.tick().await;
+        tokio::time::sleep(period * 4).await;
+        interval.tick().await;
+
+        let before = std::time::Instant::now();
+        interval.tick().await;
+        let gap = before.elapsed();
+
+        assert!(
+            gap >= Duration::from_millis(80),
+            "second post-stall tick must wait ~period (Delay), got {gap:?}"
+        );
     }
 }

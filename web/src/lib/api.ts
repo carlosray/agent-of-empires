@@ -11,6 +11,7 @@ import type {
   ProjectInfo,
   DockerStatusResponse,
   CreateSessionRequest,
+  ClaudeSessionSummary,
   SettingsFieldDescriptor,
 } from "./types";
 import { clearDeviceBindingSecret, getOrCreateDeviceBindingSecret } from "./deviceBinding";
@@ -35,6 +36,48 @@ export interface SessionsEnvelope {
 
 export function fetchSessions(): Promise<SessionsEnvelope | null> {
   return fetchJson<SessionsEnvelope>("/api/sessions");
+}
+
+export interface ConversationSearchHit {
+  session_id: string;
+  seq: number;
+  kind: string;
+  snippet: string;
+  match_count: number;
+}
+
+interface ConversationSearchResponse {
+  results: ConversationSearchHit[];
+}
+
+// Full-text search over session conversation content. Returns one hit per
+// matching session, newest first. `signal` lets the caller abort a stale
+// in-flight search when the query changes.
+export async function searchConversations(query: string, signal?: AbortSignal): Promise<ConversationSearchHit[]> {
+  const res = await fetchJson<ConversationSearchResponse>(`/api/sessions/search?q=${encodeURIComponent(query)}`, {
+    signal,
+  });
+  return res?.results ?? [];
+}
+
+// --- Recent projects ---
+
+export interface RecentProjectEntry {
+  path: string;
+  display_name: string;
+  tool: string;
+  last_used_at: string;
+}
+
+export interface RecentProjectsEnvelope {
+  projects: RecentProjectEntry[];
+}
+
+// Persisted recent projects (newest first), so a project stays in the wizard
+// Recent tab after its last session is deleted. Merged with the live
+// session-derived list in ProjectStep.
+export function fetchRecentProjects(): Promise<RecentProjectsEnvelope | null> {
+  return fetchJson<RecentProjectsEnvelope>("/api/recent-projects");
 }
 
 export async function updateWorkspaceOrdering(order: string[]): Promise<boolean> {
@@ -87,11 +130,25 @@ export async function ensureSession(id: string, signal?: AbortSignal): Promise<E
   }
 }
 
-export async function ensureTerminal(id: string, container = false): Promise<boolean> {
+export async function ensureTerminal(id: string, index = 0, container = false): Promise<boolean> {
   const path = container ? "container-terminal" : "terminal";
   try {
-    const res = await fetch(`/api/sessions/${id}/${path}`, {
+    const res = await fetch(`/api/sessions/${id}/${path}?index=${index}`, {
       method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Kill an extra terminal tab's host + container shells (index >= 1). Index 0
+ *  is the primary terminal shared with the native TUI and cannot be killed
+ *  from the web UI (the server rejects it); closing that tab only hides it. */
+export async function killTerminal(id: string, index: number): Promise<boolean> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/terminal?index=${index}`, {
+      method: "DELETE",
     });
     return res.ok;
   } catch {
@@ -159,6 +216,534 @@ export function resetSettingsSchemaCache(): void {
   schemaPromise = null;
 }
 
+// --- Plugins ---
+
+export interface PluginView {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  enabled: boolean;
+  builtin: boolean;
+  /** Validation provenance: "builtin" | "featured" | "community" | "local". */
+  validation: string;
+  source: string | null;
+  capabilities: string[];
+  /** UI slots the plugin declares it will render into (#2366), disclosed so the
+   *  user sees the plugin modifies the dashboard. Not a capability (needs no
+   *  grant). `slot` is the kebab-case slot name. */
+  ui_contributions: { slot: string; id: string }[];
+  granted: boolean;
+  needs_reapproval: boolean;
+}
+
+export interface PluginListResponse {
+  plugins: PluginView[];
+  load_errors: string[];
+}
+
+/** Outcome of a plugin enable/disable toggle. On success the server returns
+ *  the refreshed list; on failure it returns the error JSON (403 read_only /
+ *  elevation_required, or 400 plugin_error). A 403 `elevation_required` is
+ *  handled globally by the fetch interceptor, which pops the passphrase
+ *  prompt, the same as any other elevated request. */
+export type PluginToggleResult = { kind: "ok"; data: PluginListResponse } | { kind: "error"; message: string };
+
+export function fetchPlugins(): Promise<PluginListResponse | null> {
+  return fetchJson<PluginListResponse>("/api/plugins");
+}
+
+/** A command's client-executed action (`api_version >= 6`). `open-ui-link` opens
+ *  the `href` from the plugin's own per-session UI-state entry at `(slot, id)`. */
+export type PluginClientAction = { kind: "open-ui-link"; slot: PluginUiSlot; id: string };
+
+/** One active plugin command (`GET /api/plugins/commands`), normalized for the
+ *  command palette and keymap. */
+export interface PluginCommand {
+  fqid: string;
+  plugin_id: string;
+  id: string;
+  title: string;
+  description: string;
+  keybinds: string[];
+  action: PluginClientAction | null;
+}
+
+export interface PluginCommandsResponse {
+  commands: PluginCommand[];
+}
+
+export function fetchPluginCommands(): Promise<PluginCommandsResponse | null> {
+  return fetchJson<PluginCommandsResponse>("/api/plugins/commands");
+}
+
+function isValidPluginListResponse(payload: unknown): payload is PluginListResponse {
+  return (
+    typeof payload === "object" &&
+    payload !== null &&
+    Array.isArray((payload as Record<string, unknown>).plugins) &&
+    Array.isArray((payload as Record<string, unknown>).load_errors)
+  );
+}
+
+/** One plugin's update status (`GET /api/plugins/updates`). An on-demand
+ *  network check, kept off the always-on plugin list. `available` is a short
+ *  commit for an outdated GitHub source, "modified" for a changed local tree,
+ *  or null when current. `error` is set when the check could not run. */
+export interface PluginUpdateStatus {
+  id: string;
+  source: string;
+  current: string;
+  available: string | null;
+  needs_update: boolean;
+  error: string | null;
+}
+
+export type PluginUpdatesResult = { kind: "ok"; updates: PluginUpdateStatus[] } | { kind: "error"; message: string };
+
+/** Check installed plugins for updates. Returns a discriminated result (like
+ *  discoverPlugins) so this explicit action can report why it failed instead of
+ *  silently doing nothing on an HTTP/network/JSON error. */
+export async function fetchPluginUpdates(): Promise<PluginUpdatesResult> {
+  try {
+    const res = await fetch("/api/plugins/updates", { headers: { Accept: "application/json" } });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && Array.isArray(payload.updates)) {
+      return { kind: "ok", updates: payload.updates as PluginUpdateStatus[] };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Update check failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** One discovery result (`GET /api/plugins/discover`). Repo-level: the dashboard
+ *  has no install path, so it shows `install_command` for the user to copy. */
+export interface PluginDiscoveryResult {
+  slug: string;
+  html_url: string;
+  description: string | null;
+  stars: number;
+  badge: "installed" | "featured" | "unvetted";
+  install_command: string;
+}
+
+export type DiscoverResult = { kind: "ok"; results: PluginDiscoveryResult[] } | { kind: "error"; message: string };
+
+/** Search the `aoe-plugin` GitHub topic. Returns the error message (notably the
+ *  unauthenticated rate limit) so the UI can show it rather than failing
+ *  silently. */
+export async function discoverPlugins(query: string): Promise<DiscoverResult> {
+  const qs = query.trim() ? `?q=${encodeURIComponent(query.trim())}` : "";
+  try {
+    const res = await fetch(`/api/plugins/discover${qs}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && Array.isArray(payload.results)) {
+      return { kind: "ok", results: payload.results as PluginDiscoveryResult[] };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Discovery failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** A plugin's manifest fields as shown in the detail modal (parsed leniently
+ *  server-side, so a plugin targeting a newer api_version still renders). */
+export interface PluginDetailManifest {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  api_version: number;
+  capabilities: string[];
+  ui_contributions: { slot: string; id: string }[];
+  /** Screenshot/GIF previews, each resolved server-side to a raw.githubusercontent.com URL. */
+  screenshots: { src: string; alt: string; caption: string }[];
+}
+
+/** On-demand detail for one plugin source (`GET /api/plugins/details`): manifest
+ *  fields plus the repo's published release tags (the available versions). */
+export interface PluginDetail {
+  source: string;
+  manifest: PluginDetailManifest | null;
+  manifest_error: string | null;
+  release_tags: string[];
+}
+
+export type PluginDetailResult = { kind: "ok"; detail: PluginDetail } | { kind: "error"; message: string };
+
+/** Fetch a plugin source's detail (manifest + release tags) for the modal.
+ *  Only gh:owner/repo sources are supported server-side. */
+export async function fetchPluginDetails(source: string): Promise<PluginDetailResult> {
+  try {
+    const res = await fetch(`/api/plugins/details?source=${encodeURIComponent(source)}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.source === "string") {
+      return { kind: "ok", detail: payload as unknown as PluginDetail };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Details failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** One UI slot disclosed in an update consent (mirrors the engine `UiView`). */
+export interface PluginUpdateUiView {
+  slot: string;
+  id: string;
+}
+
+/** Structured disclosure for a capability-expanding plugin update, mirroring the
+ *  Rust `UpdateConsent`. Drives the consent modal. */
+export interface PluginUpdateConsent {
+  id: string;
+  from_version: string;
+  to_version: string;
+  prior_capabilities: string[];
+  new_capabilities: string[];
+  added_capabilities: string[];
+  removed_capabilities: string[];
+  ui: PluginUpdateUiView[];
+  build_steps: string[];
+  runtime_change: string | null;
+  trust_downgrade: boolean;
+  fingerprint: string;
+  stays_active_if_declined: boolean;
+}
+
+/** Result of `GET /api/plugins/{id}/update/preview`: a tagged union mirroring the
+ *  Rust `UpdatePreview`. */
+export type PluginUpdatePreview =
+  | { kind: "no_update" }
+  | { kind: "safe_update"; to_version: string; fingerprint: string }
+  | { kind: "consent_required"; consent: PluginUpdateConsent; dismissed: boolean };
+
+export type PluginUpdatePreviewResult =
+  | { kind: "ok"; preview: PluginUpdatePreview }
+  | { kind: "error"; message: string };
+
+/** Validate a preview payload against the discriminated union, so a drifted
+ *  server response is rejected rather than passed on: a safe_update must carry a
+ *  string fingerprint (else the apply would send no pin) and a consent_required
+ *  must carry a consent object (else the modal path would blow up). */
+function isValidPreview(payload: Record<string, unknown>): payload is PluginUpdatePreview {
+  switch (payload.kind) {
+    case "no_update":
+      return true;
+    case "safe_update":
+      return typeof payload.fingerprint === "string";
+    case "consent_required":
+      return typeof payload.consent === "object" && payload.consent !== null;
+    default:
+      return false;
+  }
+}
+
+/** Classify the available update for one installed plugin (no install happens).
+ *  When consent is required the payload carries the full disclosure. */
+export async function previewPluginUpdate(id: string): Promise<PluginUpdatePreviewResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/preview`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && isValidPreview(payload)) {
+      return { kind: "ok", preview: payload };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Update preview failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Start a host-side update job, pinned to the fingerprint the user saw. The
+ *  update runs as a job (like install/uninstall) so its build is observable;
+ *  poll the returned job id with `fetchPluginJob`. A fingerprint mismatch (the
+ *  remote moved since the preview) surfaces as a failed job, which the UI
+ *  recovers from by re-previewing. */
+export async function applyPluginUpdate(id: string, expectedFingerprint: string | null): Promise<PluginJobStartResult> {
+  return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/update/apply`, {
+    expected_fingerprint: expectedFingerprint,
+  });
+}
+
+/** Structured install disclosure (`POST /api/plugins/install/preview`),
+ *  mirroring the Rust `InstallConsent`. Drives the install consent modal. */
+export interface PluginInstallConsent {
+  id: string;
+  version: string;
+  source: string;
+  /** One line stating what is being installed (resolved release, ref, etc). */
+  notice: string;
+  /** The source is off the audited-release default path; warn on it. */
+  unverified: boolean;
+  /** Trust class: "featured" | "community" | "local". */
+  validation: string;
+  capabilities: string[];
+  ui: PluginUpdateUiView[];
+  build_steps: string[];
+  fingerprint: string;
+}
+
+export type PluginInstallPreviewResult =
+  | { kind: "ok"; consent: PluginInstallConsent }
+  | { kind: "error"; message: string };
+
+/** Classify a gh: install candidate and return its disclosure, without
+ *  installing. Backs the install consent modal. */
+export async function previewPluginInstall(source: string): Promise<PluginInstallPreviewResult> {
+  try {
+    const res = await fetch("/api/plugins/install/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ source }),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.fingerprint === "string") {
+      return { kind: "ok", consent: payload as unknown as PluginInstallConsent };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Install preview failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Outcome of starting a lifecycle job: a job id to poll, or an error (403
+ *  read_only / elevation_required is handled by the fetch interceptor). */
+export type PluginJobStartResult = { kind: "ok"; jobId: string } | { kind: "error"; message: string };
+
+async function startPluginJob(url: string, body: unknown): Promise<PluginJobStartResult> {
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(body),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.job_id === "string") {
+      return { kind: "ok", jobId: payload.job_id as string };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Request failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** Start a host-side install job for an approved gh: source. Poll the returned
+ *  job id with `fetchPluginJob`. */
+export async function startPluginInstall(source: string, expectedFingerprint: string): Promise<PluginJobStartResult> {
+  return startPluginJob("/api/plugins/install", { source, expected_fingerprint: expectedFingerprint });
+}
+
+/** Start a host-side uninstall job for an installed external plugin. */
+export async function startPluginUninstall(id: string): Promise<PluginJobStartResult> {
+  return startPluginJob(`/api/plugins/${encodeURIComponent(id)}/uninstall`, {});
+}
+
+/** A lifecycle job's status, mirroring the Rust `PluginJobStatus` tag. */
+export type PluginJobState = { state: "running" } | { state: "succeeded" } | { state: "failed"; error: string };
+
+/** A lifecycle job plus a bounded tail of its host-side log
+ *  (`GET /api/plugins/jobs/{id}`). */
+export interface PluginJob {
+  job: {
+    id: string;
+    kind: "install" | "update" | "uninstall";
+    target: string;
+    status: PluginJobState;
+    started_at: number;
+    finished_at: number | null;
+  };
+  log: {
+    exists: boolean;
+    tail: string;
+    lines_returned: number;
+    truncated: boolean;
+  };
+}
+
+export type PluginJobResult = { kind: "ok"; job: PluginJob } | { kind: "error"; status: number; message: string };
+
+/** Fetch a lifecycle job's status plus a tail of its log. Polled by the
+ *  progress modal until the job reaches a terminal state. The HTTP `status` is
+ *  preserved so the caller can tell a terminal 404 (the job is gone, e.g. after
+ *  a daemon restart) from a transient failure worth retrying. */
+export async function fetchPluginJob(jobId: string, tail = 200): Promise<PluginJobResult> {
+  try {
+    const res = await fetch(`/api/plugins/jobs/${encodeURIComponent(jobId)}?tail=${tail}`, {
+      headers: { Accept: "application/json" },
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && typeof payload.job === "object" && payload.job !== null) {
+      return { kind: "ok", job: payload as unknown as PluginJob };
+    }
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Job status failed (HTTP ${res.status}).`;
+    return { kind: "error", status: res.status, message };
+  } catch {
+    return { kind: "error", status: 0, message: "Network error." };
+  }
+}
+
+export type PluginDismissResult = { kind: "ok" } | { kind: "error"; message: string };
+
+/** Record an in-app decline of an available update so it stops nagging until the
+ *  next version. */
+export async function dismissPluginUpdate(id: string, fingerprint: string): Promise<PluginDismissResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/update/dismiss`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fingerprint }),
+    });
+    if (res.ok) {
+      return { kind: "ok" };
+    }
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    const message =
+      typeof payload?.message === "string" ? (payload.message as string) : `Dismiss failed (HTTP ${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+// Plugin UI extension points (#2366).
+
+/** Display tone a plugin attaches to a slot entry or notification. The host
+ *  validates it to this closed set; each surface maps it to a color. */
+export type PluginUiTone = "neutral" | "info" | "success" | "warn" | "danger";
+
+/** The nine host-rendered slots, kebab-case as the host serializes them. */
+export type PluginUiSlot =
+  | "status-bar"
+  | "row-badge"
+  | "row-column"
+  | "sort-key"
+  | "filter-facet"
+  | "card"
+  | "pane"
+  | "detail-badge"
+  | "notification";
+
+/** One piece of UI state a worker pushed. `payload` shape is determined by
+ *  `slot`; the dashboard renders it (no plugin code runs here). */
+export interface PluginUiEntry {
+  plugin_id: string;
+  slot: PluginUiSlot;
+  id: string;
+  session_id?: string;
+  payload: Record<string, unknown>;
+}
+
+/** A notification pushed via `ui.notify`. `seq` is monotonic so the client
+ *  toasts each one exactly once. */
+export interface PluginUiNotification {
+  seq: number;
+  plugin_id: string;
+  tone: PluginUiTone;
+  title: string;
+  body?: string;
+  session_id?: string;
+}
+
+export interface PluginUiState {
+  entries: PluginUiEntry[];
+  notifications: PluginUiNotification[];
+  /** Mutation counter per plugin, then per scope (a session id, or `""` for a
+   *  global slot). A manual pane action records the baseline the action POST
+   *  returns and holds its spinner until its own scope's counter moves off it,
+   *  so another session's push never clears it. Absent on an older daemon. */
+  revisions?: Record<string, Record<string, number>>;
+}
+
+/** The host's aggregated UI-state snapshot. Returns an empty state (not null)
+ *  shape on the server when no plugin host is running. */
+export function fetchPluginUiState(): Promise<PluginUiState | null> {
+  return fetchJson<PluginUiState>("/api/plugins/ui-state");
+}
+
+export async function setPluginEnabled(id: string, enabled: boolean): Promise<PluginToggleResult> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(id)}/enabled`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    const payload = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    if (res.ok && payload && isValidPluginListResponse(payload)) {
+      return { kind: "ok", data: payload };
+    }
+    const message =
+      typeof payload?.message === "string"
+        ? (payload.message as string)
+        : `Failed to ${enabled ? "enable" : "disable"} plugin (${res.status}).`;
+    return { kind: "error", message };
+  } catch {
+    return { kind: "error", message: "Network error." };
+  }
+}
+
+/** A worker accepted an action. `baselineRevision` is the scope's UI mutation
+ *  counter the host read before forwarding; the pane holds its spinner until
+ *  the polled counter moves off this value. `null` means the daemon did not
+ *  report a baseline (older daemon), so the caller skips the wait and just
+ *  clears when the POST settles. */
+export interface PluginActionAccepted {
+  baselineRevision: number | null;
+}
+
+/**
+ * Forward a plugin pane's UI action (e.g. a "Refresh" button) to the plugin's
+ * worker. Fire-and-forget at the worker: the worker runs the named method and
+ * re-pushes its UI state, which a later ui-state poll renders. `sessionId`
+ * scopes the baseline revision to the firing pane's session. Returns the
+ * accepted baseline (or null if the daemon omitted one), or null on read-only
+ * (403), no running worker (404), or network failure.
+ */
+export async function invokePluginAction(
+  pluginId: string,
+  method: string,
+  sessionId?: string,
+  params: Record<string, unknown> = {},
+): Promise<PluginActionAccepted | null> {
+  try {
+    const res = await fetch(`/api/plugins/${encodeURIComponent(pluginId)}/action`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ method, params, session_id: sessionId ?? null }),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json().catch(() => null)) as { baseline_revision?: unknown } | null;
+    // A missing baseline (older daemon) is a sentinel, not revision 0: 0 would
+    // wedge the spinner until timeout since the polled revision is also 0.
+    const rev = typeof body?.baseline_revision === "number" ? body.baseline_revision : null;
+    return { baselineRevision: rev };
+  } catch {
+    return null;
+  }
+}
+
 export async function updateSettings(updates: Record<string, unknown>): Promise<boolean> {
   try {
     const res = await fetch("/api/settings", {
@@ -202,6 +787,83 @@ export async function markWebTourSeen(): Promise<boolean> {
   try {
     const res = await fetch("/api/app-state/web-tour-seen", {
       method: "POST",
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// --- Tips ---
+
+export interface TipDto {
+  id: string;
+  title: string;
+  body: string;
+  seen: boolean;
+}
+
+export interface TipsResponse {
+  /** Mirror of `session.show_tips`; the badge and panel hide when false. */
+  enabled: boolean;
+  /** Web-eligible tips in catalog order, each flagged with its seen state. */
+  tips: TipDto[];
+}
+
+/** Fetch the web-surface tips and whether tips are enabled. Null on failure so
+ *  the caller simply shows no badge. */
+export function fetchTips(): Promise<TipsResponse | null> {
+  return fetchJson<TipsResponse>("/api/tips");
+}
+
+/** Mark one tip seen (mark-seen-on-view). Best-effort; returns success. Mirrors
+ *  {@link markWebTourSeen}: off the elevation wall, blocked on read-only. */
+export async function markTipSeen(id: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/tip-seen", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Set "Show tips on startup" (`session.show_tips`). Dedicated endpoint, not
+ *  `PATCH /api/settings`, so this cosmetic toggle stays off the passphrase/
+ *  elevation wall. Returns false on read-only (403) or network failure. */
+export async function setShowTips(enabled: boolean): Promise<boolean> {
+  try {
+    const res = await fetch("/api/tips/show", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// --- Web UI state sync (server-side mirror of synced localStorage keys) ---
+
+/** Fetch the server-side UI-state blob: a flat map of localStorage key ->
+ *  stored string value. Null on failure so the caller falls back to its local
+ *  cache. Single-tenant: this is the one user's synced preferences. */
+export async function getWebUiState(): Promise<Record<string, string> | null> {
+  return fetchJson<Record<string, string>>("/api/app-state/web-ui-state");
+}
+
+/** Merge a partial update into the server UI-state blob. Values are strings to
+ *  set, or `null` to delete the key. Best-effort; returns success. */
+export async function patchWebUiState(patch: Record<string, string | null>): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/web-ui-state", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
     });
     return res.ok;
   } catch {
@@ -534,10 +1196,29 @@ export interface UpdateStatus {
   release_url: string | null;
   web_poll_interval_minutes: number;
   error: string | null;
+  /** Version the user already dismissed the banner for, persisted server-side
+   *  in app_state so the acknowledgement is once-per-account, not per device. */
+  dismissed_version: string | null;
 }
 
 export function fetchUpdateStatus(): Promise<UpdateStatus | null> {
   return fetchJson<UpdateStatus>("/api/system/update-status");
+}
+
+/** Persist that the update banner was dismissed for `version`, server-side, so
+ *  it stays dismissed across devices (and matches the TUI). Returns true on
+ *  success; the banner optimistically hides regardless. */
+export async function dismissUpdate(version: string): Promise<boolean> {
+  try {
+    const res = await fetch("/api/app-state/dismiss-update", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version }),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 // --- Branches ---
@@ -627,6 +1308,43 @@ export async function switchAcpAgent(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+// --- Acp install agent (Tier 2 of #2109) ---
+
+export interface InstallAgentResponse {
+  session_id: string;
+  package: string;
+  success: boolean;
+  exit_code: number | null;
+  stdout: string;
+  stderr: string;
+  /** Other sessions blocked on the same adapter that were queued for an
+   *  automatic respawn (the install is global). See #2109. */
+  recovered_sessions: number;
+}
+
+/** Run `npm install -g` for the session's agent on the host. Opt-in and
+ *  hardened server-side (see `install_agent` in src/server/api/acp.rs).
+ *  Resolves with the parsed body on 2xx; throws with the server's error
+ *  message on failure (disabled, sandboxed, not npm-installable, npm
+ *  missing) so the caller can surface why. The caller respawns the worker
+ *  separately via `useRespawnSession` on `success`. */
+export async function installAcpAgent(sessionId: string): Promise<InstallAgentResponse> {
+  const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/acp/install-agent`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  const body = (await res.json().catch(() => null)) as
+    | (Partial<InstallAgentResponse> & { error?: string; message?: string })
+    | null;
+  if (!res.ok) {
+    throw new Error(body?.message || body?.error || `Server returned ${res.status}`);
+  }
+  if (!body) {
+    throw new Error("Server returned an invalid or empty response");
+  }
+  return body as InstallAgentResponse;
 }
 
 /** Fetch a markdown primer built from events `seq < beforeSeq`. Used
@@ -724,12 +1442,22 @@ export async function fetchProjects(scope?: "global" | "profile"): Promise<Proje
   return (await fetchJson<ProjectInfo[]>(url)) ?? [];
 }
 
+/** Existing Claude Code sessions on disk, newest first, for the import
+ *  picker (#2276). Empty when Claude Code was never run. */
+export async function listClaudeSessions(): Promise<ClaudeSessionSummary[]> {
+  return (await fetchJson<ClaudeSessionSummary[]>("/api/claude-sessions")) ?? [];
+}
+
 export async function createProject(body: {
   path: string;
   name?: string;
   scope?: "global" | "profile";
   allow_override?: boolean;
   default_base_branch?: string;
+  /** Pin the project on create (show it as a sessionless sidebar header).
+   *  Defaults to false server-side: the Projects view just saves, the sidebar
+   *  "Pin project" action sends true. See #2208. */
+  pinned?: boolean;
 }): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
   try {
     const res = await fetch("/api/projects", {
@@ -791,6 +1519,39 @@ export async function updateProject(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ default_base_branch: defaultBaseBranch }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      try {
+        const data = JSON.parse(text);
+        return {
+          ok: false,
+          error: data.message || `Server error (${res.status})`,
+        };
+      } catch {
+        return { ok: false, error: text || `Server error (${res.status})` };
+      }
+    }
+    const project = (await res.json()) as ProjectInfo;
+    return { ok: true, project };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/** Pin or unpin a saved project. Unpinning (pinned=false) keeps the registry
+ *  entry, so the project stays in the Projects view and the wizard; it just
+ *  drops from the sidebar. See #2208. */
+export async function setProjectPinned(
+  name: string,
+  scope: "global" | "profile",
+  pinned: boolean,
+): Promise<{ ok: boolean; error?: string; project?: ProjectInfo }> {
+  try {
+    const res = await fetch(`/api/projects/${encodeURIComponent(name)}?scope=${scope}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pinned }),
     });
     if (!res.ok) {
       const text = await res.text();
@@ -1092,6 +1853,32 @@ export async function renameSession(id: string, title: string): Promise<{ ok: bo
 }
 
 /**
+ * Manually re-run smart rename ("Auto-name now") for a still-default-named
+ * structured-view session whose automatic rename never landed. Best-effort and
+ * async: a 202 means the one-shot was re-triggered, not that the title changed.
+ * Returns the server message on failure (409 when the session already has a
+ * custom name or has no prompt yet) so the caller can surface it.
+ */
+export async function smartRenameSession(id: string): Promise<{ ok: boolean; message?: string }> {
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(id)}/smart-rename`, {
+      method: "POST",
+    });
+    if (res.ok) return { ok: true };
+    let message: string | undefined;
+    try {
+      const body = await res.json();
+      message = typeof body?.message === "string" ? body.message : undefined;
+    } catch {
+      // non-JSON error body; fall through with no message
+    }
+    return { ok: false, message };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
  * Edit a managed worktree session's workdir name: move the worktree
  * directory and, optionally, rename its git branch. The session must not be
  * running. Returns the server's validation message on failure so the caller
@@ -1196,13 +1983,10 @@ export async function setSessionPin(id: string, pinned: boolean): Promise<Sessio
   }
 }
 
-/** Archive or unarchive a session. On archive, the server kills the tmux
- *  pane (when `killPane` is true or omitted, matching TUI/CLI semantics)
- *  and shuts down the acp worker for acp-mode sessions; the
- *  reconciler will not respawn it because archived sessions are excluded
- *  from the resume target list. Sending a message via the dashboard
- *  auto-unarchives via the existing `touch_last_accessed` invariant in
- *  the send handler. See #1581. */
+/** Archive or unarchive a session. On archive (with `killPane` true or
+ *  omitted), the server tears down all tmux sessions and shuts down the
+ *  ACP worker for acp-mode sessions. Sending a message auto-unarchives.
+ *  See #1581, #1868. */
 export async function setSessionArchive(
   id: string,
   archived: boolean,
@@ -1213,6 +1997,72 @@ export async function setSessionArchive(
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ archived, kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Move a session to the trash (#2489): stops the live session (ACP
+ *  shutdown, which preserves the transcript, plus optional tmux teardown)
+ *  and hides it from the normal list while keeping every durable artifact so
+ *  it can be restored. NOT a permanent delete; use `deleteSession` for that. */
+export async function trashSession(id: string, killPane = true): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/trash`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ kill_pane: killPane }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Restore a trashed session (#2489): clears `trashed_at`, returning it to
+ *  its prior bucket with its transcript and metadata intact. */
+export async function restoreSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/restore`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Stop a session, matching the TUI's `x` keybind: kills the tmux pane and
+ *  stops (but does not remove) the Docker container for plain sessions, or
+ *  shuts down the worker for structured-view sessions. The session record is
+ *  preserved with status `Stopped` and can be resumed later. NOT a delete. */
+export async function stopSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/stop`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Start (resume) a stopped session, the inverse of stopSession: restarts a
+ *  plain session's pane or un-parks a structured session so its worker
+ *  respawns. Returns null on failure. */
+export async function startSession(id: string): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/start`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;
@@ -1232,6 +2082,24 @@ export async function setSessionSnooze(id: string, minutes: number | null): Prom
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ minutes }),
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as SessionResponse;
+  } catch {
+    return null;
+  }
+}
+
+/** Flag a session manually unread (`true`) or mark it read (`false`, clearing
+ *  both auto and manual markers). Mirrors the TUI `u` toggle; the caller
+ *  computes the target from the current state so an optimistic update stays in
+ *  sync with the server. */
+export async function setSessionUnread(id: string, unread: boolean): Promise<SessionResponse | null> {
+  try {
+    const res = await fetch(`/api/sessions/${id}/unread`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ unread }),
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;

@@ -11,7 +11,8 @@ use super::validate_profile_name;
 use super::AppState;
 use crate::server::auth::AuthenticatedSession;
 use crate::session::settings_schema::{
-    clear_path, strip_local_only, validate_patch, PatchRejection, Scope,
+    clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
+    validate_patch_with, PatchRejection, Scope,
 };
 
 // --- Agents ---
@@ -24,11 +25,22 @@ pub struct AgentInfo {
     pub host_only: bool,
     pub installed: bool,
     pub install_hint: String,
+    /// True when this agent has a one-shot mode (a `oneshot_flag`), so it can
+    /// be used for the smart-rename title call. The settings smart-rename agent
+    /// picker filters on this together with `installed`. Always false for
+    /// custom agents (no built-in one-shot contract).
+    pub oneshot_capable: bool,
     /// True when this agent can run in the structured acp UI: a
     /// built-in with an ACP adapter, or a custom agent that declares a
     /// valid `agent_acp_cmd`. The web wizard reads this to decide
     /// whether a session created for the agent runs in acp or tmux.
     pub acp_capable: bool,
+    /// True when the agent's ACP adapter binary (`acp_command`) is actually
+    /// resolvable on this host, not just registered. Distinct from
+    /// `installed` (the agent's own CLI binary) and `acp_capable` (registry
+    /// knows an adapter exists). The wizard's "Import from Claude" tab gates
+    /// on this so it never shows when claude-agent-acp is missing. See #2276.
+    pub acp_installed: bool,
     /// The ACP command a built-in agent launches in acp, e.g.
     /// `claude-agent-acp` for claude or `opencode` for opencode. This is
     /// the registry command (post `${aoe_data_dir}` substitution), which
@@ -87,9 +99,14 @@ fn build_custom_agent_infos(
             host_only: false,
             installed: true,
             install_hint: "Configured custom agent".to_string(),
+            oneshot_capable: false,
             acp_capable: agent_acp_cmd
                 .get(name)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
+            // Custom agents' acp_command is never serialized here (it can hold
+            // hostnames or secrets), so we don't probe its install state; the
+            // import tab is claude-only regardless.
+            acp_installed: false,
             // Custom agents' command values are deliberately never
             // serialized here; they can hold hostnames or secrets.
             acp_command: None,
@@ -122,7 +139,11 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     host_only: a.host_only,
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
+                    oneshot_capable: a.oneshot_flag.is_some(),
                     acp_capable: acp_registry.get(a.name).is_some(),
+                    acp_installed: acp_command
+                        .as_deref()
+                        .is_some_and(crate::cli::acp::command_present),
                     acp_command,
                     acp_args,
                 }
@@ -212,13 +233,16 @@ pub async fn update_settings(
     // or echoed-back patch keeps its safe leaves and silently drops the
     // local-only ones (#1692). They can never reach disk from the web.
     strip_local_only(&mut body);
-    // Validate every remaining leaf against the schema (single source of
-    // truth): unknown section/field -> 400, bad value -> 400. `PATCH
-    // /api/settings` is already elevation-gated by the auth middleware, so any
-    // field reaching here is treated as elevated.
-    if let Err(rej) = validate_patch(&body, Scope::Global, true) {
+    // Validate every remaining leaf against the runtime schema (core plus
+    // active-plugin `plugin:<id>` sections): unknown section/field -> 400, bad
+    // value -> 400. `PATCH /api/settings` is already elevation-gated by the
+    // auth middleware, so any field reaching here is treated as elevated.
+    if let Err(rej) = validate_patch_with(&runtime_schema(), &body, Scope::Global, true) {
         return reject_response(rej);
     }
+    // Fold validated `plugin:<id>` sections into their on-disk storage path
+    // (`plugins.<id>.settings.*`) before the generic merge.
+    rewrite_plugin_sections(&mut body);
 
     let result = tokio::task::spawn_blocking(move || {
         let config = crate::session::Config::load_or_warn();
@@ -280,7 +304,21 @@ pub async fn update_settings(
 /// secrets: descriptors are pure metadata (labels, widgets, validation, write
 /// policy), so this needs no elevation, only normal authentication.
 pub async fn get_settings_schema() -> Json<Vec<crate::session::settings_schema::FieldDescriptor>> {
-    Json(crate::session::settings_schema::schema())
+    Json(runtime_schema())
+}
+
+/// `GET /api/settings/resolved` returns every setting's effective value plus
+/// its provenance chain (user value > highest-priority plugin default > schema
+/// default for core; stored value > manifest default for plugin settings). The
+/// dashboard uses it to show where a value comes from. Pure metadata derived
+/// from the same schema the surfaces render, so only normal authentication.
+pub async fn get_settings_resolved() -> Json<Vec<crate::session::settings_schema::ResolvedSetting>>
+{
+    Json(
+        tokio::task::spawn_blocking(crate::session::settings_schema::resolve_all)
+            .await
+            .unwrap_or_default(),
+    )
 }
 
 /// Body of `PATCH /api/theme`. Either field may be omitted to leave it
@@ -442,6 +480,371 @@ pub async fn mark_web_tour_seen(State(state): State<Arc<AppState>>) -> impl Into
     }
 }
 
+#[derive(Serialize)]
+pub struct TipDto {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub seen: bool,
+}
+
+#[derive(Serialize)]
+pub struct TipsResponse {
+    /// Mirror of `session.show_tips`. The dashboard hides the badge and panel
+    /// when this is false. This payload is a read projection; the toggle is
+    /// written through the dedicated `POST /api/tips/show` ([`set_show_tips`]),
+    /// and the same preference is also editable from the settings schema.
+    pub enabled: bool,
+    /// Web-eligible tips in catalog order, each flagged with whether it has been
+    /// seen. The frontend derives the badge count from the unseen ones and can
+    /// still show seen tips in a collapsed section.
+    pub tips: Vec<TipDto>,
+}
+
+/// Returns the web-surface tips and whether tips are enabled, composed from the
+/// shared `crate::tips` catalog plus `app_state.tips_seen` and
+/// `session.show_tips`. A read projection, so it stays a plain GET behind the
+/// token wall like [`get_web_ui_state`]; the TUI-only tips never appear here.
+pub async fn get_tips(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(|| {
+        let config = crate::session::Config::load()?;
+        let signals = crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        };
+        let seen = &config.app_state.tips_seen;
+        let tips = crate::tips::eligible(crate::tips::TipSurface::Web, &signals)
+            .into_iter()
+            .map(|tip| TipDto {
+                id: tip.id.to_string(),
+                title: tip.title.to_string(),
+                body: tip.body.to_string(),
+                seen: seen.iter().any(|s| s == tip.id),
+            })
+            .collect();
+        Ok::<_, anyhow::Error>(TipsResponse {
+            enabled: config.session.show_tips,
+            tips,
+        })
+    })
+    .await;
+
+    match result {
+        Ok(Ok(resp)) => (StatusCode::OK, Json(resp)).into_response(),
+        // Best-effort: an unreadable config yields an empty, disabled payload so
+        // the dashboard simply shows no badge rather than erroring.
+        _ => (
+            StatusCode::OK,
+            Json(TipsResponse {
+                enabled: false,
+                tips: Vec::new(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct MarkTipSeenBody {
+    pub id: String,
+}
+
+/// Marks one tip seen by appending its id to the shared `app_state.tips_seen`,
+/// so the dashboard's mark-seen-on-view sticks across devices and matches the
+/// TUI. Single-purpose write mirroring [`mark_web_tour_seen`]: exempt from the
+/// elevation wall, still blocked by `read_only`, and uses `Config::load()` so a
+/// corrupt config is not silently replaced. Rejects an id that is not in the
+/// catalog so junk can't accumulate in the persisted seen list.
+pub async fn mark_tip_seen(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<MarkTipSeenBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(MarkTipSeenBody { id }) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    if !crate::tips::id_in_catalog(&id) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "unknown_tip", "message": format!("Unknown tip id '{id}'")})),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        if !config.app_state.tips_seen.iter().any(|s| s == &id) {
+            config.app_state.tips_seen.push(id);
+        }
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Marking tip seen failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tip state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Marking tip seen panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetShowTipsBody {
+    pub enabled: bool,
+}
+
+/// Sets `session.show_tips`, the "Show tips on startup" checkbox in the tip-of-
+/// the-day modal. A dedicated single-purpose write rather than `PATCH
+/// /api/settings`, which the auth middleware elevation-gates: this is a cosmetic
+/// preference and must not trip the passphrase wall on a remote server. Mirrors
+/// [`mark_web_tour_seen`]: exempt from elevation, still blocked by `read_only`,
+/// and uses `Config::load()` so a corrupt config is not silently replaced. The
+/// same preference is also editable from the settings Interaction tab.
+pub async fn set_show_tips(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<SetShowTipsBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(SetShowTipsBody { enabled }) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        config.session.show_tips = enabled;
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"show_tips": enabled})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Setting show_tips failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist tips state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Setting show_tips panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct DismissUpdateBody {
+    pub version: String,
+}
+
+/// Records that the user dismissed the update banner for a specific version,
+/// persisting to the shared `app_state.dismissed_update_version` so the
+/// dismissal sticks across devices (and matches the TUI's snooze) rather than
+/// living in per-browser localStorage. Single-purpose write mirroring
+/// [`mark_web_tour_seen`]: exempt from the elevation wall, still blocked by
+/// `read_only`, and uses `Config::load()` so a corrupt config is not silently
+/// replaced with defaults.
+pub async fn dismiss_update(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<DismissUpdateBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(body) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+    let version = body.version;
+    let persisted = version.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        config.app_state.dismissed_update_version = Some(persisted);
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"dismissed_version": version})),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Dismissing update failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist dismissal"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Dismissing update panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// Return the web dashboard's server-side UI-state blob (`app_state.web_ui_state`):
+/// a flat map of the frontend's localStorage keys to their opaque string values.
+/// Single-tenant, so this is the one user's synced prefs. GET is unauthenticated
+/// beyond the normal token wall (it grants no capability and exposes only UI
+/// preferences).
+pub async fn get_web_ui_state(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let result = tokio::task::spawn_blocking(|| {
+        let config = crate::session::Config::load()?;
+        Ok::<_, anyhow::Error>(config.app_state.web_ui_state)
+    })
+    .await;
+    match result {
+        Ok(Ok(map)) => (StatusCode::OK, Json(serde_json::json!(map))).into_response(),
+        // Best-effort: an unreadable config yields an empty blob rather than an
+        // error, so the dashboard just falls back to its localStorage cache.
+        _ => (StatusCode::OK, Json(serde_json::json!({}))).into_response(),
+    }
+}
+
+/// Merge a partial update into `app_state.web_ui_state`. The body is a flat JSON
+/// object keyed by the frontend's localStorage keys: a string value sets the
+/// key, `null` deletes it. Mirrors [`mark_web_tour_seen`]'s exemptions (off the
+/// elevation wall, still blocked by `read_only`, `Config::load()` to avoid
+/// clobbering a corrupt config). Non-string, non-null values are ignored since
+/// localStorage values are always strings.
+pub async fn patch_web_ui_state(
+    State(state): State<Arc<AppState>>,
+    body: Result<
+        Json<serde_json::Map<String, serde_json::Value>>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> impl IntoResponse {
+    if state.read_only {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"error": "read_only", "message": "Server is in read-only mode"}),
+            ),
+        )
+            .into_response();
+    }
+    let Json(patch) = match body {
+        Ok(b) => b,
+        Err(rej) => return rej.into_response(),
+    };
+
+    // Values must be string (set) or null (delete); reject anything else
+    // explicitly so a client regression surfaces instead of silently dropping
+    // part of the sync.
+    let invalid: Vec<&String> = patch
+        .iter()
+        .filter(|(_, v)| !v.is_string() && !v.is_null())
+        .map(|(k, _)| k)
+        .collect();
+    if !invalid.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "invalid_value_type",
+                "message": "web UI state values must be string or null",
+                "keys": invalid,
+            })),
+        )
+            .into_response();
+    }
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut config = crate::session::Config::load()?;
+        for (key, value) in patch {
+            match value {
+                serde_json::Value::Null => {
+                    config.app_state.web_ui_state.remove(&key);
+                }
+                serde_json::Value::String(s) => {
+                    config.app_state.web_ui_state.insert(key, s);
+                }
+                // Already rejected above; keep exhaustive for safety.
+                _ => {}
+            }
+        }
+        crate::session::save_config(&config)?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(serde_json::json!({"ok": true}))).into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(target: "http.api.system", "Persisting web UI state failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "save_failed", "message": "Failed to persist UI state"})),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(target: "http.api.system", "Persisting web UI state panicked: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal", "message": "Internal server error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Records that the user has acknowledged glob `volume_ignores` snapshot
 /// expansion (#2045), so the new-session wizard's confirm modal is shown once
 /// and never again. Single-purpose write mirroring [`mark_web_tour_seen`]: it
@@ -530,14 +933,14 @@ pub async fn get_resolved_theme(
             "GET /api/themes/{{name}} rejected: name exceeds {} bytes",
             MAX_THEME_NAME_LEN,
         );
-        return Json(crate::tui::styles::resolve_theme("default"));
+        return Json(crate::tui::styles::resolve_theme("zinc"));
     }
     tracing::debug!(theme = %name, "GET /api/themes/{{name}}");
     let resolved = tokio::task::spawn_blocking(move || crate::tui::styles::resolve_theme(&name))
         .await
         .unwrap_or_else(|e| {
             tracing::warn!(error = %e, "theme resolve task panicked, falling back to default");
-            crate::tui::styles::resolve_theme("default")
+            crate::tui::styles::resolve_theme("zinc")
         });
     Json(resolved)
 }
@@ -559,7 +962,7 @@ pub async fn get_current_theme(
     .await
     .unwrap_or_else(|e| {
         tracing::warn!(error = %e, "current theme resolve task panicked, falling back to default");
-        crate::tui::styles::resolve_theme("default")
+        crate::tui::styles::resolve_theme("zinc")
     });
     Json(resolved)
 }
@@ -755,7 +1158,6 @@ pub struct DockerStatus {
 
 pub async fn docker_status() -> Json<DockerStatus> {
     let result = tokio::task::spawn_blocking(|| {
-        use crate::containers::ContainerRuntimeInterface;
         let runtime = crate::containers::get_container_runtime();
         let available = runtime.is_available() && runtime.is_daemon_running();
         let runtime_name = if available {
@@ -894,6 +1296,11 @@ pub struct UpdateStatusResponse {
     /// hidden until a successful poll. The error is exposed so the
     /// settings UI can surface a one-liner if useful later.
     pub error: Option<String>,
+    /// The version the user has already dismissed the update banner for,
+    /// from the shared `app_state.dismissed_update_version`. Server-side so a
+    /// dismissal sticks across devices and matches the TUI (#release-notes
+    /// should only be acknowledged once, not per browser).
+    pub dismissed_version: Option<String>,
 }
 
 pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<UpdateStatusResponse> {
@@ -910,6 +1317,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: None,
+            dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         });
     }
 
@@ -932,6 +1340,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
                 release_url,
                 web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
                 error: None,
+                dismissed_version: cfg.app_state.dismissed_update_version.clone(),
             })
         }
         Err(e) => Json(UpdateStatusResponse {
@@ -942,6 +1351,7 @@ pub async fn get_update_status(State(state): State<Arc<AppState>>) -> Json<Updat
             release_url: None,
             web_poll_interval_minutes: cfg.updates.web_poll_interval_minutes,
             error: Some(e.to_string()),
+            dismissed_version: cfg.app_state.dismissed_update_version.clone(),
         }),
     }
 }
@@ -1174,6 +1584,14 @@ pub async fn get_profile_settings(
             obj.insert(
                 "logging".to_string(),
                 serde_json::to_value(&global.logging)?,
+            );
+            // Plugin settings live in the global config (global-only at Tier 0),
+            // not the profile override. Splice them in so the dashboard's plugin
+            // settings render their persisted values instead of reverting to the
+            // manifest default on every profile-view load (#2094).
+            obj.insert(
+                "plugins".to_string(),
+                serde_json::to_value(&global.plugins)?,
             );
         }
         Ok::<_, anyhow::Error>(val)

@@ -17,9 +17,27 @@ use super::Instance;
 pub const ARCHIVED_SECTION_PATH: &str = "__aoe_archived_section__";
 pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 
+/// Synthetic group path for the Trash shelf, sibling of the Archived
+/// section. Same caveat: code walking `flat_items` must skip this sentinel
+/// before invoking GroupTree-mutating ops, since no matching group exists.
+pub const TRASH_SECTION_PATH: &str = "__aoe_trash_section__";
+pub const TRASH_SECTION_NAME: &str = "Trash";
+
 #[inline]
 pub fn is_archived_section_path(path: &str) -> bool {
     path == ARCHIVED_SECTION_PATH
+}
+
+#[inline]
+pub fn is_trash_section_path(path: &str) -> bool {
+    path == TRASH_SECTION_PATH
+}
+
+/// True for the Trash section sentinel or anything nested under it. Mirrors
+/// [`is_within_archived_section`] for the trash shelf.
+#[inline]
+pub fn is_within_trash_section(path: &str) -> bool {
+    path == TRASH_SECTION_PATH || path.starts_with(&format!("{}/", TRASH_SECTION_PATH))
 }
 
 /// True for both the top-level Archived section sentinel and any synthetic
@@ -416,13 +434,23 @@ fn sort_groups<T, N, P, A>(
     }
 }
 
+/// Sessions (direct and nested) that belong to `path` and are not archived.
+fn group_members<'a>(
+    path: &'a str,
+    instances: &'a [Instance],
+) -> impl Iterator<Item = &'a Instance> + 'a {
+    let prefix = format!("{}/", path);
+    instances.iter().filter(move |i| {
+        (i.group_path == path || i.group_path.starts_with(&prefix))
+            && !i.is_archived()
+            && !i.is_trashed()
+    })
+}
+
 /// Get the most recent created_at among all sessions (direct and nested) in a group.
 /// Returns DateTime::MIN_UTC if the group has no sessions.
 fn max_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
+    group_members(path, instances)
         .map(|i| i.created_at)
         .max()
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
@@ -431,10 +459,7 @@ fn max_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> 
 /// Get the oldest created_at among all sessions (direct and nested) in a group.
 /// Returns DateTime::MAX_UTC if the group has no sessions (so empty groups sink to the bottom).
 fn min_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
+    group_members(path, instances)
         .map(|i| i.created_at)
         .min()
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
@@ -444,10 +469,7 @@ fn min_created_at_in_group(path: &str, instances: &[Instance]) -> DateTime<Utc> 
 /// Groups with no sessions (or whose sessions have never reported activity) sort to the bottom
 /// for descending order.
 fn max_last_accessed_in_group(path: &str, instances: &[Instance]) -> Option<DateTime<Utc>> {
-    let prefix = format!("{}/", path);
-    instances
-        .iter()
-        .filter(|i| (i.group_path == path || i.group_path.starts_with(&prefix)) && !i.is_archived())
+    group_members(path, instances)
         .filter_map(|i| i.last_accessed_at)
         .max()
 }
@@ -484,7 +506,7 @@ fn last_activity_group_key(
 /// in italic+dim by the row formatter); only the sort order is suppressed.
 fn attention_tier(inst: &Instance) -> u8 {
     use crate::session::Status::*;
-    if inst.is_archived() || inst.is_snoozed() || inst.pane_dead_observed {
+    if inst.is_archived() || inst.is_snoozed() || inst.is_trashed() || inst.pane_dead_observed {
         // Tier 99 sinks: archived and snoozed (snoozed = temporary archive,
         // wakes automatically when timer expires). Both read as "do not
         // bother me with this row" so they share the bottom tier.
@@ -501,6 +523,31 @@ fn attention_tier(inst: &Instance) -> u8 {
     }
 }
 
+/// Attention bucket rank with the unread promoter folded in. Pure (no global
+/// flag read) so it can be unit-tested directly. Waiting (tier 0) stays top;
+/// tier 99 stays sunk regardless of unread state. When `unread` and the
+/// feature is on, any other non-waiting row is promoted to rank 1, just below
+/// Waiting and above every other tier, with the remaining tiers shifted up by
+/// one (2..=7). When the feature is off it returns `tier` unchanged; the shift
+/// is monotonic so a feature-on run with no unread rows orders identically to
+/// before.
+fn attention_rank(tier: u8, unread: bool, unread_enabled: bool) -> u8 {
+    if tier == 99 {
+        return 99;
+    }
+    if unread_enabled {
+        if tier == 0 {
+            0
+        } else if unread {
+            1
+        } else {
+            tier.saturating_add(1)
+        }
+    } else {
+        tier
+    }
+}
+
 /// Key used to sort sessions by Attention. Primary = urgent-bias (the agent
 /// has flagged the session via `attention-urgent`); secondary = priority tier
 /// ascending; tertiary = favorite within tier; rest = "longest aging first":
@@ -513,10 +560,9 @@ fn attention_tier(inst: &Instance) -> u8 {
 /// into the "no activity" slot AFTER the dated ones, so fresh-but-untouched
 /// rows don't falsely claim the top.
 ///
-/// Within tier 99 (archived), preserve the reverse convention; most-recently
-/// archived first, since the archive block is a recency view, not an
-/// attention view. Urgent is suppressed for tier 99 so a sunk row can't
-/// claw back to the top.
+/// Within tier 99, preserve the reverse convention: most-recently sunk first,
+/// since the archive block is a recency view, not an attention view. Urgent is
+/// suppressed for tier 99 so a sunk row can't claw back to the top.
 #[allow(clippy::type_complexity)]
 fn attention_session_key(
     inst: &Instance,
@@ -543,10 +589,10 @@ fn attention_session_key(
     // design; within the sunk block, recency ordering is the intent.
     let favorite_bias = tier != 99 && inst.is_favorited();
     if tier == 99 {
-        // Tier 99 unifies archived, snoozed, pane_dead, and Error rows.
+        // Tier 99 unifies archived, snoozed, and pane-dead rows.
         // Secondary sort timestamp falls through: archived_at first, then
-        // snoozed_until, then last_accessed_at (the only signal Error /
-        // pane_dead rows have, since they were never explicitly archived).
+        // snoozed_until, then last_accessed_at (the only signal pane-dead
+        // rows have, since they were never explicitly archived).
         // Reverse() makes most-recent sink-time bubble to the top of the
         // sunk block, matching "recency view" intent across all four
         // sub-categories.
@@ -563,13 +609,14 @@ fn attention_session_key(
             None,
         );
     }
+    let rank = attention_rank(tier, inst.is_unread(), crate::session::unread_enabled());
     // Non-archived: "longest aging" = oldest last_accessed_at first (ASC).
     // The `Reverse` slot is forced to `Reverse(None)` (= sorts after all
     // Some() in the Reverse ordering) so it doesn't contribute; the real
     // tiebreak is the trailing ASC field.
     (
         !urgent_bias,
-        tier,
+        rank,
         !favorite_bias,
         inst.last_accessed_at.is_none(),
         Reverse(None),
@@ -640,7 +687,7 @@ fn attention_group_key(
     let favorite_bias = min_tier != 99
         && members
             .iter()
-            .any(|i| !i.is_archived() && !i.is_snoozed() && i.is_favorited());
+            .any(|i| !i.is_archived() && !i.is_snoozed() && !i.is_trashed() && i.is_favorited());
 
     if min_tier == 99 {
         // All members archived: sort archived block by latest archived_at.
@@ -663,9 +710,23 @@ fn attention_group_key(
     // contribute; the real tiebreak is the trailing ASC field. Shape
     // mirrors `attention_session_key` so the intent is uniform.
     let max_last = members.iter().filter_map(|i| i.last_accessed_at).max();
+    // Fold the unread promoter in at the group level too, so a project
+    // containing an unread session floats up just like the flat Attention
+    // view does (a group with an unread Idle outranks a group whose best
+    // member is a read Error). Mirrors `attention_session_key`'s rank.
+    //
+    // Only non-sunk members count: archive/snooze don't clear `unread`, so an
+    // archived or snoozed (tier-99) member must not promote the group, or a
+    // dismissed session would drag its group back to the top. This matches the
+    // session key, which short-circuits tier-99 rows before the unread rank.
+    let unread = members
+        .iter()
+        .filter(|i| attention_tier(i) != 99)
+        .any(|i| i.is_unread());
+    let rank = attention_rank(min_tier, unread, crate::session::unread_enabled());
     (
         !urgent_bias,
-        min_tier,
+        rank,
         !favorite_bias,
         max_last.is_none(),
         Reverse(None),
@@ -688,7 +749,7 @@ pub fn flatten_tree_all_profiles(
     // `append_archived_section`.
     let mut ungrouped: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path.is_empty() && !i.is_archived())
+        .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
         .collect();
 
     sort_sessions(&mut ungrouped, sort_order);
@@ -761,7 +822,10 @@ pub fn flatten_sessions_by_attention(instances: &[Instance]) -> Vec<Item> {
     // `append_archived_section`. Snoozed and pane-dead rows still sink to
     // tier 99 inline because they are transient attention sinks, not
     // lifecycle terminals.
-    let mut refs: Vec<&Instance> = instances.iter().filter(|i| !i.is_archived()).collect();
+    let mut refs: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| !i.is_archived() && !i.is_trashed())
+        .collect();
     refs.sort_by_key(|i| attention_session_key(i));
     refs.into_iter()
         .map(|inst| Item::Session {
@@ -783,7 +847,7 @@ pub fn flatten_tree(
     // `append_archived_section`.
     let mut ungrouped: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path.is_empty() && !i.is_archived())
+        .filter(|i| i.group_path.is_empty() && !i.is_archived() && !i.is_trashed())
         .collect();
 
     sort_sessions(&mut ungrouped, sort_order);
@@ -843,7 +907,7 @@ fn flatten_group(
     // section appended by the caller.
     let mut group_sessions: Vec<&Instance> = instances
         .iter()
-        .filter(|i| i.group_path == group.path && !i.is_archived())
+        .filter(|i| i.group_path == group.path && !i.is_archived() && !i.is_trashed())
         .collect();
 
     sort_sessions(&mut group_sessions, sort_order);
@@ -889,7 +953,10 @@ fn count_sessions_in_group(path: &str, instances: &[Instance]) -> usize {
 /// No-op when there are no archived sessions, so users who never archive
 /// anything don't see a phantom "Archived (0)" header.
 pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], collapsed: bool) {
-    let mut archived: Vec<&Instance> = instances.iter().filter(|i| i.is_archived()).collect();
+    let mut archived: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| i.is_archived() && !i.is_trashed())
+        .collect();
     if archived.is_empty() {
         return;
     }
@@ -910,6 +977,44 @@ pub fn append_archived_section(items: &mut Vec<Item>, instances: &[Instance], co
     }
 
     for inst in archived {
+        items.push(Item::Session {
+            id: inst.id.clone(),
+            depth: 1,
+        });
+    }
+}
+
+/// Append the synthetic Trash section to `items`: a depth-0 header followed
+/// by every `is_trashed()` session, most-recently-trashed first (the row a
+/// user just deleted is the one they are most likely to want back). When
+/// `collapsed` is true only the header is pushed; the header still shows the
+/// count. No-op when nothing is trashed, so users who never delete don't see
+/// a phantom "Trash (0)" header. Rendered as a sibling of the Archived
+/// section, pinned to the very bottom (see `HomeView::build_flat_items`).
+/// Flat in every grouping mode: trash is a recovery shelf, not a workspace,
+/// so it is not nested by project the way the Archived section is.
+pub fn append_trash_section(items: &mut Vec<Item>, instances: &[Instance], collapsed: bool) {
+    let mut trashed: Vec<&Instance> = instances.iter().filter(|i| i.is_trashed()).collect();
+    if trashed.is_empty() {
+        return;
+    }
+    trashed.sort_by_key(|i| Reverse(i.trashed_at));
+
+    items.push(Item::Group {
+        path: TRASH_SECTION_PATH.to_string(),
+        name: TRASH_SECTION_NAME.to_string(),
+        depth: 0,
+        collapsed,
+        session_count: trashed.len(),
+        profile: None,
+        archived_at: None,
+    });
+
+    if collapsed {
+        return;
+    }
+
+    for inst in trashed {
         items.push(Item::Session {
             id: inst.id.clone(),
             depth: 1,
@@ -947,7 +1052,10 @@ pub fn append_archived_section_by_project(
     project_collapsed: &HashMap<String, bool>,
     sort_order: SortOrder,
 ) {
-    let archived: Vec<&Instance> = instances.iter().filter(|i| i.is_archived()).collect();
+    let archived: Vec<&Instance> = instances
+        .iter()
+        .filter(|i| i.is_archived() && !i.is_trashed())
+        .collect();
     if archived.is_empty() {
         return;
     }
@@ -1901,9 +2009,11 @@ mod tests {
 
     #[test]
     fn test_attention_group_key_one_active_pulls_group_up() {
-        // Mixed group: 1 archived Waiting, 1 active Idle. Group should sort
-        // at tier 2 (Idle); the active member pulls it out of the archive
-        // tier. This is the auto-unarchive contract for cascade.
+        // Mixed group: 1 archived Waiting, 1 active Idle. The active member
+        // pulls the group out of the archive tier (99) into the Idle bucket.
+        // With the unread promoter enabled (default), a non-unread Idle group
+        // encodes to rank 3 (Waiting=0, unread=1, other tiers shifted +1, so
+        // Idle tier 2 -> 3); the point is it's well above the archive tier.
         let mut archived_waiting = Instance::new("aw", "/tmp/aw");
         archived_waiting.group_path = "work".to_string();
         archived_waiting.status = crate::session::Status::Waiting;
@@ -1915,8 +2025,68 @@ mod tests {
         let instances = vec![archived_waiting, active_idle];
         let key = attention_group_key("work", None, &instances);
         assert_eq!(
-            key.1, 2,
-            "group with one active Idle session should sort at tier 2"
+            key.1, 3,
+            "active Idle group should sort in the Idle bucket, far above archive tier 99"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_promotes_unread_below_waiting() {
+        // Group A holds a read Error (tier 1); Group B holds an unread Idle
+        // (tier 2). With the unread promoter on (default), B's unread member
+        // floats it to rank 1, above A's Error (rank 2), matching how the flat
+        // Attention view promotes unread just below Waiting.
+        let mut err = Instance::new("err", "/tmp/err");
+        err.group_path = "a".to_string();
+        err.status = crate::session::Status::Error;
+
+        let mut unread_idle = Instance::new("ui", "/tmp/ui");
+        unread_idle.group_path = "b".to_string();
+        unread_idle.status = crate::session::Status::Idle;
+        unread_idle.mark_unread();
+
+        let key_a = attention_group_key("a", None, std::slice::from_ref(&err));
+        let key_b = attention_group_key("b", None, std::slice::from_ref(&unread_idle));
+        assert!(
+            key_b < key_a,
+            "group with an unread Idle must outrank a group whose best member is a read Error: b={key_b:?} a={key_a:?}"
+        );
+    }
+
+    #[test]
+    fn test_attention_group_key_sunk_unread_member_does_not_promote() {
+        // A group with one active *read* Idle member and one *archived* member
+        // that still carries an unread marker (archive doesn't clear `unread`)
+        // must NOT be promoted: the dismissed member can't drag the group up.
+        // Rank should be the plain Idle bucket, identical to the same group
+        // without any unread anywhere.
+        let mut active_read = Instance::new("ar", "/tmp/ar");
+        active_read.group_path = "g".to_string();
+        active_read.status = crate::session::Status::Idle;
+
+        let mut archived_unread = Instance::new("au", "/tmp/au");
+        archived_unread.group_path = "g".to_string();
+        archived_unread.status = crate::session::Status::Idle;
+        archived_unread.mark_unread();
+        archived_unread.archive(); // archived_at set; unread intentionally kept
+
+        let members = vec![active_read.clone(), archived_unread];
+        let key = attention_group_key("g", None, &members);
+
+        // Same group but with the second member simply read: ranks identical,
+        // proving the sunk unread member contributed nothing.
+        let read_baseline = vec![active_read.clone(), {
+            let mut other = Instance::new("o", "/tmp/o");
+            other.group_path = "g".to_string();
+            other.status = crate::session::Status::Idle;
+            other.archive();
+            other
+        }];
+        let baseline = attention_group_key("g", None, &read_baseline);
+        assert_eq!(
+            key.1, baseline.1,
+            "an archived unread member must not promote the group: rank={} baseline={}",
+            key.1, baseline.1
         );
     }
 
@@ -1971,6 +2141,47 @@ mod tests {
             plain_key < fav_key,
             "plain+Waiting (tier 0) must sort above fav+Idle (tier 2): plain={plain_key:?} fav={fav_key:?}"
         );
+    }
+
+    #[test]
+    fn test_attention_rank_unread_promoter() {
+        // Tiers: Waiting=0, Error=1, Idle=2, Unknown=3, Running=4.
+        // Feature ON: an unread row ranks just below Waiting (0) and above
+        // every other tier, so an unread Idle beats a read Error/Running.
+        let waiting = attention_rank(0, false, true);
+        let unread_idle = attention_rank(2, true, true);
+        let read_error = attention_rank(1, false, true);
+        let read_running = attention_rank(4, false, true);
+        assert!(waiting < unread_idle, "Waiting must stay above unread");
+        assert!(
+            unread_idle < read_error,
+            "unread Idle must rank above a read Error"
+        );
+        assert!(
+            unread_idle < read_running,
+            "unread Idle must rank above a read Running"
+        );
+
+        // Feature OFF: rank is the raw tier, so ordering is unchanged and an
+        // (impossible-when-off, but defensive) unread flag does not promote.
+        assert_eq!(attention_rank(0, false, false), 0);
+        assert_eq!(attention_rank(2, true, false), 2);
+        assert_eq!(attention_rank(4, false, false), 4);
+
+        assert_eq!(
+            attention_rank(99, true, true),
+            99,
+            "unread must not promote sunk rows"
+        );
+        assert_eq!(
+            attention_rank(99, false, true),
+            99,
+            "read sunk rows must keep rank 99"
+        );
+
+        // OFF ordering matches the pre-feature tier order for read rows.
+        assert!(attention_rank(0, false, false) < attention_rank(1, false, false));
+        assert!(attention_rank(1, false, false) < attention_rank(2, false, false));
     }
 
     #[test]

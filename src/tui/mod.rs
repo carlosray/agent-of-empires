@@ -8,10 +8,13 @@ mod creation_poller;
 pub(crate) mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
-mod home;
+pub(crate) mod home;
+#[cfg(feature = "serve")]
+pub(crate) mod plugin_ui;
 #[cfg(feature = "serve")]
 pub(crate) mod remote_home;
 pub(crate) mod responsive;
+mod restart_poller;
 pub mod settings;
 mod status_poller;
 mod stop_poller;
@@ -20,6 +23,23 @@ pub(crate) mod structured_view;
 pub(crate) mod styles;
 
 pub use app::*;
+
+/// Entry point for the hidden `aoe __vt-pipe <socket>` helper subprocess used
+/// by the `AOE_VT_LIVE` live-preview path (default on). Copies the pane's piped
+/// output (stdin) to the unix socket, unbuffered. Dispatched in `main` before
+/// clap so it stays off the CLI/docs surface.
+#[cfg(unix)]
+pub fn run_vt_pipe(socket: &str) -> std::io::Result<()> {
+    crate::tmux::vt::run_pipe(socket)
+}
+
+#[cfg(not(unix))]
+pub fn run_vt_pipe(_socket: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "__vt-pipe is unix-only",
+    ))
+}
 
 use anyhow::Result;
 use crossterm::{
@@ -54,8 +74,92 @@ fn env_mouse_capture_allows() -> bool {
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
         .unwrap_or(true)
 }
+
+/// RAII guard for the TUI's terminal mode. `enter` turns on raw mode, the
+/// alternate screen, bracketed paste, and (when requested) mouse capture; the
+/// `Drop` impl reverses all of it. Because it runs on drop, the terminal is
+/// restored on EVERY exit path, including a panic mid-render, where the old
+/// inline teardown was skipped and left the terminal wedged (raw mode / mouse
+/// reporting stuck on). Drop is best-effort and never panics.
+struct TerminalGuard {
+    /// Whether to emit `DisableMouseCapture` on teardown. Mirrors the startup
+    /// gate: under Mosh we never enable capture, so we must not disable it
+    /// either; otherwise we always disable (a mid-session settings toggle can
+    /// turn it on after startup, so we can't gate on the startup value).
+    disable_mouse: bool,
+}
+
+impl TerminalGuard {
+    fn enter(enable_mouse: bool, mosh_active: bool) -> Result<Self> {
+        // Roll back any already-applied state if a later step fails, so a
+        // partial enter (e.g. raw mode on, alternate screen failed) never
+        // leaves the shell wedged before a guard exists to restore it on drop.
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+            let _ = disable_raw_mode();
+            return Err(err.into());
+        }
+        if enable_mouse {
+            if let Err(err) = execute!(stdout, EnableMouseCapture) {
+                let _ = execute!(stdout, LeaveAlternateScreen, DisableBracketedPaste);
+                let _ = disable_raw_mode();
+                return Err(err.into());
+            }
+        }
+        Ok(Self {
+            disable_mouse: !mosh_active,
+        })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = disable_raw_mode();
+        if self.disable_mouse {
+            let _ = execute!(stdout, DisableMouseCapture);
+        }
+        let _ = execute!(
+            stdout,
+            LeaveAlternateScreen,
+            DisableBracketedPaste,
+            crossterm::cursor::Show
+        );
+    }
+}
 use crate::session::get_update_settings;
 use crate::update::check_for_update;
+
+/// Clear the screen and force a full redraw on the next frame, without the
+/// `ESC[6n` cursor-position round-trip that ratatui's `Terminal::clear` does.
+///
+/// ratatui 0.30's `Terminal::clear` snapshots the cursor via
+/// `get_cursor_position` before clearing. That read shares crossterm's internal
+/// event reader with our live `EventStream`; around stream lifecycle changes the
+/// reader's poll wakes early and the cursor read completes with no matching
+/// event, which surfaces as "cursor position could not be read within a normal
+/// duration" (an immediate 0 ms failure, not the 2 s timeout the message
+/// implies). Clearing the backend directly via `clear_region(ClearType::All)`
+/// (the same call ratatui's Fullscreen `clear_viewport` issues) and resetting
+/// the diff baseline repaints every cell on the next `draw` with no cursor
+/// query.
+///
+/// A free function rather than an `App` method so both the local home view and
+/// the remote home view route through one definition, keeping the "no clear
+/// path calls `get_cursor_position`" invariant true across the whole TUI.
+/// `ClearType::All` is correct for the `Viewport::Fullscreen` the TUI uses; an
+/// inline or fixed viewport would need a different clear.
+pub(crate) fn clear_terminal<B: Backend>(terminal: &mut Terminal<B>) -> Result<(), B::Error> {
+    terminal
+        .backend_mut()
+        .clear_region(ratatui::backend::ClearType::All)?;
+    // Reset both buffers so the next draw diffs against an empty baseline and
+    // repaints the whole viewport.
+    terminal.current_buffer_mut().reset();
+    terminal.swap_buffers();
+    Ok(())
+}
 
 pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     // Cross-machine entrypoint: when `AOE_DAEMON_URL` is set, swap the
@@ -123,17 +227,21 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
         }
     }
 
+    // Opt-in clean-only plugin auto-update sweep (off by default). Spawned
+    // non-blocking so a slow remote or git never delays the TUI; applied updates
+    // take effect on the next launch.
+    // No notifier in the TUI: there is no plugin host / notification ring here.
+    crate::plugin::auto_update::spawn_if_enabled(&crate::session::Config::load_or_warn(), None);
+
     // Bail early if stdin is not a terminal. Running without a tty would
     // cause the event loop to busy-loop after the parent terminal dies.
     if !io::stdin().is_terminal() {
         anyhow::bail!("stdin is not a terminal; aoe requires an interactive TTY");
     }
 
-    // Setup terminal
-    // (mouse_capture_requested defined below; see top-of-file pub fn.)
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    // Setup terminal. Resolve the mouse/mosh policy BEFORE entering raw mode so
+    // the RAII `TerminalGuard` owns the whole enter/restore lifecycle.
+    //
     // Mouse capture is ON by default to preserve preview-pane wheel scroll
     // (#795); toggle it off via Settings > Interaction > Mouse Capture, or set
     // AOE_MOUSE_CAPTURE=0 as a backstop on iOS Mosh + Termius/Blink, which
@@ -151,10 +259,9 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
     let startup_session_config = crate::session::resolve_config(profile)
         .map(|c| c.session)
         .unwrap_or_default();
-    if mouse_capture_requested(&startup_session_config) && !mosh_active {
-        execute!(stdout, EnableMouseCapture)?;
-    }
-    let backend = CrosstermBackend::new(stdout);
+    let enable_mouse = mouse_capture_requested(&startup_session_config) && !mosh_active;
+    let _terminal_guard = TerminalGuard::enter(enable_mouse, mosh_active)?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
     if let Some(title) = crate::terminal::dashboard_title_for_profile(profile) {
         if let Err(e) = crate::terminal::write_title_sequence(terminal.backend_mut(), &title) {
@@ -212,22 +319,52 @@ pub async fn run(profile: &str, startup_warning: Option<String>) -> Result<()> {
 
     crate::session::clear_tui_heartbeat();
 
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableBracketedPaste
-    )?;
-    // Always disable on teardown (except Mosh, where we never enabled): a
-    // mid-session Settings toggle can turn capture on after startup, so gating
-    // disable on the startup snapshot would leave capture stuck on at exit.
-    if !mosh_active {
-        execute!(terminal.backend_mut(), DisableMouseCapture)?;
-    }
-    terminal.show_cursor()?;
-
+    // Terminal restore (raw mode, alternate screen, bracketed paste, mouse
+    // capture, cursor) happens in `_terminal_guard`'s Drop, so it runs on every
+    // exit path including a panic, not just this normal return.
+    drop(terminal);
     result
+}
+
+#[cfg(test)]
+mod clear_terminal_tests {
+    use super::clear_terminal;
+    use ratatui::{backend::TestBackend, buffer::Cell, widgets::Paragraph, Terminal};
+
+    fn all_blank(terminal: &Terminal<TestBackend>) -> bool {
+        terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .all(|c| c == &Cell::default())
+    }
+
+    /// `clear_terminal` must wipe the backend AND reset ratatui's diff baseline,
+    /// so a clear followed by an identical redraw repaints every cell instead of
+    /// diffing to a no-op and leaving a blank screen.
+    #[test]
+    fn clears_backend_and_repaints_on_next_identical_draw() {
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new("HELLO"), f.area()))
+            .unwrap();
+        assert!(!all_blank(&terminal), "draw should paint the backend");
+
+        clear_terminal(&mut terminal).unwrap();
+        assert!(
+            all_blank(&terminal),
+            "clear_terminal should wipe the backend"
+        );
+
+        // Same content again: without the diff-baseline reset the diff would be
+        // empty and the screen would stay blank after the clear.
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new("HELLO"), f.area()))
+            .unwrap();
+        assert!(!all_blank(&terminal), "redraw after clear must repaint");
+    }
 }
 
 #[cfg(test)]

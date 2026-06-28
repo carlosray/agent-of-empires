@@ -18,8 +18,12 @@ pub mod agent_compat;
 pub mod agent_profiles;
 pub mod agent_registry;
 pub mod approvals;
+pub mod background_agent;
+#[cfg(feature = "serve")]
+pub mod claude_import;
 pub mod client;
 pub mod context_primer;
+pub mod elicitations;
 pub mod event_store;
 pub mod fs_handler;
 pub mod install_hints;

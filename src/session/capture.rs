@@ -62,7 +62,7 @@ pub(crate) fn generate_claude_session_id() -> String {
 /// Claude stores per-project data under `~/.claude/projects/{encoded}/` where
 /// non-alphanumeric characters (except `-`) are replaced with `-`.
 /// For example: `/Users/foo/bar` becomes `-Users-foo-bar`.
-fn encode_claude_project_path(project_path: &str) -> String {
+pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
     project_path
         .chars()
         .map(|c| {
@@ -221,7 +221,7 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 /// Polling closure for Claude Code session tracking on the host filesystem.
 ///
 /// Per tick, in order:
-/// 1. Read `/tmp/aoe-hooks/<instance_id>/session_id` (written by Claude's
+/// 1. Read `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` (written by Claude's
 ///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
 ///    old, return it and skip the disk scan.
 /// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
@@ -239,7 +239,7 @@ pub(crate) fn claude_poll_fn(
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
         // Sidecar reads are scoped per-instance: the file lives under
-        // `/tmp/aoe-hooks/<instance_id>/` so a sibling instance's hook
+        // `/tmp/aoe-hooks-<euid>/<instance_id>/` so a sibling instance's hook
         // writes cannot reach this path, which is why the read skips
         // `compose_exclusion`. `extra_excludes` is still honored so a
         // sidecar value matching one of this instance's cleared sids does
@@ -743,11 +743,66 @@ pub(crate) fn compose_exclusion(
     set
 }
 
+/// Extend [`compose_exclusion`] with the sids of stopped, archived, or
+/// pane-less Claude peers in the same `project_path`, read from
+/// `sessions.json` via `Storage` for the caller's effective profile.
+///
+/// Used only by the Claude branch of `Instance::try_retroactive_capture`
+/// when the per-instance sidecar is absent or stale: the mtime fallback
+/// over `~/.claude/projects/<encoded-cwd>/` otherwise picks a co-located
+/// stopped peer's jsonl, since [`build_exclusion_set`] only sees live
+/// tmux peers, and the resume binds to the peer's conversation (#2355).
+///
+/// `claude_poll_fn` keeps the live-only exclusion via [`compose_exclusion`]:
+/// it runs on a hot polling path, and live peers already surface in the
+/// tmux env scan.
+///
+/// Scope: `~/.claude/projects/` is keyed by `$HOME`, not by AoE profile,
+/// but this helper only inspects `sessions.json` for the caller's effective
+/// profile. A stopped peer in a different profile against the same host
+/// `$HOME` will not be excluded; the residual gap is narrower than #2355's
+/// trigger and is left for a follow-up.
+pub(crate) fn compose_exclusion_with_stopped_peers(
+    current_instance_id: &str,
+    current_project_path: &str,
+    profile: &str,
+    retroactive_capture_excludes: &HashSet<String>,
+) -> HashSet<String> {
+    let mut set = compose_exclusion(current_instance_id, retroactive_capture_excludes);
+    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
+        return set;
+    };
+    let Ok(instances) = storage.load() else {
+        return set;
+    };
+    for inst in instances {
+        if inst.id == current_instance_id {
+            continue;
+        }
+        if inst.tool != "claude" {
+            continue;
+        }
+        if inst.project_path != current_project_path {
+            continue;
+        }
+        let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
+            || inst.is_archived()
+            || !inst.has_live_tmux_pane();
+        if !should_exclude {
+            continue;
+        }
+        if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+            set.insert(sid.to_string());
+        }
+    }
+    set
+}
+
 /// Build the set of session IDs already claimed by other live AoE instances.
 ///
-/// Reads every other AoE-prefixed tmux session's hidden env to find which
-/// session IDs are currently bound to which instance, and returns the set
-/// of captured IDs that belong to instances OTHER than `current_instance_id`.
+/// Reads every other live AoE tmux session's hidden env to find which session
+/// IDs are currently bound to which instance, and returns the set of captured
+/// IDs that belong to instances OTHER than `current_instance_id`.
 /// Used by post-launch poll closures to avoid re-importing another
 /// instance's session via filesystem scan.
 ///
@@ -769,8 +824,7 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
         .lines()
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
-                && !name.starts_with(crate::tmux::TERMINAL_PREFIX)
-                && !name.starts_with(crate::tmux::CONTAINER_TERMINAL_PREFIX)
+                && !name.starts_with(crate::tmux::TOOL_PREFIX)
         })
         .collect();
 
@@ -785,7 +839,11 @@ fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
 
     let other_sessions: Vec<&str> = instance_ids
         .iter()
-        .filter(|(_, owner)| owner.as_deref() != Some(current_instance_id))
+        .filter(|(_, owner)| {
+            owner
+                .as_deref()
+                .is_some_and(|owner| owner != current_instance_id)
+        })
         .map(|(name, _)| name.as_str())
         .collect();
 
@@ -4180,9 +4238,26 @@ mod tests {
     #[test]
     #[serial]
     fn test_claude_poll_fn_reads_hook_sidecar_first() {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_tmp = tempfile::tempdir().unwrap();
+        let hook_base = hook_tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&hook_base).unwrap();
+        std::fs::set_permissions(&hook_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::hooks::override_base_for_test(hook_base.clone());
+        crate::hooks::reset_for_test();
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::hooks::clear_base_override_for_test();
+                crate::hooks::reset_for_test();
+            }
+        }
+        let _cleanup = Cleanup;
+
         let instance_id = "test_sidecar_first_path";
-        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
-        std::fs::create_dir_all(&hook_dir).unwrap();
+        let hook_dir = hook_base.join(instance_id);
+        std::fs::create_dir(&hook_dir).unwrap();
+        std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let sidecar_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         std::fs::write(hook_dir.join("session_id"), sidecar_uuid).unwrap();
 
@@ -4207,15 +4282,31 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        std::fs::remove_dir_all(&hook_dir).ok();
     }
 
     #[test]
     #[serial]
     fn test_claude_poll_fn_skips_stale_sidecar_falls_through_to_disk() {
+        use std::os::unix::fs::PermissionsExt;
+        let hook_tmp = tempfile::tempdir().unwrap();
+        let hook_base = hook_tmp.path().join("aoe-hooks");
+        std::fs::create_dir(&hook_base).unwrap();
+        std::fs::set_permissions(&hook_base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        crate::hooks::override_base_for_test(hook_base.clone());
+        crate::hooks::reset_for_test();
+        struct Cleanup;
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                crate::hooks::clear_base_override_for_test();
+                crate::hooks::reset_for_test();
+            }
+        }
+        let _cleanup = Cleanup;
+
         let instance_id = "test_sidecar_stale_falls_through";
-        let hook_dir = std::path::PathBuf::from("/tmp/aoe-hooks").join(instance_id);
-        std::fs::create_dir_all(&hook_dir).unwrap();
+        let hook_dir = hook_base.join(instance_id);
+        std::fs::create_dir(&hook_dir).unwrap();
+        std::fs::set_permissions(&hook_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let stale_uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let sidecar_path = hook_dir.join("session_id");
         std::fs::write(&sidecar_path, stale_uuid).unwrap();
@@ -4248,7 +4339,6 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
-        std::fs::remove_dir_all(&hook_dir).ok();
     }
 
     #[test]

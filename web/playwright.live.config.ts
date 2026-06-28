@@ -8,7 +8,7 @@
 // Use `npx playwright test --config=playwright.live.config.ts`.
 //
 // CI runs this from the `playwright-live` job (see .github/workflows/ci.yml)
-// after building `aoe` with `--features serve --release`. Local runs pick up
+// after building `aoe` with default features (serve included). Local runs pick up
 // the binary from `AOE_E2E_BINARY` or fall back to `../target/release/aoe`.
 
 import { defineConfig } from "@playwright/test";
@@ -46,7 +46,13 @@ export default defineConfig({
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
-  reporter: process.env.CI ? [["html", { open: "never", outputFolder: "playwright-live-report" }], ["github"]] : "list",
+  reporter: process.env.CI
+    ? [
+        ["html", { open: "never", outputFolder: "playwright-live-report" }],
+        ["github"],
+        ["junit", { outputFile: "test-report.junit.xml" }],
+      ]
+    : "list",
   projects: [
     {
       name: "chromium",

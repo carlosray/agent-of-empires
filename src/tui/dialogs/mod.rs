@@ -1,6 +1,7 @@
 //! TUI dialog components
 
 mod changelog;
+mod cheats;
 mod command_palette;
 mod confirm;
 mod context_menu;
@@ -13,6 +14,7 @@ mod info;
 mod intro;
 mod new_session;
 mod no_agents;
+mod plugin_manager;
 mod profile_picker;
 mod project_session_picker;
 mod projects;
@@ -24,8 +26,9 @@ mod send_message;
 #[cfg(feature = "serve")]
 mod serve;
 mod snooze_duration;
-mod sort_picker;
+pub mod sort_picker;
 mod telemetry_consent;
+mod tips;
 mod tool_picker;
 mod update_confirm;
 mod worktree_name;
@@ -46,6 +49,7 @@ pub use intro::{IntroDialog, IntroOutcome};
 pub(crate) use new_session::project_picker_label;
 pub use new_session::{NewSessionData, NewSessionDialog};
 pub use no_agents::{NoAgentsAction, NoAgentsDialog};
+pub use plugin_manager::PluginManagerDialog;
 pub use profile_picker::{ProfileEntry, ProfilePickerAction, ProfilePickerDialog};
 pub use project_session_picker::ProjectSessionPickerDialog;
 pub use projects::ProjectsDialog;
@@ -59,6 +63,7 @@ pub use serve::{ServeAction, ServeView};
 pub use snooze_duration::SnoozeDurationDialog;
 pub use sort_picker::SortPickerDialog;
 pub use telemetry_consent::TelemetryConsentDialog;
+pub use tips::{TipsDialog, TipsOutcome};
 pub use tool_picker::ToolPickerDialog;
 pub use update_confirm::UpdateConfirmDialog;
 pub use worktree_name::{WorktreeNameData, WorktreeNameDialog};

@@ -56,6 +56,7 @@ use tracing::{debug, trace, warn};
 
 use super::approvals::Nonce;
 use super::state::{Event, Plan, RateLimitInfo};
+use crate::events::{self, Order, SeqBound};
 
 /// Externally-tagged JSON discriminants for non-substantive structured view
 /// events: lifecycle and metadata snapshots the agent emits once per
@@ -71,16 +72,6 @@ const NON_SUBSTANTIVE_EVENT_DISCRIMINANTS: &[&str] = &[
     "AcpSessionAssigned",
     "PromptCapabilities",
 ];
-
-/// Build the `AND event_json NOT LIKE '{"Name":%'` SQL fragment for every
-/// non-substantive discriminant, newline-joined for readable queries.
-fn non_substantive_not_like_clauses() -> String {
-    NON_SUBSTANTIVE_EVENT_DISCRIMINANTS
-        .iter()
-        .map(|name| format!("AND event_json NOT LIKE '{{\"{name}\":%'"))
-        .collect::<Vec<_>>()
-        .join("\n               ")
-}
 
 /// One page of replayed events plus the cursor metadata a paginating
 /// client needs to fetch the next page.
@@ -108,42 +99,36 @@ pub struct ReplayPage {
     pub lowest_seq: Option<u64>,
 }
 
-/// Highest seq stored for `session_id`, or 0 if none. Free fn so both
-/// the public [`EventStore::highest_seq`] and the single-snapshot
-/// [`EventStore::replay_page`] can share it under one held lock.
-fn query_highest_seq(conn: &Connection, session_id: &str) -> u64 {
-    match conn
-        .query_row(
-            "SELECT MAX(seq) FROM acp_events WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()
-    {
-        Ok(Some(Some(max))) => max as u64,
-        _ => 0,
-    }
-}
-
-/// Lowest seq still stored for `session_id`, or `None` when empty.
-/// Companion to [`query_highest_seq`].
-fn query_lowest_seq(conn: &Connection, session_id: &str) -> Option<u64> {
-    match conn
-        .query_row(
-            "SELECT MIN(seq) FROM acp_events WHERE session_id = ?1",
-            params![session_id],
-            |row| row.get::<_, Option<i64>>(0),
-        )
-        .optional()
-    {
-        Ok(Some(Some(m))) => Some(m as u64),
-        _ => None,
-    }
+/// A user turn begins at one of these events. Backward replay paging
+/// (`replay_page_before`) aligns each page to one so the client never
+/// seams a split turn when it prepends older history.
+fn is_user_turn_boundary(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. }
+    )
 }
 
 /// SQLite-backed structured view event log. One row per (session_id, seq).
+///
+/// The generic storage mechanics (schema, append, retention prune, keyset
+/// scans, seq bookkeeping, attachment blobs, topic deletion) live in
+/// `crate::events`; this type is the ACP consumer: it owns the connection,
+/// serializes/deserializes the `Event` payload, and keeps the ACP-specific
+/// replay semantics and `json_extract` accessors. The dependency arrow runs
+/// acp -> events.
 pub struct EventStore {
     conn: Mutex<Connection>,
+    /// Read-only connection used exclusively by `search_content`. A
+    /// content search scans many rows; routing it through the writer
+    /// `conn` would hold that mutex for the whole scan and stall the
+    /// live `record()` path (WAL gives no concurrency while one Rust
+    /// mutex serializes every access). A separate read-only connection
+    /// lets WAL serve the scan concurrently with writes. Searches still
+    /// serialize against each other behind this mutex, which is fine:
+    /// one in-flight search at a time is plenty for the palette.
+    search_conn: Mutex<Connection>,
+    schema: events::Schema,
     /// Per-session retention cap. Older events are pruned on insert
     /// once the count exceeds this value. Bytes are not enforced here
     /// (the in-memory ring still has a byte cap); the row count keeps
@@ -157,49 +142,26 @@ impl EventStore {
     /// enabled so concurrent writers (publish path) and readers
     /// (replay endpoint) don't block each other.
     pub fn open(db_path: &Path, max_events_per_session: usize) -> Result<Self> {
-        if let Some(parent) = db_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).with_context(|| {
-                    format!(
-                        "create parent dir for structured view DB at {}",
-                        parent.display()
-                    )
-                })?;
-            }
-        }
-        let conn = Connection::open(db_path)
-            .with_context(|| format!("open structured view DB at {}", db_path.display()))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .context("enable WAL mode")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .context("set synchronous=NORMAL")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS acp_events (
-                session_id  TEXT    NOT NULL,
-                seq         INTEGER NOT NULL,
-                event_json  TEXT    NOT NULL,
-                created_at  INTEGER NOT NULL,
-                PRIMARY KEY (session_id, seq)
-            );
-            CREATE INDEX IF NOT EXISTS idx_acp_events_session_seq
-                ON acp_events(session_id, seq);
-            CREATE INDEX IF NOT EXISTS idx_acp_events_session_created_at
-                ON acp_events(session_id, created_at);
-            CREATE TABLE IF NOT EXISTS acp_attachments (
-                session_id    TEXT    NOT NULL,
-                seq           INTEGER NOT NULL,
-                attachment_id TEXT    NOT NULL,
-                kind          TEXT    NOT NULL,
-                mime_type     TEXT    NOT NULL,
-                name          TEXT,
-                data          BLOB    NOT NULL,
-                created_at    INTEGER NOT NULL,
-                PRIMARY KEY (session_id, attachment_id)
-            );
-            CREATE INDEX IF NOT EXISTS idx_acp_attachments_session_seq
-                ON acp_attachments(session_id, seq);",
+        // Prefix "acp" maps to the existing acp_events / acp_attachments
+        // tables, so an established database opens unchanged (no migration).
+        let schema = events::Schema::new("acp")?;
+        let conn = events::open(db_path, &schema)?;
+        // Separate read-only handle for content search; the writer above
+        // already created the file and tables, so opening read-only here
+        // always succeeds. query_only is belt-and-suspenders on top of the
+        // READ_ONLY flag; busy_timeout keeps a scan from erroring out if it
+        // briefly contends with a checkpoint.
+        let search_conn = Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
         )
-        .context("create acp_events schema")?;
+        .with_context(|| format!("open read-only search handle at {}", db_path.display()))?;
+        search_conn
+            .pragma_update(None, "query_only", "ON")
+            .context("set query_only=ON on search handle")?;
+        search_conn
+            .busy_timeout(std::time::Duration::from_millis(1000))
+            .context("set busy_timeout on search handle")?;
         debug!(
             target: "acp.event_store",
             path = %db_path.display(),
@@ -208,6 +170,8 @@ impl EventStore {
         );
         Ok(Self {
             conn: Mutex::new(conn),
+            search_conn: Mutex::new(search_conn),
+            schema,
             max_events_per_session,
         })
     }
@@ -228,13 +192,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let inserted = conn
-            .execute(
-                "INSERT OR IGNORE INTO acp_events (session_id, seq, event_json, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
-                params![session_id, seq as i64, json, now_ms],
-            )
-            .with_context(|| format!("insert {session_id}@{seq}"))?;
+        let inserted = events::insert_event(&conn, &self.schema, session_id, seq, &json, now_ms)?;
         if inserted == 0 {
             // Primary-key collision: same (session_id, seq) seen before.
             // Logged at trace because the cause is usually a benign retry
@@ -259,80 +217,20 @@ impl EventStore {
                 "recorded event"
             );
         }
-        // Prune oldest beyond the retention cap. Cheap when below the cap
-        // (the subquery returns 0 rows). We do it on every insert rather
-        // than periodically so the upper bound on per-session disk usage
-        // is strict rather than amortised.
-        //
-        // Snapshot events (the slash-command list, mode list, ACP session
-        // id) are exempt from pruning: the agent only emits them once per
-        // session lifecycle, near the start of the seq range, so a long
-        // session blows past the cap and evicts them; leaving the
-        // composer's `/` palette and the mode picker empty on reconnect.
-        // See #1049. The `event_json NOT LIKE` clauses match the
-        // externally-tagged JSON discriminant for each pinned variant.
-        if self.max_events_per_session > 0 {
-            // Compute the prune cutoff seq once so the events delete and
-            // the attachments delete agree on the same threshold. Doing
-            // the events delete first would shift the OFFSET row out from
-            // under the attachments delete and leave orphaned blobs.
-            let cutoff: Option<i64> = conn
-                .query_row(
-                    "SELECT seq FROM acp_events
-                     WHERE session_id = ?1
-                     ORDER BY seq DESC
-                     LIMIT 1 OFFSET ?2",
-                    params![session_id, self.max_events_per_session as i64],
-                    |row| row.get(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            if let Some(cutoff) = cutoff {
-                // The `non_substantive_not_like_clauses()` helper pins the
-                // snapshot variants (slash-command list, mode list, ACP
-                // session id) so a long session can't evict them. See #1049.
-                let prune_sql = format!(
-                    "DELETE FROM acp_events
-                     WHERE session_id = ?1
-                       AND seq <= ?2
-                       {clauses}",
-                    clauses = non_substantive_not_like_clauses()
-                );
-                match conn.execute(&prune_sql, params![session_id, cutoff]) {
-                    Ok(0) => {}
-                    Ok(pruned) => {
-                        trace!(
-                            target: "acp.event_store",
-                            session = %session_id,
-                            pruned,
-                            cap = self.max_events_per_session,
-                            "pruned oldest events past retention cap"
-                        );
-                    }
-                    Err(e) => {
-                        // Prune failure isn't fatal; the row is recorded,
-                        // we just exceed the cap until the next prune
-                        // succeeds. Log + swallow so callers don't have to
-                        // distinguish "record failed" from "trim failed".
-                        warn!(target: "acp.event_store", "prune {session_id}: {e}");
-                    }
-                }
-                // Drop attachment blobs whose owning UserPromptSent has
-                // (or is about to be) pruned. Attachments only ever hang
-                // off prompts, never the pinned snapshot variants, so a
-                // flat `seq <= cutoff` delete cannot strand a blob whose
-                // event survived. This is what keeps the attachment table
-                // bounded alongside the event log rather than growing
-                // without limit as screenshots accumulate.
-                if let Err(e) = conn.execute(
-                    "DELETE FROM acp_attachments
-                     WHERE session_id = ?1 AND seq <= ?2",
-                    params![session_id, cutoff],
-                ) {
-                    warn!(target: "acp.event_store", "prune attachments {session_id}: {e}");
-                }
-            }
-        }
+        // Prune oldest beyond the retention cap on every insert so the
+        // per-session disk bound stays strict rather than amortised.
+        // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS are exempt: the agent emits
+        // those snapshot events (slash-command list, mode list, ACP session
+        // id) once per session lifecycle near the start of the seq range, so
+        // a long session would otherwise evict them and leave the composer's
+        // `/` palette and the mode picker empty on reconnect. See #1049.
+        events::prune_retention(
+            &conn,
+            &self.schema,
+            session_id,
+            self.max_events_per_session,
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+        );
         Ok(())
     }
 
@@ -345,42 +243,26 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let mut stmt = match conn.prepare(
-            "SELECT seq, event_json FROM acp_events
-             WHERE session_id = ?1 AND seq < ?2
-             ORDER BY seq ASC",
-        ) {
-            Ok(s) => s,
+        events::scan(
+            &conn,
+            &self.schema,
+            session_id,
+            SeqBound::Before(before),
+            Order::Asc,
+            None,
+        )
+        .into_iter()
+        .filter_map(|(seq, json)| match serde_json::from_str::<Event>(&json) {
+            Ok(event) => Some((seq, event)),
             Err(e) => {
-                warn!(target: "acp.event_store", "prepare replay_before for {session_id}: {e}");
-                return Vec::new();
+                warn!(
+                    target: "acp.event_store",
+                    "deserialise event {session_id}@{seq}: {e}"
+                );
+                None
             }
-        };
-        let rows = match stmt.query_map(params![session_id, before as i64], |row| {
-            let seq: i64 = row.get(0)?;
-            let json: String = row.get(1)?;
-            Ok((seq as u64, json))
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(target: "acp.event_store", "query replay_before for {session_id}: {e}");
-                return Vec::new();
-            }
-        };
-        let mut out = Vec::new();
-        for row in rows {
-            match row {
-                Ok((seq, json)) => match serde_json::from_str::<Event>(&json) {
-                    Ok(event) => out.push((seq, event)),
-                    Err(e) => warn!(
-                        target: "acp.event_store",
-                        "deserialise event {session_id}@{seq}: {e}"
-                    ),
-                },
-                Err(e) => warn!(target: "acp.event_store", "row error: {e}"),
-            }
-        }
-        out
+        })
+        .collect()
     }
 
     /// Return all events for `session_id` with `seq > since`, oldest
@@ -412,88 +294,39 @@ impl EventStore {
         // land between these reads and the page query and make
         // `has_more`/`highest_seq` disagree (which would let the client's
         // paging cap stop early). See #1705 review.
-        let highest_seq = query_highest_seq(&conn, session_id);
-        let lowest_seq = query_lowest_seq(&conn, session_id);
-        // `seq` is a signed SQLite column; clamp before the cast so the
-        // status probe's `since = u64::MAX` doesn't wrap to -1 and match
-        // every row (`seq > -1`) instead of returning an empty page.
-        let since_i64 = i64::try_from(since).unwrap_or(i64::MAX);
-        // Probe one extra row beyond `limit` to detect `has_more` without
-        // a second query against `highest_seq`.
+        let highest_seq = events::highest_seq(&conn, &self.schema, session_id);
+        let lowest_seq = events::lowest_seq(&conn, &self.schema, session_id);
+        // Probe one extra row beyond `limit` to detect `has_more` without a
+        // second query against `highest_seq`. The signed-column clamp for a
+        // `u64::MAX` cursor lives in `events::scan`.
         let probe = limit.map(|n| n.saturating_add(1));
-        let sql = match probe {
-            Some(_) => {
-                "SELECT seq, event_json FROM acp_events
-                 WHERE session_id = ?1 AND seq > ?2
-                 ORDER BY seq ASC LIMIT ?3"
-            }
-            None => {
-                "SELECT seq, event_json FROM acp_events
-                 WHERE session_id = ?1 AND seq > ?2
-                 ORDER BY seq ASC"
-            }
-        };
-        let mut stmt = match conn.prepare(sql) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(target: "acp.event_store", "prepare replay for {session_id}: {e}");
-                return ReplayPage {
-                    events: Vec::new(),
-                    last_scanned_seq: None,
-                    has_more: false,
-                    highest_seq,
-                    lowest_seq,
-                };
-            }
-        };
-        let map_row = |row: &rusqlite::Row| {
-            let seq: i64 = row.get(0)?;
-            let json: String = row.get(1)?;
-            Ok((seq as u64, json))
-        };
-        let rows = match probe {
-            Some(p) => stmt.query_map(params![session_id, since_i64, p as i64], map_row),
-            None => stmt.query_map(params![session_id, since_i64], map_row),
-        };
-        let rows = match rows {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(target: "acp.event_store", "query replay for {session_id}: {e}");
-                return ReplayPage {
-                    events: Vec::new(),
-                    last_scanned_seq: None,
-                    has_more: false,
-                    highest_seq,
-                    lowest_seq,
-                };
-            }
-        };
+        let rows = events::scan(
+            &conn,
+            &self.schema,
+            session_id,
+            SeqBound::After(since),
+            Order::Asc,
+            probe,
+        );
         let mut out = Vec::new();
         let mut last_scanned_seq = None;
-        let mut scanned = 0usize;
         let mut has_more = false;
-        for row in rows {
-            match row {
-                Ok((seq, json)) => {
-                    // The probe row proves another page exists; don't
-                    // consume it or advance the cursor onto it.
-                    if let Some(n) = limit {
-                        if scanned == n {
-                            has_more = true;
-                            break;
-                        }
-                    }
-                    scanned += 1;
-                    last_scanned_seq = Some(seq);
-                    match serde_json::from_str::<Event>(&json) {
-                        Ok(event) => out.push((seq, event)),
-                        Err(e) => warn!(
-                            target: "acp.event_store",
-                            "deserialise event {session_id}@{seq}: {e}"
-                        ),
-                    }
+        for (scanned, (seq, json)) in rows.into_iter().enumerate() {
+            // The probe row proves another page exists; don't consume it or
+            // advance the cursor onto it.
+            if let Some(n) = limit {
+                if scanned == n {
+                    has_more = true;
+                    break;
                 }
-                Err(e) => warn!(target: "acp.event_store", "row error: {e}"),
+            }
+            last_scanned_seq = Some(seq);
+            match serde_json::from_str::<Event>(&json) {
+                Ok(event) => out.push((seq, event)),
+                Err(e) => warn!(
+                    target: "acp.event_store",
+                    "deserialise event {session_id}@{seq}: {e}"
+                ),
             }
         }
         trace!(
@@ -504,6 +337,111 @@ impl EventStore {
             returned = out.len(),
             has_more,
             "replayed events"
+        );
+        ReplayPage {
+            events: out,
+            last_scanned_seq,
+            has_more,
+            highest_seq,
+            lowest_seq,
+        }
+    }
+
+    /// Return up to `limit` events for `session_id` with `seq < before`,
+    /// the ones sitting CLOSEST below `before`, in ascending (oldest
+    /// first) order. Backs the structured view's recent-first load: the
+    /// client renders the tail first (request `before = u64::MAX`) and
+    /// pages older history as the user scrolls up, passing the previous
+    /// page's lowest seq back as `before`.
+    ///
+    /// Mirrors [`replay_page`](Self::replay_page)'s single-snapshot lock
+    /// and `n + 1` probe, but scans `ORDER BY seq DESC` so the window is
+    /// the newest rows below `before` (a forward `ORDER BY seq ASC LIMIT`
+    /// would return the OLDEST rows and leave a gap). The DESC result is
+    /// reversed in memory before returning so callers always see ASC.
+    /// `last_scanned_seq` is the LOWEST seq consumed (the cursor for the
+    /// next-older page); it advances over rows that fail to deserialise so
+    /// a corrupt row can't stall the paging loop.
+    pub fn replay_page_before(
+        &self,
+        session_id: &str,
+        before: u64,
+        limit: Option<usize>,
+    ) -> ReplayPage {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let highest_seq = events::highest_seq(&conn, &self.schema, session_id);
+        let lowest_seq = events::lowest_seq(&conn, &self.schema, session_id);
+        // Probe one extra row beyond `limit` to detect `has_more`. The
+        // signed-column clamp for a `u64::MAX` tail cursor lives in
+        // `events::scan`.
+        let probe = limit.map(|n| n.saturating_add(1));
+        let rows = events::scan(
+            &conn,
+            &self.schema,
+            session_id,
+            SeqBound::Before(before),
+            Order::Desc,
+            probe,
+        );
+        let mut out = Vec::new();
+        let mut last_scanned_seq = None;
+        let mut has_more = false;
+        for (scanned, (seq, json)) in rows.into_iter().enumerate() {
+            // The probe row proves an older page exists; don't consume it or
+            // move the cursor onto it.
+            if let Some(n) = limit {
+                if scanned == n {
+                    has_more = true;
+                    break;
+                }
+            }
+            // DESC scan, so each consumed row's seq is lower than the last;
+            // the final one is the page's lowest, which is the cursor for
+            // the next-older page.
+            last_scanned_seq = Some(seq);
+            match serde_json::from_str::<Event>(&json) {
+                Ok(event) => out.push((seq, event)),
+                Err(e) => warn!(
+                    target: "acp.event_store",
+                    "deserialise event {session_id}@{seq}: {e}"
+                ),
+            }
+        }
+        // Scanned newest-first; callers expect oldest-first.
+        out.reverse();
+        // Align the page to a user-turn boundary so the client can reduce
+        // it in isolation and prepend it without seaming a split turn onto
+        // the already-loaded head. Only when `has_more`: a leading partial
+        // turn belongs to an older turn whose start is in the next page, so
+        // drop it here and let the next `before` re-fetch it. When the page
+        // reached session start (`!has_more`) keep everything, so the very
+        // first turn and the pinned handshake snapshot (#1049) survive on a
+        // short session that loads in one page. The giant-single-turn case
+        // (no boundary in the whole window) keeps the window as-is rather
+        // than returning an empty page and trapping the client's paging loop.
+        if has_more {
+            if let Some(i) = out
+                .iter()
+                .position(|(_, ev)| is_user_turn_boundary(ev))
+                .filter(|&i| i > 0)
+            {
+                out.drain(0..i);
+            }
+        }
+        // Cursor for the next-older page is the lowest seq we kept, so a
+        // trimmed leading turn re-loads contiguously on the next request.
+        last_scanned_seq = out.first().map(|(seq, _)| *seq).or(last_scanned_seq);
+        trace!(
+            target: "acp.event_store",
+            session = %session_id,
+            before,
+            limit = ?limit,
+            returned = out.len(),
+            has_more,
+            "replayed events before cursor"
         );
         ReplayPage {
             events: out,
@@ -542,6 +480,118 @@ impl EventStore {
         } else {
             None
         }
+    }
+
+    /// Full-text search over conversation content (agent messages, user
+    /// prompts, tool output) across every session, newest match first,
+    /// grouped to one hit per session. Backs the web command palette's
+    /// "Conversations" group (#2515).
+    ///
+    /// Runs on the dedicated read-only `search_conn` so a scan never
+    /// blocks the live `record()` path. Returns an empty vec for a query
+    /// below the minimum length or on any DB error: search is best-effort
+    /// chrome, not a correctness path.
+    ///
+    // ponytail: raw event_json LIKE prefilter, then decode + verify in
+    // Rust. No FTS5 and no plaintext sidecar table, so zero write-path
+    // cost and no migration. The SQL LIKE can over-match on JSON keys
+    // (e.g. "text"), but the post-decode check that the extracted prose
+    // actually contains the query drops those before they reach results.
+    // Ceiling: a full scan bounded by SEARCH_ROW_SCAN_CAP. Upgrade path
+    // if the corpus outgrows it: a plaintext sidecar table or an FTS5
+    // virtual table populated on record().
+    pub fn search_content(&self, query: &str, limit: usize) -> Vec<ContentHit> {
+        let trimmed = query.trim();
+        if trimmed.chars().count() < MIN_SEARCH_CHARS {
+            return Vec::new();
+        }
+        let needle: String = trimmed
+            .chars()
+            .take(MAX_SEARCH_CHARS)
+            .collect::<String>()
+            .to_lowercase();
+        let limit = limit.clamp(1, MAX_SEARCH_RESULTS);
+        let pattern = format!("%{}%", escape_like(&needle));
+
+        let conn = match self.search_conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT session_id, seq, event_json FROM acp_events
+             WHERE event_json LIKE ?1 ESCAPE '\\'
+             ORDER BY created_at DESC LIMIT ?2",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare search query: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![pattern, SEARCH_ROW_SCAN_CAP as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "run search query: {e}");
+                return Vec::new();
+            }
+        };
+
+        // Preserve newest-first row order; the first row seen for a
+        // session is its representative (newest) hit, later rows only
+        // bump match_count.
+        let mut order: Vec<String> = Vec::new();
+        let mut hits: std::collections::HashMap<String, ContentHit> =
+            std::collections::HashMap::new();
+        for row in rows.flatten() {
+            let (session_id, seq, json) = row;
+            let Ok(event) = serde_json::from_str::<Event>(&json) else {
+                continue;
+            };
+            let Some((kind, text)) = event_search_text(&event) else {
+                continue;
+            };
+            // The SQL LIKE matched the raw JSON; confirm the query is in
+            // the extracted prose, not a field name or escape sequence.
+            if !text.to_lowercase().contains(&needle) {
+                continue;
+            }
+            match hits.get_mut(&session_id) {
+                Some(hit) => hit.match_count += 1,
+                None => {
+                    // Stop once we have enough distinct sessions: rows are
+                    // newest-first, so any further new session ranks below
+                    // these and would be dropped anyway. Counting the cap on
+                    // distinct sessions (not raw rows) keeps one chatty
+                    // session from hiding others. match_count past this point
+                    // is left approximate on purpose.
+                    if order.len() >= limit {
+                        break;
+                    }
+                    order.push(session_id.clone());
+                    hits.insert(
+                        session_id.clone(),
+                        ContentHit {
+                            session_id,
+                            seq: seq.max(0) as u64,
+                            kind,
+                            snippet: make_snippet(&text, &needle),
+                            match_count: 1,
+                        },
+                    );
+                }
+            }
+        }
+
+        order
+            .into_iter()
+            .filter_map(|id| hits.remove(&id))
+            .collect()
     }
 
     /// Return the most recent `Event::RateLimit` stored for `session_id`
@@ -608,10 +658,12 @@ impl EventStore {
             .flatten();
         // No log for the "no row" branch. The web UI polls /api/sessions
         // every ~2-3s and fans this query out per structured view session; every
-        // idle session would land here on every poll. The "still pending"
-        // and "treated as fired" branches below stay at trace because
-        // those carry the wake `at` timestamp, which is the only
-        // diagnostic value of this function.
+        // idle session would land here on every poll. The past-due branch
+        // below is silent for the same reason: once a wakeup's `at` is in
+        // the past it stays past forever, so logging there would spam one
+        // line per poll for the session's whole life. Only the bounded
+        // "still pending" branch logs; it carries the wake `at` and clears
+        // the moment the wakeup fires.
         let json = json?;
         let event: Event = match serde_json::from_str(&json) {
             Ok(e) => e,
@@ -636,17 +688,113 @@ impl EventStore {
                 );
                 Some((at, reason))
             } else {
-                trace!(
-                    target: "acp.event_store",
-                    session = %session_id,
-                    wake_at = %at,
-                    elapsed_secs = (now - at).num_seconds(),
-                    "latest_pending_wakeup: wake `at` in past; treating as fired"
-                );
                 None
             }
         } else {
             None
+        }
+    }
+
+    /// Whether the session has an armed `Monitor` (background watch). Returns
+    /// the latest `MonitorArmed` description when active, `None` otherwise.
+    ///
+    /// A `Monitor` is fire-and-forget with no fixed end time, so unlike
+    /// `latest_pending_wakeup` there is no timestamp to gate on, and the
+    /// `Monitor` tool call itself completes at arm time (it returns "monitor
+    /// started"), so its completion is not the disarm signal either. The
+    /// badge stays up from the arm until either the user takes over
+    /// (`UserPromptSent` at a higher seq) or the monitor fires and that turn
+    /// ends. The fire is observed as a tool call started after the arm (the
+    /// agent acting on the wake); the badge then retires on the next
+    /// `Stopped`. This covers both shapes: the agent ending the arming turn
+    /// and resuming later between prompts (closed by `agent_idle`), and the
+    /// monitor blocking the arming turn in-band (closed by `prompt_complete`).
+    /// A `Stopped` with no post-arm tool work is the arming turn ending while
+    /// the monitor is still pending, so it leaves the badge up. See #2325.
+    pub fn latest_active_monitor(&self, session_id: &str) -> Option<Option<String>> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Latest MonitorArmed and its seq.
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT seq, event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND event_json LIKE '{\"MonitorArmed\":%'
+                 ORDER BY seq DESC LIMIT 1",
+                params![session_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        let (armed_seq, json) = row?;
+        // The user taking over clears the badge immediately. No log on the
+        // common "no monitor" branch above (this query fans out per
+        // structured session on every ~2-3s sessions poll).
+        let user_took_over: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND event_json LIKE '{\"UserPromptSent\":%'
+                 LIMIT 1",
+                params![session_id, armed_seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if user_took_over.is_some() {
+            return None;
+        }
+        // Otherwise the badge clears once the monitor fired (a tool call
+        // started after the arm) AND that turn has since ended (a Stopped
+        // past that tool start). Without the post-work gate, the arming
+        // turn's own Stopped while the monitor is still pending would clear
+        // it prematurely.
+        let first_work_seq: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(seq) FROM acp_events
+                 WHERE session_id = ?1
+                   AND seq > ?2
+                   AND event_json LIKE '{\"ToolCallStarted\":%'",
+                params![session_id, armed_seq],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(work_seq) = first_work_seq {
+            let turn_ended: Option<i64> = conn
+                .query_row(
+                    "SELECT 1 FROM acp_events
+                     WHERE session_id = ?1
+                       AND seq > ?2
+                       AND event_json LIKE '{\"Stopped\":%'
+                     LIMIT 1",
+                    params![session_id, work_seq],
+                    |row| row.get(0),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            if turn_ended.is_some() {
+                return None;
+            }
+        }
+        match serde_json::from_str::<Event>(&json) {
+            Ok(Event::MonitorArmed { description }) => Some(description),
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    target: "acp.event_store",
+                    session = %session_id,
+                    "latest_active_monitor: deserialise failed: {e}"
+                );
+                None
+            }
         }
     }
 
@@ -802,7 +950,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let max = query_highest_seq(&conn, session_id);
+        let max = events::highest_seq(&conn, &self.schema, session_id);
         trace!(
             target: "acp.event_store",
             session = %session_id,
@@ -822,7 +970,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let min = query_lowest_seq(&conn, session_id);
+        let min = events::lowest_seq(&conn, &self.schema, session_id);
         trace!(
             target: "acp.event_store",
             session = %session_id,
@@ -840,26 +988,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        let mut stmt =
-            match conn.prepare("SELECT session_id, MAX(seq) FROM acp_events GROUP BY session_id") {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(target: "acp.event_store", "prepare all_session_seqs: {e}");
-                    return Vec::new();
-                }
-            };
-        let rows = match stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let max: i64 = row.get(1)?;
-            Ok((id, max as u64))
-        }) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(target: "acp.event_store", "query all_session_seqs: {e}");
-                return Vec::new();
-            }
-        };
-        let collected: Vec<(String, u64)> = rows.filter_map(|r| r.ok()).collect();
+        let collected = events::all_topic_seqs(&conn, &self.schema);
         debug!(
             target: "acp.event_store",
             sessions = collected.len(),
@@ -894,6 +1023,8 @@ impl EventStore {
                    AND (json_extract(event_json, '$.UserPromptSent') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
                      OR json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+                     OR json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
                      OR json_extract(event_json, '$.Stopped') IS NOT NULL
                      OR json_extract(event_json, '$.RateLimitAutoResumed') IS NOT NULL
                      OR json_extract(event_json, '$.AgentStartupError') IS NOT NULL)
@@ -911,6 +1042,42 @@ impl EventStore {
                 None
             });
         json.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    /// Text of the session's first `UserPromptSent` event, if any. The manual
+    /// "Auto-name now" recovery re-runs smart rename against the original
+    /// intent (the first prompt), so it reads the earliest prompt here rather
+    /// than depending on the in-memory prompt that the original auto-trigger
+    /// saw. Returns `None` when the session has no prompt event (e.g. the first
+    /// one was pruned on a very long session), which the caller treats as
+    /// "nothing to rename from".
+    pub fn first_user_prompt(&self, session_id: &str) -> Option<String> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT event_json FROM acp_events
+                 WHERE session_id = ?1
+                   AND json_extract(event_json, '$.UserPromptSent') IS NOT NULL
+                 ORDER BY seq ASC
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap_or_else(|e| {
+                warn!(
+                    target: "acp.event_store",
+                    "first_user_prompt query for {session_id}: {e}"
+                );
+                None
+            });
+        match json.and_then(|s| serde_json::from_str::<Event>(&s).ok()) {
+            Some(Event::UserPromptSent { text, .. }) => Some(text),
+            _ => None,
+        }
     }
 
     /// Nonces of `ApprovalRequested` events for the session that lack a
@@ -949,6 +1116,47 @@ impl EventStore {
             Ok(r) => r,
             Err(e) => {
                 warn!(target: "acp.event_store", "query unresolved_approval_nonces for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Elicitation nonces from `ElicitationRequested` events on disk with
+    /// no matching `ElicitationResolved`. The elicitation parallel of
+    /// [`Self::unresolved_approval_nonces`]: lets the supervisor cancel
+    /// question cards whose responder oneshot died with the previous
+    /// daemon, so they don't reappear as dead 404 cards on replay.
+    pub fn unresolved_elicitation_nonces(&self, session_id: &str) -> Vec<Nonce> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') AS nonce
+             FROM acp_events
+             WHERE session_id = ?1
+               AND json_extract(event_json, '$.ElicitationRequested') IS NOT NULL
+               AND json_extract(event_json, '$.ElicitationRequested.elicitation.nonce') NOT IN (
+                   SELECT json_extract(event_json, '$.ElicitationResolved.nonce')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND json_extract(event_json, '$.ElicitationResolved') IS NOT NULL
+               )",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare unresolved_elicitation_nonces for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| {
+            let nonce: String = row.get(0)?;
+            Ok(Nonce(nonce))
+        }) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query unresolved_elicitation_nonces for {session_id}: {e}");
                 return Vec::new();
             }
         };
@@ -1022,17 +1230,6 @@ impl EventStore {
         &self,
         session_ids: &[String],
     ) -> std::collections::HashMap<String, i64> {
-        let mut out = std::collections::HashMap::new();
-        if session_ids.is_empty() {
-            return out;
-        }
-        let conn = match self.conn.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
-        let placeholders = std::iter::repeat_n("?", session_ids.len())
-            .collect::<Vec<_>>()
-            .join(",");
         // Exclude non-substantive lifecycle/metadata events so they do not
         // reset the idle clock. AcpSessionAssigned in particular is emitted
         // on every cold-start resume (acp_client.rs), so counting it would
@@ -1040,41 +1237,19 @@ impl EventStore {
         // and the idle-reap (#1689) would never fire across restarts. Shares
         // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS with the retention prune so the
         // two predicates cannot desync.
-        let sql = format!(
-            "SELECT session_id, MAX(created_at) FROM acp_events
-             WHERE session_id IN ({placeholders})
-               {clauses}
-             GROUP BY session_id",
-            clauses = non_substantive_not_like_clauses()
-        );
-        let mut stmt = match conn.prepare(&sql) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!(target: "acp.event_store", "last_event_at_for_sessions prepare: {e}");
-                return out;
-            }
-        };
-        let rows = stmt.query_map(rusqlite::params_from_iter(session_ids.iter()), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        });
-        match rows {
-            Ok(iter) => {
-                for r in iter {
-                    match r {
-                        Ok((session_id, created_at)) => {
-                            out.insert(session_id, created_at);
-                        }
-                        Err(e) => {
-                            warn!(target: "acp.event_store", "last_event_at_for_sessions row: {e}");
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                warn!(target: "acp.event_store", "last_event_at_for_sessions query: {e}");
-            }
+        if session_ids.is_empty() {
+            return std::collections::HashMap::new();
         }
-        out
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        events::last_event_at_for_topics(
+            &conn,
+            &self.schema,
+            session_ids,
+            NON_SUBSTANTIVE_EVENT_DISCRIMINANTS,
+        )
     }
 
     /// Persist one decoded attachment blob, keyed to the seq of the
@@ -1094,30 +1269,18 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if let Err(e) = conn.execute(
-            "INSERT OR IGNORE INTO acp_attachments
-                (session_id, seq, attachment_id, kind, mime_type, name, data, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![
-                session_id,
-                seq as i64,
-                blob.id,
-                blob.kind.as_str(),
-                blob.mime_type,
-                blob.name,
-                blob.data,
-                now_ms,
-            ],
-        ) {
-            warn!(
-                target: "acp.event_store",
-                session = %session_id,
-                attachment = %blob.id,
-                "insert attachment failed: {e}"
-            );
-            return false;
-        }
-        true
+        events::insert_attachment(
+            &conn,
+            &self.schema,
+            session_id,
+            seq,
+            &blob.id,
+            blob.kind.as_str(),
+            &blob.mime_type,
+            blob.name.as_deref(),
+            &blob.data,
+            now_ms,
+        )
     }
 
     /// Drop all attachment blobs owned by one prompt seq. Used as a
@@ -1128,17 +1291,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        if let Err(e) = conn.execute(
-            "DELETE FROM acp_attachments WHERE session_id = ?1 AND seq = ?2",
-            params![session_id, seq as i64],
-        ) {
-            warn!(
-                target: "acp.event_store",
-                session = %session_id,
-                seq,
-                "rollback attachments failed: {e}"
-            );
-        }
+        events::delete_attachments_for_seq(&conn, &self.schema, session_id, seq);
     }
 
     /// Fetch one attachment's MIME type and bytes for the replay GET
@@ -1153,22 +1306,7 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        conn.query_row(
-            "SELECT mime_type, data FROM acp_attachments
-             WHERE session_id = ?1 AND attachment_id = ?2",
-            params![session_id, attachment_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
-        )
-        .optional()
-        .unwrap_or_else(|e| {
-            warn!(
-                target: "acp.event_store",
-                session = %session_id,
-                attachment = %attachment_id,
-                "load attachment failed: {e}"
-            );
-            None
-        })
+        events::load_attachment(&conn, &self.schema, session_id, attachment_id)
     }
 
     /// Latest prompt capabilities the agent advertised for this session,
@@ -1210,30 +1348,15 @@ impl EventStore {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        match conn.execute(
-            "DELETE FROM acp_events WHERE session_id = ?1",
-            params![session_id],
-        ) {
-            Ok(deleted) => {
-                debug!(
-                    target: "acp.event_store",
-                    session = %session_id,
-                    deleted,
-                    "deleted session events"
-                );
-            }
-            Err(e) => {
-                warn!(target: "acp.event_store", "delete {session_id}: {e}");
-            }
-        }
-        // Cascade to attachment blobs so a deleted session leaves no
+        // Cascades to attachment blobs so a deleted session leaves no
         // orphaned bytes behind.
-        if let Err(e) = conn.execute(
-            "DELETE FROM acp_attachments WHERE session_id = ?1",
-            params![session_id],
-        ) {
-            warn!(target: "acp.event_store", "delete attachments {session_id}: {e}");
-        }
+        let deleted = events::delete_topic(&conn, &self.schema, session_id);
+        debug!(
+            target: "acp.event_store",
+            session = %session_id,
+            deleted,
+            "deleted session events"
+        );
     }
 }
 
@@ -1253,16 +1376,116 @@ pub struct AttachmentBlob {
 /// full payload (assistant chunks can be a few KB each). Unknown
 /// variants fall back to "other"; `event_kind` only exists for log
 /// breadcrumbs and doesn't need to stay in lockstep with the enum.
+/// Shortest query `search_content` will run; below this every session
+/// matches and the result is noise.
+const MIN_SEARCH_CHARS: usize = 2;
+/// Cap on query length so a pathological input can't build a huge LIKE
+/// pattern.
+const MAX_SEARCH_CHARS: usize = 128;
+/// Most sessions returned from a single search.
+const MAX_SEARCH_RESULTS: usize = 20;
+/// Hard ceiling on rows the LIKE prefilter scans, so a no-match query on a
+/// huge DB can't scan the whole table. The scan also stops early as soon as
+/// `limit` distinct sessions are collected, so the common case reads far
+/// fewer rows; this ceiling only bites when matches are sparse. Set well
+/// above `limit` so a single chatty session's run of newest events does not
+/// crowd other matching sessions out of the window.
+const SEARCH_ROW_SCAN_CAP: usize = 2000;
+/// Characters of context kept on each side of the match in a snippet.
+const SNIPPET_RADIUS_CHARS: usize = 60;
+
+/// One session's content-search hit: the newest matching event plus a
+/// count of how many of its events matched within the scanned window.
+#[derive(Debug, Clone)]
+pub struct ContentHit {
+    pub session_id: String,
+    pub seq: u64,
+    pub kind: &'static str,
+    pub snippet: String,
+    pub match_count: usize,
+}
+
+/// Escape the LIKE metacharacters so user input is matched literally
+/// rather than as wildcard syntax (a bare `%` would otherwise match
+/// every row). Paired with `ESCAPE '\'` in the query.
+fn escape_like(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Extract the user-facing prose from an event for content search, with
+/// a short kind label. Returns `None` for structural / metadata events
+/// that carry no conversation text. Only the high-signal prose sources
+/// are indexed; status and error strings are deliberately excluded so a
+/// search stays scoped to the conversation.
+fn event_search_text(event: &Event) -> Option<(&'static str, String)> {
+    let pick = |s: &str, kind: &'static str| {
+        let t = s.trim();
+        if t.is_empty() {
+            None
+        } else {
+            Some((kind, s.to_string()))
+        }
+    };
+    match event {
+        Event::AgentMessageChunk { text, .. } => pick(text, "agent"),
+        Event::UserPromptSent { text, .. } => pick(text, "user"),
+        Event::UserDiffCommentsPrompt {
+            assembled_markdown, ..
+        } => pick(assembled_markdown, "user"),
+        Event::ToolCallContent { content, .. } => pick(content, "tool"),
+        Event::ToolCallCompleted { content, .. } => pick(content, "tool"),
+        _ => None,
+    }
+}
+
+/// Build a display snippet: a window of `SNIPPET_RADIUS_CHARS` on each
+/// side of the first case-insensitive match of `needle` (already
+/// lowercased) in `text`, whitespace-collapsed, with ellipses where
+/// trimmed. Falls back to the head of the text when the needle is not
+/// found (callers only pass text that matched, so this is rare). UTF-8
+/// safe: windows on char boundaries, never byte offsets.
+fn make_snippet(text: &str, needle: &str) -> String {
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let chars: Vec<char> = collapsed.chars().collect();
+    let lower = collapsed.to_lowercase();
+    // Map the byte index of the match to a char index over `chars`.
+    let match_char = lower
+        .find(needle)
+        .map(|byte_idx| lower[..byte_idx].chars().count())
+        .unwrap_or(0);
+    let start = match_char.saturating_sub(SNIPPET_RADIUS_CHARS);
+    let end = (match_char + needle.chars().count() + SNIPPET_RADIUS_CHARS).min(chars.len());
+    let mut snippet = String::new();
+    if start > 0 {
+        snippet.push('…');
+    }
+    snippet.extend(&chars[start..end]);
+    if end < chars.len() {
+        snippet.push('…');
+    }
+    snippet
+}
+
 fn event_kind(event: &Event) -> &'static str {
     match event {
         Event::PlanUpdated { .. } => "plan_updated",
         Event::TodoListUpdated { .. } => "todo_list_updated",
+        Event::SessionTitleSuggested { .. } => "session_title_suggested",
         Event::ToolCallStarted { .. } => "tool_call_started",
         Event::ToolCallCompleted { .. } => "tool_call_completed",
         Event::ToolCallContent { .. } => "tool_call_content",
         Event::ToolCallUpdated { .. } => "tool_call_updated",
         Event::ApprovalRequested { .. } => "approval_requested",
         Event::ApprovalResolved { .. } => "approval_resolved",
+        Event::ElicitationRequested { .. } => "elicitation_requested",
+        Event::ElicitationResolved { .. } => "elicitation_resolved",
         Event::DiffEmitted { .. } => "diff_emitted",
         Event::ThinkingStarted => "thinking_started",
         Event::ThinkingEnded => "thinking_ended",
@@ -1277,6 +1500,10 @@ fn event_kind(event: &Event) -> &'static str {
         Event::ConfigOptionsUpdated { .. } => "config_options_updated",
         Event::ConfigOptionSwitchFailed { .. } => "config_option_switch_failed",
         Event::RawAgentUpdate { .. } => "raw_agent_update",
+        Event::BackgroundAgentLaunched { .. } => "background_agent_launched",
+        Event::BackgroundAgentProgress { .. } => "background_agent_progress",
+        Event::BackgroundAgentCompleted { .. } => "background_agent_completed",
+        Event::PromptRuntimeError { .. } => "prompt_runtime_error",
         Event::AgentMessageChunk { .. } => "agent_message_chunk",
         Event::CancelRequested { .. } => "cancel_requested",
         Event::Stopped { .. } => "stopped",
@@ -1290,6 +1517,7 @@ fn event_kind(event: &Event) -> &'static str {
         Event::SessionCleared => "session_cleared",
         Event::ConversationCompacted => "conversation_compacted",
         Event::WakeupScheduled { .. } => "wakeup_scheduled",
+        Event::MonitorArmed { .. } => "monitor_armed",
         Event::PromptRejected { .. } => "prompt_rejected",
         Event::AgentSwitched { .. } => "agent_switched",
     }
@@ -1305,6 +1533,111 @@ mod tests {
         let path = tmp.path().join("acp.db");
         let store = EventStore::open(&path, max).unwrap();
         (tmp, store)
+    }
+
+    fn agent_chunk(text: &str) -> Event {
+        Event::AgentMessageChunk { text: text.into() }
+    }
+
+    fn user_prompt(text: &str) -> Event {
+        Event::UserPromptSent {
+            text: text.into(),
+            attachments: vec![],
+        }
+    }
+
+    #[test]
+    fn search_content_finds_prompt_agent_and_tool_text() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s1", 1, &user_prompt("please refactor the reconciler"))
+            .unwrap();
+        store
+            .record("s2", 1, &agent_chunk("I updated the supervisor"))
+            .unwrap();
+        store
+            .record(
+                "s3",
+                1,
+                &Event::ToolCallContent {
+                    tool_call_id: "t1".into(),
+                    content: "grep matched reconciler in supervisor.rs".into(),
+                },
+            )
+            .unwrap();
+
+        let hits = store.search_content("reconciler", 10);
+        let ids: Vec<&str> = hits.iter().map(|h| h.session_id.as_str()).collect();
+        assert!(ids.contains(&"s1"), "prompt text should match");
+        assert!(ids.contains(&"s3"), "tool content should match");
+        assert!(!ids.contains(&"s2"), "non-matching session excluded");
+    }
+
+    #[test]
+    fn search_content_ignores_json_keys() {
+        let (_tmp, store) = open_store(1000);
+        // The substring "text" is a JSON key in every UserPromptSent row,
+        // so a raw LIKE would match; the decode-and-verify step must drop
+        // it because the prose does not contain "text".
+        store.record("s1", 1, &user_prompt("hello world")).unwrap();
+        let hits = store.search_content("text", 10);
+        assert!(hits.is_empty(), "JSON key 'text' must not match prose");
+    }
+
+    #[test]
+    fn search_content_is_case_insensitive_and_groups_by_session() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s1", 1, &agent_chunk("The Quick Brown Fox"))
+            .unwrap();
+        store.record("s1", 2, &agent_chunk("quick again")).unwrap();
+        let hits = store.search_content("QUICK", 10);
+        assert_eq!(hits.len(), 1, "two matching events collapse to one session");
+        assert_eq!(hits[0].session_id, "s1");
+        assert_eq!(hits[0].match_count, 2);
+    }
+
+    #[test]
+    fn search_content_escapes_like_wildcards() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record("s1", 1, &agent_chunk("plain message"))
+            .unwrap();
+        // Unescaped, "e%" becomes LIKE pattern %e%% which matches any text
+        // containing "e" (the prose has several). Escaped, it matches only
+        // the literal substring "e%", which the prose lacks, so the result
+        // is empty. This fails if wildcard escaping regresses.
+        let hits = store.search_content("e%", 10);
+        assert!(
+            hits.is_empty(),
+            "% must be matched literally, not as a wildcard"
+        );
+    }
+
+    #[test]
+    fn search_content_caps_distinct_sessions_not_raw_rows() {
+        let (_tmp, store) = open_store(1000);
+        // A chatty session (s_busy) with many matching events recorded first
+        // (older), then a single newer match in s_quiet. The cap is on
+        // distinct sessions, so s_busy must not crowd s_quiet out.
+        for seq in 1..=20 {
+            store
+                .record("s_busy", seq, &agent_chunk("needle again"))
+                .unwrap();
+        }
+        store.record("s_quiet", 1, &agent_chunk("needle")).unwrap();
+
+        let all = store.search_content("needle", 10);
+        let ids: Vec<&str> = all.iter().map(|h| h.session_id.as_str()).collect();
+        assert!(ids.contains(&"s_busy"), "chatty session present");
+        assert!(
+            ids.contains(&"s_quiet"),
+            "quiet session not hidden by chatty one"
+        );
+
+        // limit caps the number of distinct sessions, not raw matched rows.
+        let one = store.search_content("needle", 1);
+        assert_eq!(one.len(), 1, "limit bounds distinct sessions");
     }
 
     fn img_blob(id: &str) -> AttachmentBlob {
@@ -1328,6 +1661,27 @@ mod tests {
                 size: 7,
             }],
         }
+    }
+
+    #[test]
+    fn first_user_prompt_returns_earliest_prompt_text() {
+        let (_tmp, store) = open_store(1000);
+        let prompt = |text: &str| Event::UserPromptSent {
+            text: text.into(),
+            attachments: vec![],
+        };
+        // A session with no prompt yet => None (manual rename has nothing to
+        // name from).
+        assert!(store.first_user_prompt("s-1").is_none());
+        // Earliest UserPromptSent by seq wins, even when recorded out of order.
+        store.record("s-1", 2, &prompt("second prompt")).unwrap();
+        store.record("s-1", 1, &prompt("first prompt")).unwrap();
+        assert_eq!(
+            store.first_user_prompt("s-1").as_deref(),
+            Some("first prompt")
+        );
+        // Scoped per session.
+        assert!(store.first_user_prompt("s-2").is_none());
     }
 
     #[test]
@@ -2197,6 +2551,171 @@ mod tests {
     }
 
     #[test]
+    fn latest_active_monitor_returns_description_when_armed() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("clippy passes".into()),
+                },
+            )
+            .unwrap();
+        let armed = store.latest_active_monitor("s-1").expect("armed");
+        assert_eq!(armed.as_deref(), Some("clippy passes"));
+    }
+
+    #[test]
+    fn latest_active_monitor_persists_without_a_user_prompt() {
+        // A monitor firing re-invokes the agent with activity but no
+        // UserPromptSent, so the badge must persist across those re-fires.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("build".into()),
+                },
+            )
+            .unwrap();
+        // Trailing agent activity (no user prompt) does not clear it.
+        store.record("s-1", 2, &Event::ThinkingStarted).unwrap();
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::AgentMessageChunk {
+                    text: "resuming".into(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_some());
+    }
+
+    #[test]
+    fn latest_active_monitor_clears_on_user_prompt() {
+        // The user typing a follow-up means they took over; the badge clears.
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("watch".into()),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::UserPromptSent {
+                    text: "stop watching".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_none());
+    }
+
+    #[test]
+    fn latest_active_monitor_persists_on_arming_turn_stop() {
+        // The arming turn ending while the monitor is still pending (no
+        // post-arm tool work yet) must NOT clear the badge (#2325).
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::MonitorArmed {
+                    description: Some("watch".into()),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::Stopped {
+                    reason: "prompt_complete".into(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_some());
+    }
+
+    #[test]
+    fn latest_active_monitor_clears_after_fired_work_and_stop() {
+        // The monitor fired (a tool call started after the arm) and that turn
+        // then ended: the badge clears regardless of the Stopped reason, so
+        // both the in-band (`prompt_complete`) and between-prompt
+        // (`agent_idle`) monitor shapes are covered (#2325).
+        for reason in ["prompt_complete", "agent_idle"] {
+            let (_tmp, store) = open_store(1000);
+            store
+                .record(
+                    "s-1",
+                    1,
+                    &Event::MonitorArmed {
+                        description: Some("watch".into()),
+                    },
+                )
+                .unwrap();
+            store
+                .record(
+                    "s-1",
+                    2,
+                    &Event::ToolCallStarted {
+                        tool_call: crate::acp::state::ToolCall {
+                            id: "tc-1".into(),
+                            name: "Read".into(),
+                            kind: "read".into(),
+                            args_preview: String::new(),
+                            started_at: Utc::now(),
+                            parent_tool_call_id: None,
+                            memory_recall: None,
+                            diffs: Vec::new(),
+                        },
+                    },
+                )
+                .unwrap();
+            // Tool started but turn not yet ended: badge still up.
+            assert!(store.latest_active_monitor("s-1").is_some());
+            store
+                .record(
+                    "s-1",
+                    3,
+                    &Event::Stopped {
+                        reason: reason.into(),
+                    },
+                )
+                .unwrap();
+            assert!(
+                store.latest_active_monitor("s-1").is_none(),
+                "badge should clear after fired work + Stopped({reason})"
+            );
+        }
+    }
+
+    #[test]
+    fn latest_active_monitor_none_without_monitor() {
+        let (_tmp, store) = open_store(1000);
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::UserPromptSent {
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(store.latest_active_monitor("s-1").is_none());
+    }
+
+    #[test]
     fn fired_wakeup_for_prompt_skips_mid_wait_user_followup() {
         // Regression for #1091: a user-typed prompt arriving BEFORE the
         // wake `at` must not count as the wake firing. Same flaw as
@@ -2482,6 +3001,107 @@ mod tests {
         assert!(store.unresolved_approval_nonces("s-2").is_empty());
     }
 
+    fn orphan_test_elicitation(nonce: &Nonce) -> crate::acp::elicitations::Elicitation {
+        crate::acp::elicitations::Elicitation {
+            nonce: nonce.clone(),
+            message: "Pick".into(),
+            title: None,
+            description: None,
+            tool_call_id: None,
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        }
+    }
+
+    /// Elicitation parallel of `unresolved_approval_nonces`: an
+    /// `ElicitationRequested` whose nonce never saw a matching
+    /// `ElicitationResolved` is reported as orphaned on reattach.
+    #[test]
+    fn unresolved_elicitation_nonces_finds_orphaned_requests() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::ElicitationOutcome;
+
+        let (_tmp, store) = open_store(1000);
+        let nonce_a = Nonce::new();
+        let nonce_b = Nonce::new();
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation(&nonce_a),
+                },
+            )
+            .unwrap();
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation(&nonce_b),
+                },
+            )
+            .unwrap();
+        // Only nonce_a is resolved; nonce_b stays orphaned.
+        store
+            .record(
+                "s-1",
+                3,
+                &Event::ElicitationResolved {
+                    nonce: nonce_a,
+                    outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(store.unresolved_elicitation_nonces("s-1"), vec![nonce_b]);
+        // Unrelated session must not bleed into the query.
+        assert!(store.unresolved_elicitation_nonces("s-2").is_empty());
+    }
+
+    /// `latest_status_event` must recognize elicitation lifecycle events,
+    /// so a session blocked on a pending elicitation re-derives to Waiting
+    /// on cold-start / attach instead of waiting for the next live event.
+    #[test]
+    fn latest_status_event_includes_elicitation_lifecycle() {
+        use crate::acp::approvals::Nonce;
+        use crate::acp::elicitations::ElicitationOutcome;
+
+        let (_tmp, store) = open_store(1000);
+        let nonce_a = Nonce::new();
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::ElicitationRequested {
+                    elicitation: orphan_test_elicitation(&nonce_a),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::ElicitationRequested { .. })
+        ));
+
+        store
+            .record(
+                "s-1",
+                2,
+                &Event::ElicitationResolved {
+                    nonce: nonce_a,
+                    outcome: ElicitationOutcome::Accepted,
+                    answers: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            store.latest_status_event("s-1"),
+            Some(Event::ElicitationResolved { .. })
+        ));
+    }
+
     fn rate_limit_event(secs_until_reset: i64) -> Event {
         Event::RateLimit {
             info: RateLimitInfo {
@@ -2549,5 +3169,93 @@ mod tests {
             ),
             "RateLimitAutoResumed must supersede Stopped{{rate_limited}}"
         );
+    }
+
+    #[test]
+    fn replay_page_before_returns_closest_below_in_asc_order() {
+        let (_tmp, store) = open_store(1000);
+        for seq in 1..=10 {
+            store.record("s-1", seq, &Event::ThinkingStarted).unwrap();
+        }
+        // Tail: newest page is requested with before = u64::MAX.
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(3));
+        let seqs: Vec<u64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        // The CLOSEST 3 below the cursor, ascending (not the oldest 3).
+        assert_eq!(seqs, vec![8, 9, 10]);
+        assert!(tail.has_more, "older events remain below seq 8");
+        assert_eq!(
+            tail.last_scanned_seq,
+            Some(8),
+            "cursor is the page's lowest"
+        );
+        assert_eq!(tail.highest_seq, 10);
+
+        // Next-older page pages back via before = previous lowest.
+        let older = store.replay_page_before("s-1", 8, Some(3));
+        let seqs: Vec<u64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 7]);
+        assert!(older.has_more);
+        assert_eq!(older.last_scanned_seq, Some(5));
+    }
+
+    #[test]
+    fn replay_page_before_stops_at_session_start() {
+        let (_tmp, store) = open_store(1000);
+        for seq in 1..=4 {
+            store.record("s-1", seq, &Event::ThinkingStarted).unwrap();
+        }
+        // A page that reaches the very first event clears has_more so the
+        // client knows not to keep paging older.
+        let page = store.replay_page_before("s-1", 3, Some(10));
+        let seqs: Vec<u64> = page.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2]);
+        assert!(!page.has_more, "reached session start, nothing older");
+        // Empty when before predates everything stored.
+        let none = store.replay_page_before("s-1", 1, Some(10));
+        assert!(none.events.is_empty());
+        assert!(!none.has_more);
+    }
+
+    #[test]
+    fn replay_page_before_trims_leading_partial_turn_to_boundary() {
+        let (_tmp, store) = open_store(1000);
+        // seq 1: handshake-ish, 2: prompt A, 3-4: A's turn, 5: prompt B,
+        // 6-7: B's turn.
+        store
+            .record(
+                "s-1",
+                1,
+                &Event::PromptCapabilities {
+                    image: true,
+                    audio: false,
+                    embedded_context: true,
+                },
+            )
+            .unwrap();
+        let prompt = |t: &str| Event::UserPromptSent {
+            text: t.into(),
+            attachments: vec![],
+        };
+        store.record("s-1", 2, &prompt("A")).unwrap();
+        store.record("s-1", 3, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 4, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 5, &prompt("B")).unwrap();
+        store.record("s-1", 6, &Event::ThinkingStarted).unwrap();
+        store.record("s-1", 7, &Event::ThinkingStarted).unwrap();
+
+        // Tail of 4 frames would be seq 4..7, but seq 4 is mid-turn A.
+        // With has_more, the page is trimmed to start at prompt B (seq 5).
+        let tail = store.replay_page_before("s-1", u64::MAX, Some(4));
+        let seqs: Vec<u64> = tail.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![5, 6, 7], "leading partial turn A trimmed");
+        assert!(tail.has_more);
+        assert_eq!(tail.last_scanned_seq, Some(5), "cursor is boundary B");
+
+        // Next page (before=5) reaches session start: keep everything,
+        // including the seq-1 handshake, so a one-page load isn't stripped.
+        let older = store.replay_page_before("s-1", 5, Some(10));
+        let seqs: Vec<u64> = older.events.iter().map(|(seq, _)| *seq).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4]);
+        assert!(!older.has_more);
     }
 }

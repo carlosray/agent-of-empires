@@ -5,7 +5,7 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{HomeView, ViewMode};
+use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, ViewMode};
 use crate::session::{save_config, Config, GroupTree, Instance, Item, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -44,6 +44,39 @@ fn create_test_env_empty() -> TestEnv {
     TestEnv { _temp: temp, view }
 }
 
+// #1897 / CodeRabbit follow-up: `add_instance` is the funnel for both the
+// `Creating` placeholder stub (async creation flow) and the finalized session
+// row. The opt-in create-trend counter must bump only for finalized inserts, or
+// a successful background create double-counts (stub + real) and a cancelled one
+// counts a session that never existed. Asserts deltas (not absolutes) since the
+// counter is a process-global shared with the `telemetry_creates` serial group.
+#[test]
+#[serial_test::serial(telemetry_creates)]
+fn add_instance_counts_only_finalized_creates() {
+    use crate::session::Status;
+    let mut env = create_test_env_empty();
+    let before = crate::tui::app::session_create_count_for_test();
+
+    let mut stub = Instance::new("stub", "/tmp/test");
+    stub.source_profile = "test".to_string();
+    stub.status = Status::Creating;
+    env.view.add_instance(stub);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before,
+        "a Creating placeholder stub must not bump the create counter"
+    );
+
+    let mut real = Instance::new("real", "/tmp/test");
+    real.source_profile = "test".to_string();
+    env.view.add_instance(real);
+    assert_eq!(
+        crate::tui::app::session_create_count_for_test(),
+        before + 1,
+        "a finalized session insert must bump the create counter exactly once"
+    );
+}
+
 #[test]
 #[serial]
 fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
@@ -60,17 +93,250 @@ fn rewire_disk_subscriptions_is_noop_without_tokio_runtime() {
     let current = vec!["test".to_string()];
 
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "construction outside a tokio runtime must not prewire subscriptions"
     );
-    view.rewire_disk_subscriptions(&current).unwrap();
+    view.rewire_disk_subscriptions(&current);
     assert!(
-        view.disk_watch_handles.is_empty(),
+        view.disk_watch.handles.is_empty(),
         "rewire outside a tokio runtime must stay a no-op for lib tests"
     );
     assert!(
-        !view.disk_dirty.load(std::sync::atomic::Ordering::Acquire),
+        !view
+            .disk_watch
+            .dirty
+            .load(std::sync::atomic::Ordering::Acquire),
         "the noop branch must leave disk_dirty clear outside a runtime"
+    );
+}
+
+#[tokio::test(flavor = "current_thread")]
+#[serial]
+async fn config_watch_keys_distinguish_global_from_profile_named_global() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile_name = "<global>";
+    let _storage = Storage::new_unwatched(profile_name).unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some(profile_name.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::new().unwrap(),
+    )
+    .unwrap();
+
+    assert_eq!(view.config_watch.handles.len(), 2);
+    assert!(view
+        .config_watch
+        .handles
+        .contains_key(&ConfigWatchKey::Global));
+    assert!(view
+        .config_watch
+        .handles
+        .contains_key(&ConfigWatchKey::profile(profile_name)));
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_does_not_reopen_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.info_dialog.is_some(),
+        "precondition: initial load shows warning dialog"
+    );
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert!(
+        view.info_dialog.is_none(),
+        "watcher-driven refresh must not reopen the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_reopens_hotkey_warning_dialog() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(
+        &global_config,
+        "[tools.alpha]\ncommand = \"alpha\"\nhotkey = \"Ctrl+g\"\n",
+    )
+    .unwrap();
+
+    let tools = AvailableTools::with_tools(&["alpha"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.info_dialog = None;
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.info_dialog.is_some(),
+        "interactive refresh must still surface the hotkey warning dialog"
+    );
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_stashes_pending_watcher_theme() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("dracula"),
+        "watcher-driven refresh must stash the resolved theme name so the tick loop can dispatch App::set_theme"
+    );
+}
+
+#[test]
+#[serial]
+fn interactive_refresh_does_not_stash_pending_watcher_theme() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Interactive);
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "interactive refresh must not stash a pending theme; settings/intro input handlers dispatch Action::SetTheme directly"
+    );
+}
+
+#[test]
+#[serial]
+fn take_pending_watcher_theme_clears_the_field() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.pending_watcher_theme = Some("zinc".to_string());
+
+    let first = view.take_pending_watcher_theme();
+    let second = view.take_pending_watcher_theme();
+    assert_eq!(first.as_deref(), Some("zinc"));
+    assert!(
+        second.is_none(),
+        "take must drain the pending field so a single watcher refresh dispatches at most one set_theme"
+    );
+}
+
+#[test]
+#[serial]
+fn watcher_refresh_stashes_global_theme_not_profile_override() {
+    use crate::session::profile_config::{save_profile_config, ProfileConfig};
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+
+    let profile_overrides: ProfileConfig =
+        serde_json::from_value(serde_json::json!({"theme": {"name": "empire"}}))
+            .expect("legacy hand-edited overrides may carry a theme key even though theme is global by contract");
+    save_profile_config("test", &profile_overrides).unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert!(
+        view.pending_watcher_theme.is_none(),
+        "precondition: HomeView::new must not stash a pending watcher theme"
+    );
+
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("dracula"),
+        "watcher path must stash the global theme name via resolve_theme_name; a stale per-profile theme override (legacy or hand-edited) must not mask the global value"
+    );
+}
+
+#[test]
+#[serial]
+fn second_watcher_refresh_overwrites_stale_stash() {
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    let global_config = crate::session::get_app_dir().unwrap().join("config.toml");
+    std::fs::write(&global_config, "[theme]\nname = \"dracula\"\n").unwrap();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(view.pending_watcher_theme.as_deref(), Some("dracula"));
+
+    std::fs::write(&global_config, "[theme]\nname = \"empire\"\n").unwrap();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
+    assert_eq!(
+        view.pending_watcher_theme.as_deref(),
+        Some("empire"),
+        "second watcher refresh must overwrite the stale stash; first-write-wins would silently drop the latest theme change"
     );
 }
 
@@ -105,6 +371,20 @@ fn create_test_env_with_sessions(count: usize) -> TestEnv {
     view.flat_items = view.build_flat_items();
     view.update_selected();
     TestEnv { _temp: temp, view }
+}
+
+/// Disable trash-first delete for tests that assert the permanent-delete
+/// dialog opens on `d` / `Shift+D` / context-menu Delete. With the default
+/// (`delete_to_trash = true`) those keys move the session to the trash
+/// instead of opening the dialog; the trash-first path has its own coverage
+/// (`trash_then_restore_round_trip`). Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2489.
+fn disable_delete_to_trash() {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.session.delete_to_trash = false;
+    crate::session::config::save_config(&config).unwrap();
 }
 
 fn create_test_env_with_groups() -> TestEnv {
@@ -325,6 +605,251 @@ fn preview_visible_rows_equal_output_area_with_info_shown() {
     assert_eq!(
         env.view.preview_visible_rows, env.view.preview_pane_area.height as usize,
         "visible rows must match the output area height, not be a row short"
+    );
+}
+
+/// Precedence: unread paints only on resting (Idle/Unknown) rows. A live
+/// status supersedes it, keeping its own spinner — so a Running session that
+/// also carries an unread marker must NOT show the solid unread dot. See the
+/// #2088 review note about jumbled precedence.
+#[test]
+#[serial]
+fn unread_dot_yields_to_a_running_status() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(120, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+        }
+        out
+    };
+
+    // Idle + unread: the row shows the solid unread dot.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        render(&mut env).contains('●'),
+        "an idle unread row should paint the unread dot"
+    );
+
+    // Running + still unread: the live status wins; no unread dot.
+    env.view
+        .mutate_instance(&id, |inst| inst.status = crate::session::Status::Running);
+    env.view.flat_items = env.view.build_flat_items();
+    assert!(
+        !render(&mut env).contains('●'),
+        "a running row must keep its spinner, not the unread dot"
+    );
+}
+
+/// Dwell-to-read: an unread row that stays selected past `UNREAD_DWELL`
+/// (with the list in the foreground) is cleared, distinguishing "stopped to
+/// read it" from "scrolled past."
+#[test]
+#[serial]
+fn unread_dwell_clears_after_threshold() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+        inst.mark_unread();
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+
+    let t0 = Instant::now();
+    // First tick arms the dwell clock; nothing cleared yet.
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Below the threshold: still unread (this is the "scrolled past" guard).
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+    // Past the threshold: cleared.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_millis(1)));
+    assert!(!env.view.get_instance(&id).unwrap().is_unread());
+}
+
+/// A fresh manual flag (`u`) is held for the current visit: marking a session
+/// unread and keeping the cursor on it must not let dwell-to-read undo the
+/// mark. Regression for the bug where staying on the row past `UNREAD_DWELL`
+/// silently re-cleared it.
+#[test]
+#[serial]
+fn manual_unread_survives_same_visit_dwell() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+    env.view
+        .toggle_unread_at_cursor()
+        .expect("manual toggle should succeed");
+    assert!(env.view.get_instance(&id).unwrap().is_unread());
+
+    let t0 = Instant::now();
+    // Arm the clock, then sit well past the threshold without moving: the hold
+    // keeps the mark.
+    assert!(!env.view.tick_unread_dwell(t0));
+    assert!(!env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(5)));
+    assert!(
+        env.view.get_instance(&id).unwrap().is_unread(),
+        "a freshly hand-flagged row must survive dwell while it stays selected"
+    );
+}
+
+/// The manual hold is per-visit: after leaving a hand-flagged row and coming
+/// back, dwelling on it clears the mark like any other unread row. This is the
+/// behavior verified by hand (select A, mark unread, move to B, move back, sit
+/// past the threshold -> it clears).
+#[test]
+#[serial]
+fn manual_unread_clears_after_leave_and_return() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instances()[0].id.clone();
+    let b = env.view.instances()[1].id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Select A and flag it unread by hand.
+    env.view.select_session_by_id(&a);
+    env.view.toggle_unread_at_cursor().expect("manual mark A");
+    assert!(env.view.get_instance(&a).unwrap().is_unread());
+
+    // Move to B with NO dwell tick in between (a quick hop, like real
+    // navigation). The hold must release purely from the selection change;
+    // otherwise returning to A would stay suppressed forever (the reported
+    // bug, which an in-between tick would have masked).
+    env.view.select_session_by_id(&b);
+    assert!(
+        env.view.manual_unread_hold.is_none(),
+        "moving off the row must release the hold without needing a dwell tick"
+    );
+
+    // Come back to A: arm the clock, then sit past the threshold. Now it clears.
+    let t0 = Instant::now();
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0));
+    let cleared = env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(1));
+    assert!(cleared, "revisiting and dwelling should clear the mark");
+    assert!(
+        !env.view.get_instance(&a).unwrap().is_unread(),
+        "a hand-flagged row clears on revisit + dwell (per-visit hold)"
+    );
+}
+
+/// Engaging with a hand-flagged row (open/attach, which clears it) also drops
+/// the per-visit hold, so a *later* auto mark on that same still-selected row
+/// is not wrongly suppressed and clears on dwell.
+#[test]
+#[serial]
+fn manual_hold_released_on_engagement_lets_auto_clear() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances()[0].id.clone();
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = crate::session::Status::Idle;
+    });
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.select_session_by_id(&id);
+
+    // Hand-flag, then engage (the open/attach path), which clears it and ends
+    // the hold even though the cursor never left the row.
+    env.view.toggle_unread_at_cursor().expect("manual mark");
+    env.view.clear_unread_on_view(&id);
+    assert!(
+        env.view.manual_unread_hold.is_none(),
+        "engaging with the row must release the manual hold"
+    );
+    assert!(!env.view.get_instance(&id).unwrap().is_unread());
+
+    // A later auto mark on the same (still-selected) row must clear on dwell.
+    env.view.mutate_instance(&id, |inst| inst.mark_unread());
+    let t0 = Instant::now();
+    assert!(!env.view.tick_unread_dwell(t0));
+    let cleared = env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(1));
+    assert!(
+        cleared && !env.view.get_instance(&id).unwrap().is_unread(),
+        "a later auto mark must not be suppressed by a stale hold"
+    );
+}
+
+/// Moving the selection to a different row before the dwell completes spares
+/// the first row: arrowing through a list doesn't read everything you pass.
+#[test]
+#[serial]
+fn unread_dwell_resets_on_selection_change() {
+    use std::time::{Duration, Instant};
+    crate::session::set_unread_enabled(true);
+    let mut env = create_test_env_with_sessions(2);
+    let a = env.view.instances()[0].id.clone();
+    let b = env.view.instances()[1].id.clone();
+    for id in [&a, &b] {
+        env.view.mutate_instance(id, |inst| {
+            inst.status = crate::session::Status::Idle;
+            inst.mark_unread();
+        });
+    }
+    env.view.flat_items = env.view.build_flat_items();
+
+    let t0 = Instant::now();
+    // Arm the dwell clock on A.
+    env.view.select_session_by_id(&a);
+    assert!(!env.view.tick_unread_dwell(t0));
+    // Move to B well before A's threshold; A's clock is dropped, B's arms.
+    env.view.select_session_by_id(&b);
+    assert!(!env.view.tick_unread_dwell(t0 + Duration::from_millis(500)));
+    // Long after, B has now dwelled past the threshold and clears; A, which we
+    // left early, is untouched.
+    assert!(env
+        .view
+        .tick_unread_dwell(t0 + super::UNREAD_DWELL + Duration::from_secs(2)));
+    assert!(
+        env.view.get_instance(&a).unwrap().is_unread(),
+        "row left before the threshold must stay unread"
+    );
+    assert!(
+        !env.view.get_instance(&b).unwrap().is_unread(),
+        "row dwelled past the threshold must be cleared"
     );
 }
 
@@ -804,6 +1329,7 @@ fn test_search_mode_enter_exits_and_clears_state() {
 #[serial]
 fn test_d_on_session_opens_delete_dialog() {
     let mut env = create_test_env_with_sessions(3);
+    disable_delete_to_trash();
     env.view.update_selected();
     assert!(env.view.unified_delete_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -1008,6 +1534,324 @@ fn test_enter_clears_matches_so_n_opens_new_dialog() {
     assert!(env.view.new_dialog.is_none());
     env.view.handle_key(key(KeyCode::Char('n')), None);
     assert!(env.view.new_dialog.is_some());
+}
+
+// The only catalog tip is earned, so it (and the badge) appears only after the
+// `new_session_with_selection` counter crosses its threshold. Set that on disk
+// and refresh the cached badge so a test starts with the tip eligible.
+fn earn_tip(env: &mut TestEnv) {
+    let mut config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    config.app_state.new_session_with_selection_count =
+        crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD;
+    crate::session::config::save_config(&config).unwrap();
+    env.view.tips_unseen = crate::tui::home::tips_unseen_count(&config);
+}
+
+#[test]
+#[serial]
+fn open_tips_dialog_opens_even_with_no_eligible_tips() {
+    // No tip earned yet: "Show tips" still opens the overlay (an empty state)
+    // rather than silently doing nothing.
+    let mut env = create_test_env_empty();
+    assert!(env.view.tips_dialog.is_none());
+    env.view.open_tips_dialog();
+    assert!(env.view.tips_dialog.is_some());
+}
+
+#[test]
+#[serial]
+fn persist_tips_outcome_merges_seen_sets_disabled_and_updates_badge() {
+    use crate::tui::dialogs::TipsOutcome;
+
+    let mut env = create_test_env_empty();
+    earn_tip(&mut env);
+    let before = env.view.tips_unseen;
+    assert!(before > 0);
+
+    env.view.persist_tips_outcome(TipsOutcome {
+        newly_seen: vec!["new-from-selection".to_string()],
+        disabled: Some(true),
+    });
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    assert!(config
+        .app_state
+        .tips_seen
+        .iter()
+        .any(|s| s == "new-from-selection"));
+    assert!(!config.session.show_tips);
+    // Disabling tips zeroes the cached badge count.
+    assert_eq!(env.view.tips_unseen, 0);
+}
+
+#[test]
+#[serial]
+fn tips_badge_renders_with_count_and_hides_when_zero() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+
+    let render = |env: &mut TestEnv| -> String {
+        let backend = TestBackend::new(200, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    // Earn the tip so the badge shows a count.
+    earn_tip(&mut env);
+    let n = env.view.tips_unseen;
+    assert!(n > 0);
+    let shown = render(&mut env);
+    assert!(
+        shown.contains(&format!("{n} tips")),
+        "badge should show the unseen count\n{shown}"
+    );
+
+    // Zero unseen (or disabled) hides the badge entirely.
+    env.view.tips_unseen = 0;
+    let hidden = render(&mut env);
+    assert!(
+        !hidden.contains("tips"),
+        "no badge when nothing is unseen\n{hidden}"
+    );
+}
+
+#[test]
+#[serial]
+fn footer_hints_yield_to_tips_badge_when_thin() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+    earn_tip(&mut env);
+    let n = env.view.tips_unseen;
+    assert!(n > 0);
+    let badge = format!("{n} tips");
+
+    let render_at = |env: &mut TestEnv, w: u16| -> String {
+        let backend = TestBackend::new(w, 40);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    // Wide: the badge and even a low-priority hint (Diff) both fit.
+    let wide = render_at(&mut env, 200);
+    assert!(wide.contains(&badge), "badge shows when wide\n{wide}");
+    assert!(
+        wide.contains("Diff"),
+        "low-priority hint present when wide\n{wide}"
+    );
+
+    // Thin: the badge still shows (it takes priority); the hints yield.
+    let thin = render_at(&mut env, 30);
+    assert!(
+        thin.contains(&badge),
+        "badge survives on a thin footer\n{thin}"
+    );
+    assert!(
+        !thin.contains("Diff"),
+        "low-priority hints drop to make room for the badge\n{thin}"
+    );
+}
+
+#[test]
+#[serial]
+fn clicking_footer_tips_badge_opens_overlay() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+    earn_tip(&mut env);
+    assert!(env.view.tips_unseen > 0);
+
+    // Render once so the footer captures the badge's clickable rect.
+    let backend = TestBackend::new(200, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let rect = env
+        .view
+        .tips_badge_rect
+        .expect("badge rect should be captured when shown");
+
+    assert!(env.view.tips_dialog.is_none());
+    let handled = env.view.handle_tips_badge_click(rect.x, rect.y);
+    assert!(handled, "click on the badge is handled");
+    assert!(
+        env.view.tips_dialog.is_some(),
+        "clicking the badge opens the tips overlay"
+    );
+}
+
+#[test]
+#[serial]
+fn hovering_footer_tips_badge_sets_hover_state() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let theme = load_theme("empire");
+    earn_tip(&mut env);
+
+    // Render once so the badge's rect is captured.
+    let backend = TestBackend::new(200, 40);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view.render(f, area, &theme, None, None, None);
+        })
+        .unwrap();
+    let rect = env.view.tips_badge_rect.expect("badge rect captured");
+
+    assert!(!env.view.tips_badge_hovered);
+    // Hovering the badge sets the highlight and reports a change.
+    assert!(env.view.handle_hover(rect.x, rect.y));
+    assert!(env.view.tips_badge_hovered);
+    // Moving off clears it.
+    assert!(env.view.handle_hover(0, 0));
+    assert!(!env.view.tips_badge_hovered);
+}
+
+#[test]
+#[serial]
+fn earned_new_from_selection_tip_pops_after_repeated_n_with_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id);
+    let before = env.view.tips_unseen;
+
+    // Open + cancel `n` with a selection enough times to earn the tip.
+    for _ in 0..crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD {
+        env.view.handle_key(key(KeyCode::Char('n')), None);
+        assert!(
+            env.view.new_dialog.is_some(),
+            "n opens the new-session dialog"
+        );
+        env.view.handle_key(key(KeyCode::Esc), None);
+    }
+
+    // The earned tip is now in the badge and queued to pop.
+    assert_eq!(
+        env.view.tips_unseen,
+        before + 1,
+        "earned tip joins the badge"
+    );
+    assert!(
+        env.view.pending_tip_pop.is_some(),
+        "earned tip should be queued after the threshold"
+    );
+
+    // The next idle keystroke drains the queue into the tips overlay.
+    assert!(env.view.tips_dialog.is_none());
+    env.view.handle_key(key(KeyCode::Char('j')), None);
+    assert!(
+        env.view.tips_dialog.is_some(),
+        "queued earned tip should pop on the next keystroke"
+    );
+    assert!(env.view.pending_tip_pop.is_none(), "pop is drained once");
+}
+
+#[test]
+#[serial]
+fn earned_tip_does_not_pop_when_tips_disabled() {
+    use crate::tui::dialogs::TipsOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id);
+    env.view.persist_tips_outcome(TipsOutcome {
+        newly_seen: vec![],
+        disabled: Some(true),
+    });
+
+    for _ in 0..crate::tips::NEW_FROM_SELECTION_TIP_THRESHOLD {
+        env.view.handle_key(key(KeyCode::Char('n')), None);
+        env.view.handle_key(key(KeyCode::Esc), None);
+    }
+
+    assert!(
+        env.view.pending_tip_pop.is_none(),
+        "disabled tips must not queue a pop"
+    );
+    assert_eq!(env.view.tips_unseen, 0, "disabled tips => empty badge");
+}
+
+#[test]
+#[serial]
+fn using_n_suppresses_the_earned_tip() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id);
+    // Earn the tip (badge showing) without queueing a pop.
+    earn_tip(&mut env);
+    let earned = env.view.tips_unseen;
+    assert!(earned > 0, "tip is earned and badged");
+
+    // The user discovers N for themselves: open new-from-selection.
+    env.view.handle_key(key(KeyCode::Char('N')), None);
+    assert!(
+        env.view.new_dialog.is_some(),
+        "N opens the new-from-selection dialog"
+    );
+    // The earned tip drops from the badge (rotation tips, if any, remain).
+    assert_eq!(
+        env.view.tips_unseen,
+        earned - 1,
+        "using N suppresses the tip that teaches it"
+    );
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .unwrap_or_default();
+    assert!(
+        config.app_state.used_new_from_selection,
+        "N use is persisted"
+    );
 }
 
 #[test]
@@ -1663,7 +2507,7 @@ fn test_refresh_from_config_updates_show_branch_toggle() {
     config.worktree.show_branch_in_tui = false;
     save_config(&config).unwrap();
 
-    view.refresh_from_config();
+    view.refresh_from_config(super::ConfigRefreshOrigin::Watcher);
     assert!(!view.show_branch_in_tui);
 }
 
@@ -1695,6 +2539,8 @@ fn create_test_env_with_group_sessions() -> TestEnv {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
     instances.push(inst3);
 
@@ -1771,8 +2617,8 @@ fn test_group_has_managed_worktrees() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    assert!(view.group_has_managed_worktrees("work", "work/"));
-    assert!(!view.group_has_managed_worktrees("other", "other/"));
+    assert!(view.group_has_managed_worktrees("work", "work/", None));
+    assert!(!view.group_has_managed_worktrees("other", "other/", None));
 }
 
 #[test]
@@ -1793,6 +2639,8 @@ fn test_group_has_containers() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
 
     let mut inst2 = Instance::new("other-session", "/tmp/other");
@@ -1820,8 +2668,8 @@ fn test_group_has_containers() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    assert!(view.group_has_containers("work", "work/"));
-    assert!(!view.group_has_containers("other", "other/"));
+    assert!(view.group_has_containers("work", "work/", None));
+    assert!(!view.group_has_containers("other", "other/", None));
 }
 
 #[test]
@@ -1898,6 +2746,52 @@ fn test_archive_selected_group_archives_all_members() {
             "session {} (group {:?}) archived state should match group membership",
             inst.title,
             inst.group_path
+        );
+    }
+}
+
+/// Locks #1868: bulk archive persists synchronously even though tmux
+/// teardown runs off-thread. Real tmux state asserted in
+/// `tests/e2e/archive_restore.rs`.
+#[test]
+#[serial]
+fn test_archive_selected_group_widened_teardown_persists_synchronously() {
+    let mut env = create_test_env_with_group_sessions();
+
+    for (i, item) in env.view.flat_items.iter().enumerate() {
+        if let Item::Group { path, .. } = item {
+            if path == "work" {
+                env.view.cursor = i;
+                env.view.update_selected();
+                break;
+            }
+        }
+    }
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    let work_ids: Vec<String> = env.view.active_sessions_in_selected_group();
+    assert_eq!(work_ids.len(), 3);
+
+    let result = env.view.archive_selected_group();
+    assert!(
+        result.is_ok(),
+        "archive_selected_group must return Ok even when the off-thread \
+         teardown is fire-and-forget; got {:?}",
+        result
+    );
+
+    for id in &work_ids {
+        let inst = env
+            .view
+            .instances()
+            .iter()
+            .find(|i| &i.id == id)
+            .expect("group member must still exist after archive");
+        assert!(
+            inst.is_archived(),
+            "session {} ({}) must have archived_at set synchronously \
+             on the input thread before archive_selected_group returns",
+            inst.title,
+            id
         );
     }
 }
@@ -2143,6 +3037,8 @@ fn test_delete_group_with_sessions_respects_container_option() {
         container_name: "test-container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
 
     {
@@ -2377,6 +3273,115 @@ fn test_group_collapsed_state_saved_to_storage() {
     assert!(
         saved_group.collapsed,
         "collapsed state should be persisted to storage"
+    );
+}
+
+/// Project-mode folder collapse must survive a restart. Unlike group mode
+/// (persisted on the per-profile GroupTree), project folders are auto-derived
+/// and have no group record, so their collapse state is written to
+/// `app_state.project_group_collapsed`. Regression for collapsed project
+/// folders re-expanding on relaunch.
+#[test]
+#[serial]
+fn test_project_group_collapsed_state_persists_to_config() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Find a project folder header and confirm it starts expanded.
+    let (group_idx, group_path) = env
+        .view
+        .flat_items
+        .iter()
+        .enumerate()
+        .find_map(|(idx, item)| match item {
+            Item::Group {
+                path, collapsed, ..
+            } => {
+                assert!(!collapsed, "project folder should start expanded");
+                Some((idx, path.clone()))
+            }
+            _ => None,
+        })
+        .expect("project mode should have a folder header");
+
+    // Collapse it via Enter, which routes through toggle_group_collapsed.
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    // The collapsed path must be persisted to the on-disk config.
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after collapse");
+    assert!(
+        config
+            .app_state
+            .project_group_collapsed
+            .contains(&group_path),
+        "collapsed project folder path should be persisted to app_state"
+    );
+
+    // A freshly constructed HomeView (simulating relaunch) must restore it.
+    let fresh = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.project_group_collapsed.get(&group_path).copied(),
+        Some(true),
+        "relaunched HomeView should restore the collapsed project folder"
+    );
+}
+
+/// A collapse entry for a project that no longer exists must be pruned on save
+/// so the persisted set can't grow without bound as projects come and go. A
+/// still-live folder collapsed in the same session must survive.
+#[test]
+#[serial]
+fn test_project_group_collapsed_prunes_stale_paths() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Project;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // A real folder the user collapsed this session.
+    let live_path = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            Item::Group { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("project mode should have a folder header");
+
+    env.view
+        .project_group_collapsed
+        .insert(live_path.clone(), true);
+    // A stale entry for a project that isn't part of this session at all.
+    env.view
+        .project_group_collapsed
+        .insert("/repos/deleted-ghost".to_string(), true);
+
+    env.view.save_project_group_collapsed();
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after save");
+    let saved = &config.app_state.project_group_collapsed;
+    assert!(
+        saved.contains(&live_path),
+        "a live collapsed folder must be persisted"
+    );
+    assert!(
+        !saved.iter().any(|p| p == "/repos/deleted-ghost"),
+        "a collapse entry for a nonexistent project must be pruned"
     );
 }
 
@@ -2848,6 +3853,7 @@ fn test_strict_mode_ctrl_d_r_p_reach_secondary_actions() {
     // fire rename (not serve), and orphaned the diff/serve/projects arms. All
     // three Ctrl chords must keep CTRL so their secondary arms fire.
     let mut env = create_test_env_with_sessions(1);
+    disable_delete_to_trash();
     env.view.strict_hotkeys = true;
     env.view.cursor = 0;
     env.view.update_selected();
@@ -3974,6 +4980,136 @@ fn test_delete_group_scoped_to_owning_profile() {
     );
 }
 
+/// Opening the group-delete dialog must scope its session count to the
+/// selected group's profile. Two profiles can own a same-named group; an
+/// empty group in one profile should open the simple confirm, not the
+/// "delete N sessions" options dialog driven by its populated twin in
+/// another profile. Regression for the group-key conflict where the empty
+/// group was not the one the delete modal acted on.
+#[test]
+#[serial]
+fn test_group_delete_dialog_scoped_to_owning_profile() {
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // alpha owns an EMPTY "work" group (group exists, no sessions).
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
+    let mut tree_a = GroupTree::new_with_groups(&[], &[]);
+    tree_a.create_group("work");
+    storage_a
+        .update(|i, g| {
+            *i = vec![];
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // beta owns a same-named "work" group that still has a session.
+    let storage_b = Storage::new_unwatched("beta").unwrap();
+    let mut inst_b = Instance::new("B1", "/tmp/b");
+    inst_b.group_path = "work".to_string();
+    let tree_b = GroupTree::new_with_groups(&[inst_b.clone()], &[]);
+    storage_b
+        .update(|i, g| {
+            *i = [inst_b].to_vec();
+            *g = tree_b.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    // Select alpha's (empty) "work" group.
+    let work_indices: Vec<usize> = view
+        .flat_items
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, item)| match item {
+            Item::Group { path, .. } if path == "work" => Some(idx),
+            _ => None,
+        })
+        .collect();
+    for idx in work_indices {
+        view.cursor = idx;
+        view.update_selected();
+        if view.selected_group_profile.as_deref() == Some("alpha") {
+            break;
+        }
+    }
+    assert_eq!(view.selected_group_profile.as_deref(), Some("alpha"));
+
+    view.open_delete_for_selected();
+
+    assert!(
+        view.group_delete_options_dialog.is_none(),
+        "empty group must not trigger the with-sessions options dialog from a same-named group in another profile"
+    );
+    assert!(
+        view.confirm_dialog.is_some(),
+        "empty group should open the simple delete-group confirm"
+    );
+}
+
+/// Changing a session's profile via the rename dialog must prune the
+/// source profile's now-empty group, just like the restart-with-edits
+/// path does. Without the prune the source keeps an empty group with the
+/// same name as the target's copy, which renders as a duplicate header and
+/// collides on the shared group key.
+#[test]
+#[serial]
+fn test_rename_profile_change_prunes_source_group() {
+    use crate::session::GroupTree;
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+
+    // alpha has one session in "work"; beta exists but is empty.
+    let storage_a = Storage::new_unwatched("alpha").unwrap();
+    let mut inst_a = Instance::new("A1", "/tmp/a");
+    inst_a.group_path = "work".to_string();
+    let id = inst_a.id.clone();
+    let tree_a = GroupTree::new_with_groups(&[inst_a.clone()], &[]);
+    storage_a
+        .update(|i, g| {
+            *i = [inst_a].to_vec();
+            *g = tree_a.get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+    let _storage_b = Storage::new_unwatched("beta").unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.selected_session = Some(id.clone());
+
+    // Move the session alpha -> beta, keeping the same group name.
+    view.rename_selected("", None, Some("beta"), false).unwrap();
+
+    let moved = view.instances().iter().find(|i| i.id == id).unwrap();
+    assert_eq!(moved.source_profile, "beta");
+    assert_eq!(moved.group_path, "work");
+    assert!(
+        view.group_trees.get("beta").unwrap().group_exists("work"),
+        "beta should own the 'work' group after the move"
+    );
+    assert!(
+        !view
+            .group_trees
+            .get("alpha")
+            .map(|t| t.group_exists("work"))
+            .unwrap_or(false),
+        "alpha's now-empty 'work' group should be pruned after the profile move"
+    );
+}
+
 #[test]
 #[serial]
 fn test_shift_n_opens_prefilled_dialog_from_session() {
@@ -4039,12 +5175,12 @@ fn test_group_context_menu_new_session_prefills_path() {
 
     // The group right-click menu's "New Session" routes here.
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
         .view
         .new_dialog
         .as_ref()
-        .expect("NewFromGroup should open the new-session dialog");
+        .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(dialog.path_value(), "/tmp/work");
     assert_eq!(dialog.group_value(), "work");
 }
@@ -4067,7 +5203,7 @@ fn test_group_context_menu_new_session_shows_no_agents_without_tools() {
     env.view.update_selected();
 
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     assert!(
         env.view.new_dialog.is_none(),
         "no agents means the new-session form must not open"
@@ -4100,17 +5236,54 @@ fn test_group_context_menu_new_session_prefills_path_in_project_mode() {
     env.view.update_selected();
 
     env.view
-        .dispatch_context_menu_action(ContextMenuAction::NewFromGroup);
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
     let dialog = env
         .view
         .new_dialog
         .as_ref()
-        .expect("NewFromGroup should open the new-session dialog");
+        .expect("NewFromSelection should open the new-session dialog");
     assert_eq!(
         dialog.path_value(),
         "/tmp/work",
         "project-mode prefill should borrow the member repo path"
     );
+}
+
+#[test]
+#[serial]
+fn test_session_context_menu_new_session_prefills_from_session() {
+    use crate::tui::dialogs::ContextMenuAction;
+
+    let mut env = create_test_env_with_groups();
+
+    // Move cursor onto the "work-project" session row, as a right-click would.
+    let target_id = env
+        .view
+        .instances
+        .iter()
+        .find(|i| i.repo_path() == "/tmp/work")
+        .map(|i| i.id.clone())
+        .expect("work-project instance should exist");
+    let session_idx = env
+        .view
+        .flat_items
+        .iter()
+        .position(|item| matches!(item, Item::Session { id, .. } if *id == target_id))
+        .expect("work-project session row should exist in flat_items");
+    env.view.cursor = session_idx;
+    env.view.update_selected();
+
+    // The session right-click menu's "New Session" routes here, prefilling the
+    // dialog from the right-clicked session's repo path and group (issue #2023).
+    env.view
+        .dispatch_context_menu_action(ContextMenuAction::NewFromSelection);
+    let dialog = env
+        .view
+        .new_dialog
+        .as_ref()
+        .expect("NewFromSelection should open the new-session dialog");
+    assert_eq!(dialog.path_value(), "/tmp/work");
+    assert_eq!(dialog.group_value(), "work");
 }
 
 #[test]
@@ -5481,6 +6654,86 @@ fn app_update_banner_takes_precedence_over_image_banner() {
     );
 }
 
+/// Issue #2220: the app-update banner reassures users that updating is safe
+/// for running sessions. The reassurance must render alongside the version and
+/// action keys so users know `u` won't tear down their work.
+#[test]
+#[serial]
+fn app_update_banner_reassures_running_sessions_are_safe() {
+    use crate::tui::styles::load_theme;
+    use crate::update::UpdateInfo;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_empty();
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let theme = load_theme("empire");
+
+    let update_info = UpdateInfo {
+        available: true,
+        current_version: "1.0.0".to_string(),
+        latest_version: "1.1.0".to_string(),
+    };
+
+    terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let buf = terminal.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+
+    assert!(
+        out.contains("running sessions stay safe"),
+        "expected the update banner to reassure that running sessions are safe.\nFull buffer:\n{out}"
+    );
+    assert!(
+        out.contains("[u] update"),
+        "the action key must still render alongside the reassurance.\nFull buffer:\n{out}"
+    );
+
+    // Narrow-terminal contract: the reassurance is appended after the keys
+    // precisely so the action hints survive when the line is too narrow to
+    // hold everything. At 72 columns the keys fit but the reassurance clips.
+    let narrow = TestBackend::new(72, 30);
+    let mut narrow_terminal = Terminal::new(narrow).unwrap();
+    narrow_terminal
+        .draw(|f| {
+            let area = f.area();
+            env.view
+                .render(f, area, &theme, Some(&update_info), None, None);
+        })
+        .unwrap();
+
+    let nbuf = narrow_terminal.backend().buffer();
+    let mut nout = String::new();
+    for y in 0..nbuf.area.height {
+        for x in 0..nbuf.area.width {
+            nout.push_str(nbuf[(x, y)].symbol());
+        }
+        nout.push('\n');
+    }
+
+    assert!(
+        nout.contains("[u] update") && nout.contains("[Ctrl+x] dismiss"),
+        "the action keys must survive clipping on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+    assert!(
+        !nout.contains("running sessions stay safe"),
+        "the trailing reassurance is expected to clip first on a narrow terminal.\nFull buffer:\n{nout}"
+    );
+}
+
 /// Regression for the e2e CI failure (job 76034901940):
 /// `test_command_palette_fuzzy_search_settings` and
 /// `test_profile_picker_create_new_profile` failed because the harness types
@@ -5728,6 +6981,8 @@ fn toggle_favorite_at_cursor_noop_with_no_selection() {
 #[serial]
 fn toggle_archive_at_cursor_round_trip() {
     let mut env = create_test_env_with_sessions(1);
+    // Keep the Archived section expanded so the archived row stays reachable.
+    env.view.archived_section_collapsed = false;
     let id = env.view.instances[0].id.clone();
     env.view.selected_session = Some(id.clone());
 
@@ -5737,8 +6992,79 @@ fn toggle_archive_at_cursor_round_trip() {
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.instances[0].is_archived());
 
+    // Archiving moved the selection off the row (it advances to the next
+    // active session; here there is none). Navigate back onto the archived
+    // row, as a user would, before toggling it back.
+    env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(!env.view.instances[0].is_archived());
+}
+
+/// Trashing a session hides it from the active list and surfaces it under
+/// the synthetic Trash section; the shelve/unshelve key (`z`) restores it.
+#[test]
+#[serial]
+fn trash_then_restore_round_trip() {
+    let mut env = create_test_env_with_sessions(2);
+    // Keep the Trash section expanded so the trashed row stays reachable.
+    env.view.trashed_section_collapsed = false;
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    assert!(!env.view.instances[0].is_trashed());
+
+    env.view.trash_session_by_id(&id);
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be trashed"
+    );
+
+    // The Trash section header is present, and the trashed row is not in the
+    // active flow (it renders under that header).
+    let items = env.view.build_flat_items();
+    assert!(
+        items.iter().any(|it| matches!(
+            it,
+            Item::Group { path, .. } if crate::session::is_trash_section_path(path)
+        )),
+        "Trash section header must be present after trashing"
+    );
+
+    // Restore via the shelve/unshelve key.
+    env.view.select_session_by_id(&id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "session must be restored out of trash"
+    );
+}
+
+#[test]
+#[serial]
+fn d_on_session_with_default_trash_persists_trash_marker() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "pressing d with default trash-first config must mark the row trashed in memory"
+    );
+    assert!(
+        env.view.unified_delete_dialog.is_none(),
+        "trash-first d must not open the permanent-delete dialog"
+    );
+    let disk_row = Storage::new_unwatched("test")
+        .unwrap()
+        .load()
+        .unwrap()
+        .into_iter()
+        .find(|inst| inst.id == id)
+        .expect("disk row present");
+    assert!(
+        disk_row.is_trashed(),
+        "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+    );
 }
 
 /// When no session is selected, the toggle is a silent no-op.
@@ -5750,21 +7076,24 @@ fn toggle_archive_at_cursor_noop_with_no_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
 }
 
-/// Approach 2: archiving in the default (non-Attention) sort keeps the cursor
-/// AND selection on the just-archived session instead of swapping to a
-/// neighbor, and reveals the Archived section so the row stays visible. This is
-/// what lets the preview render the calm "Archived" placeholder for the same
-/// row the user is looking at, rather than flashing a dead-pane warning and
-/// then snapping selection to the session below.
+/// Archiving in the default (non-Attention) sort advances the cursor to the
+/// next active session below instead of following the archived row into the
+/// Archived section. The section is NOT auto-revealed; its header count is
+/// the feedback. The preview follows the new selection through the normal
+/// per-frame retarget (cache gates on session id, worker drops stale frames).
 #[test]
 #[serial]
-fn archive_keeps_selection_and_reveals_section() {
-    let mut env = create_test_env_with_sessions(2);
-    // Start with the Archived section collapsed (the default / reported repro).
+fn archive_advances_cursor_to_next_session() {
+    let mut env = create_test_env_with_sessions(3);
+    // Start with the Archived section collapsed (the default).
     env.view.archived_section_collapsed = true;
     env.view.cursor = 0;
     env.view.update_selected();
     let id = env.view.selected_session.clone().unwrap();
+    let next_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a session row below the cursor, got {other:?}"),
+    };
 
     env.view.toggle_archive_at_cursor().unwrap();
 
@@ -5774,19 +7103,132 @@ fn archive_keeps_selection_and_reveals_section() {
     );
     assert_eq!(
         env.view.selected_session.as_deref(),
-        Some(id.as_str()),
-        "selection must stay on the archived session, not swap to a neighbor"
+        Some(next_id.as_str()),
+        "selection must advance to the next active session"
     );
     assert!(
-        !env.view.archived_section_collapsed,
-        "archiving must reveal the Archived section so the row stays visible"
+        env.view.archived_section_collapsed,
+        "single-row archive must not auto-reveal the Archived section"
     );
     match env.view.flat_items.get(env.view.cursor) {
         Some(Item::Session { id: cur, .. }) => {
-            assert_eq!(cur, &id, "cursor must land on the archived row")
+            assert_eq!(cur, &next_id, "cursor must sit on the next session's row")
         }
-        _ => panic!("cursor should be on the archived session row"),
+        _ => panic!("cursor should be on the next session row"),
     }
+}
+
+/// Archiving the bottom session has no row below to advance to, so the
+/// cursor falls back to the nearest active session above.
+#[test]
+#[serial]
+fn archive_bottom_row_falls_back_to_session_above() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = true;
+    let last = env.view.flat_items.len() - 1;
+    env.view.cursor = last;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+    let above_id = match env.view.flat_items.get(last - 1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a session row above the cursor, got {other:?}"),
+    };
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session.as_deref(),
+        Some(above_id.as_str()),
+        "with nothing below, selection must land on the session above"
+    );
+}
+
+/// Archiving the only active session leaves nothing to advance to: the
+/// cursor clamps into the remaining list (the Archived section header) and
+/// the selection clears instead of pointing at a vanished row.
+#[test]
+#[serial]
+fn archive_last_active_session_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "no active session remains, so nothing should be selected"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
+}
+
+/// The successor scan must skip rows already parked under an EXPANDED
+/// Archived section: archiving the last active row with an archived row
+/// visible below clears the selection instead of advancing into the section.
+#[test]
+#[serial]
+fn archive_successor_skips_archived_rows() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.archived_section_collapsed = false;
+
+    // Park the second session first, so an archived row sits below.
+    let parked_id = match env.view.flat_items.get(1) {
+        Some(Item::Session { id, .. }) => id.clone(),
+        other => panic!("expected a second session row, got {other:?}"),
+    };
+    env.view.select_session_by_id(&parked_id);
+    env.view.toggle_archive_at_cursor().unwrap();
+    assert!(env.view.get_instance(&parked_id).unwrap().is_archived());
+
+    // Archive the remaining active session. The only session row left below
+    // the cursor is the parked one, which must NOT become the selection.
+    let id = env.view.selected_session.clone().unwrap();
+    assert_ne!(
+        id, parked_id,
+        "selection must have fallen back to the active row"
+    );
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "the cursor must not advance onto a row inside the Archived section"
+    );
+}
+
+/// Attention sort: archiving the only active session with the Archived
+/// section collapsed leaves no session row for `select_top_attention` to
+/// land on. Selection must clear (not stay pinned to the invisible archived
+/// row) and the cursor must clamp into the shrunken list.
+#[test]
+#[serial]
+fn archive_last_active_session_attention_sort_clears_selection() {
+    let mut env = create_test_env_with_sessions(1);
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    env.view.flat_items = env.view.build_flat_items();
+    env.view.archived_section_collapsed = true;
+    env.view.cursor = 0;
+    env.view.update_selected();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.toggle_archive_at_cursor().unwrap();
+
+    assert!(env.view.get_instance(&id).unwrap().is_archived());
+    assert_eq!(
+        env.view.selected_session, None,
+        "selection must not point at the archived row hidden in the collapsed section"
+    );
+    assert!(
+        env.view.cursor < env.view.flat_items.len(),
+        "cursor must stay clamped inside the rebuilt list"
+    );
 }
 
 /// Restoring with `z` unarchives the row and keeps it selected, following it
@@ -5804,6 +7246,9 @@ fn unarchive_keeps_selection() {
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(env.view.get_instance(&id).unwrap().is_archived());
 
+    // The archive advanced the cursor to the neighbor; navigate back onto
+    // the archived row (visible because the section is expanded) to restore.
+    env.view.select_session_by_id(&id);
     env.view.toggle_archive_at_cursor().unwrap();
     assert!(
         !env.view.get_instance(&id).unwrap().is_archived(),
@@ -5953,6 +7398,236 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     assert_eq!(
         stored, now,
         "cooldown timestamp must not be overwritten on a debounced press"
+    );
+}
+
+#[test]
+#[serial]
+fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
+    if std::process::Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("Skipping: tmux not available");
+        return;
+    }
+
+    let temp = TempDir::new().unwrap();
+    setup_test_home(&temp);
+    let profile = "restart-resume-failed";
+    let storage = Storage::new_unwatched(profile).unwrap();
+    let stale_sid = "11111111-2222-3333-4444-555555555555";
+
+    let mut inst = Instance::new("restart-resume-failed", "/tmp/x");
+    inst.source_profile = profile.to_string();
+    inst.tool = "claude".to_string();
+    inst.command = "/bin/false".to_string();
+    inst.agent_session_id = Some(stale_sid.to_string());
+    let id = inst.id.clone();
+    let tmux_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    storage
+        .update(|instances, groups| {
+            *instances = vec![inst.clone()];
+            *groups = GroupTree::new_with_groups(std::slice::from_ref(&inst), &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some(profile.to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.update_selected();
+    view.selected_session = Some(id.clone());
+
+    let result = view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+
+    let mut applied = false;
+    for _ in 0..120 {
+        if view.apply_restart_results() {
+            applied = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let _ = std::process::Command::new("tmux")
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
+
+    assert!(applied, "timed out waiting for async restart result");
+    let dialog = view.info_dialog.as_ref().expect("resume failure dialog");
+    assert_eq!(dialog.title(), "Restart Failed");
+    assert!(dialog.message().contains(stale_sid));
+    let row = view.get_instance(&id).expect("instance remains visible");
+    assert_eq!(row.agent_session_id.as_deref(), Some(stale_sid));
+    assert_eq!(row.resume_probe_failed_sid.as_deref(), Some(stale_sid));
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert!(row.last_accessed_at.is_some());
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_preserves_peer_sid_and_marker() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("peer-fresh-sid".to_string());
+    env.view.instances[0].resume_probe_failed_sid = Some("peer-fresh-sid".to_string());
+
+    let mut worker = env.view.instances[0].clone();
+    worker.status = crate::session::Status::Error;
+    worker.agent_session_id = Some("phase1-stale-sid".to_string());
+    worker.resume_probe_failed_sid = Some("phase1-stale-sid".to_string());
+    worker.last_error =
+        Some("resume failed for sid phase1-stale-sid; preserved for explicit retry".to_string());
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(worker.clone()),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::ResumeFailed {
+                sid: "phase1-stale-sid".to_string(),
+            }),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Error);
+    assert_eq!(row.agent_session_id.as_deref(), Some("peer-fresh-sid"));
+    assert_eq!(
+        row.resume_probe_failed_sid.as_deref(),
+        Some("peer-fresh-sid")
+    );
+    assert!(env.view.restart_in_flight.is_empty());
+    let dialog = env
+        .view
+        .info_dialog
+        .as_ref()
+        .expect("resume failure dialog");
+    assert!(dialog.message().contains("phase1-stale-sid"));
+}
+
+#[test]
+#[serial]
+fn apply_restart_results_propagates_worker_sid_without_peer_write() {
+    use crate::session::StartOutcome;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.restart_in_flight.insert(id.clone());
+    env.view.instances[0].agent_session_id = Some("sid-before".to_string());
+
+    let before = env.view.instances[0].clone();
+    let mut worker = before.clone();
+    worker.agent_session_id = Some("sid-after".to_string());
+    worker.status = crate::session::Status::Running;
+
+    env.view.restart_poller = crate::tui::restart_poller::RestartPoller::with_result_for_test(
+        crate::session::restart::RestartResult {
+            session_id: id.clone(),
+            before: Box::new(before),
+            instance: Box::new(worker),
+            outcome: Ok(StartOutcome::Resumed),
+        },
+    );
+
+    assert!(env.view.apply_restart_results());
+
+    let row = env
+        .view
+        .get_instance(&id)
+        .expect("instance remains visible");
+    assert_eq!(row.status, crate::session::Status::Running);
+    assert_eq!(row.agent_session_id.as_deref(), Some("sid-after"));
+    assert_eq!(row.resume_probe_failed_sid, None);
+    assert!(env.view.restart_in_flight.is_empty());
+}
+
+#[test]
+#[serial]
+fn execute_send_message_missing_session_shows_send_failed() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.instances.retain(|inst| inst.id != id);
+    env.view.instance_map.remove(&id);
+
+    env.view.execute_send_message(&id, "hello");
+
+    let dialog = env.view.info_dialog.as_ref().expect("send failure dialog");
+    assert_eq!(dialog.title(), "Send Failed");
+    assert_eq!(
+        dialog.message(),
+        "Session disappeared before the message could be sent."
+    );
+}
+
+/// A second restart press while the first cascade is still running on the
+/// poller worker must be dropped. The cascade is off the event loop, so the
+/// 1.5s keyboard-repeat debounce does not cover a deliberate press during a
+/// multi-second pull; without the in-flight guard the worker would enqueue a
+/// duplicate request and restart the row twice.
+#[test]
+#[serial]
+fn restart_selected_session_skips_when_already_in_flight() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.restart_selected_session(None, None, None, None);
+    assert!(result.is_ok());
+    assert!(
+        env.view.restart_cooldown_at.is_empty(),
+        "an in-flight restart must drop the press before any bookkeeping"
+    );
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Starting,
+        "the row must not be re-flipped to Starting by a dropped duplicate press"
+    );
+}
+
+/// Deleting a row whose restart cascade is still running would fire docker
+/// commands against the container the worker is mid-creating. The delete must
+/// be refused (and surfaced) rather than racing the restart worker.
+#[test]
+#[serial]
+fn delete_selected_refused_during_restart() {
+    use crate::tui::dialogs::DeleteOptions;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instances[0].id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.restart_in_flight.insert(id.clone());
+
+    let result = env.view.delete_selected(&DeleteOptions::default());
+    assert!(result.is_ok());
+    assert_ne!(
+        env.view.instances[0].status,
+        crate::session::Status::Deleting,
+        "delete must be refused while a restart is in flight"
+    );
+    assert!(
+        env.view.info_dialog.is_some(),
+        "the refused delete must surface a dialog, not silently no-op"
     );
 }
 
@@ -6119,7 +7794,7 @@ fn pinned_project_without_sessions_shows_empty_header() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("gamma", "/repos/gamma", ProjectScope::Global),
+        Project::new("gamma", "/repos/gamma", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6174,9 +7849,17 @@ fn p_key_pins_project_on_header() {
     // The pin path must not open the projects dialog (the chord is shared).
     assert!(env.view.projects_dialog.is_none());
 
-    // Unpinning (a second toggle) drops the registry entry.
+    // Unpinning (a second toggle) clears the pin but KEEPS the saved project,
+    // so the entry stays in the registry (only an explicit remove deletes it).
+    // See #2208.
     env.view.toggle_project_pin_at_cursor();
     assert!(!env.view.is_project_label_pinned("alpha"));
+    // The specific entry is kept (not just "registry non-empty") with its pin
+    // flag cleared: unpin keeps the saved project, only Remove deletes it.
+    let after = crate::session::projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert_eq!(after[0].name, "alpha");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
 }
 
 /// Off a project header (here: in Manual grouping), `p` keeps its original
@@ -6313,10 +7996,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         .unwrap();
 
     // Stale registry entry: same basename, different (nonexistent) path.
+    // Pinned, so it surfaces as an empty header (#2208).
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("otari", "/repos/otari", ProjectScope::Global),
+        Project::new("otari", "/repos/otari", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6366,10 +8050,11 @@ fn stale_registry_entry_with_mismatched_archived_path_stays_pinned_and_unpinnabl
         "unpin must drop the empty header from the main flow; got {:?}",
         view.flat_items
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "unpin must remove the stale registry entry"
-    );
+    // Unpin clears the flag but KEEPS the saved project (#2208): the entry
+    // survives, now unpinned, so it stays in the Projects view / wizard.
+    let after = projects::load_global().unwrap();
+    assert_eq!(after.len(), 1, "unpin must keep the registry entry");
+    assert!(!after[0].pinned, "unpin must clear the pin flag");
     // The archived session itself is untouched; it stays under Archived.
     assert!(
         view.flat_items
@@ -6540,7 +8225,7 @@ fn all_profiles_view_includes_profile_scoped_pins() {
     projects::add(
         "beta",
         ProjectScope::Profile,
-        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6864,7 +8549,7 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
     projects::add(
         "beta",
         ProjectScope::Profile,
-        Project::new("lonely", "/repos/lonely", ProjectScope::Profile),
+        Project::new("lonely", "/repos/lonely", ProjectScope::Profile).with_pinned(true),
         false,
     )
     .unwrap();
@@ -6887,10 +8572,13 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
         !view.is_project_label_pinned("lonely"),
         "lonely must read as unpinned after the toggle"
     );
-    // The entry is gone from beta's on-disk registry, not just the in-memory view.
+    // The unpin must clear the flag on beta's on-disk entry (not the default
+    // profile's), but KEEP the entry: it stays a saved project. See #2208.
+    let beta_after = projects::load_profile("beta").unwrap();
+    assert_eq!(beta_after.len(), 1, "the profile-scoped entry must be kept");
     assert!(
-        projects::load_profile("beta").unwrap().is_empty(),
-        "the profile-scoped registry entry must be removed from disk"
+        !beta_after[0].pinned,
+        "its pin flag must be cleared on disk"
     );
     let still: Vec<String> = view
         .flat_items
@@ -6908,9 +8596,10 @@ fn unpin_profile_scoped_pin_from_all_profiles_clears_header() {
 
 /// A repo pinned in BOTH scopes (a profile entry shadowing a global one via
 /// `--allow-override`) must fully unpin in a single press. `load_merged` only
-/// surfaces the shadowing profile entry, so removing just that one would
-/// re-surface the global entry and leave the header pinned after a "success"
-/// dialog. Unpin sweeps every scope for the path.
+/// surfaces the shadowing profile entry, so clearing just that one would
+/// re-surface the global pin and leave the header pinned after a "success"
+/// dialog. Unpin sweeps every scope for the path, clearing the flag while
+/// keeping each entry. See #2208.
 #[test]
 #[serial]
 fn unpin_clears_both_global_and_profile_entries_for_a_path() {
@@ -6922,14 +8611,14 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
     projects::add(
         "test",
         ProjectScope::Global,
-        Project::new("dual-global", "/repos/dual", ProjectScope::Global),
+        Project::new("dual-global", "/repos/dual", ProjectScope::Global).with_pinned(true),
         false,
     )
     .unwrap();
     projects::add(
         "test",
         ProjectScope::Profile,
-        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile),
+        Project::new("dual-profile", "/repos/dual", ProjectScope::Profile).with_pinned(true),
         true,
     )
     .unwrap();
@@ -6954,14 +8643,14 @@ fn unpin_clears_both_global_and_profile_entries_for_a_path() {
         !env.view.is_project_label_pinned("dual"),
         "dual must read as unpinned after a single press"
     );
-    assert!(
-        projects::load_global().unwrap().is_empty(),
-        "global entry must be removed"
-    );
-    assert!(
-        projects::load_profile("test").unwrap().is_empty(),
-        "profile entry must be removed"
-    );
+    // Both entries are kept (saved projects), with the pin flag cleared in
+    // each scope so the merged view no longer shows a pinned header. See #2208.
+    let global_after = projects::load_global().unwrap();
+    assert_eq!(global_after.len(), 1, "global entry must be kept");
+    assert!(!global_after[0].pinned, "global pin flag must be cleared");
+    let profile_after = projects::load_profile("test").unwrap();
+    assert_eq!(profile_after.len(), 1, "profile entry must be kept");
+    assert!(!profile_after[0].pinned, "profile pin flag must be cleared");
     let names: Vec<String> = env
         .view
         .flat_items
@@ -7889,6 +9578,432 @@ mod scroll_pane_isolation {
         env.view.preview_area = Rect::new(30, 0, 100, 40);
     }
 
+    /// Build a live-send env whose preview-capture worker reports the
+    /// given cursor, so the alternate-screen wheel-forwarding branch can
+    /// be exercised without a real full-screen pane.
+    fn live_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        use crate::tui::home::live_send::{LiveSendState, LiveSendTarget, LiveSendWorker};
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view.live_send = Some(LiveSendState {
+            session_id: "fake".to_string(),
+            title: "fake".to_string(),
+            tmux_name: "fake".to_string(),
+            target: LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+        env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
+        // Spawn the capture worker, then inject the cursor (set_target
+        // clears it, so the injection must come after).
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
+    /// Like `live_env_with_cursor` but WITHOUT entering live-send: the
+    /// session is merely previewed (the common "hover the preview" case).
+    /// No `live_send` / `live_send_worker`; the capture worker and its
+    /// target are set so `forward_wheel_to_preview` can take the passive
+    /// one-shot path.
+    fn passive_env_with_cursor(cursor: crate::tmux::PaneCursor) -> TestEnv {
+        let mut env = create_test_env_with_sessions(3);
+        setup_panes(&mut env);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view.preview_capture_target = Some("fake".to_string());
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker spawned")
+            .set_cursor_for_test(Some(cursor));
+        env
+    }
+
+    fn alt_screen_cursor(
+        alternate_on: bool,
+        mouse_tracking: bool,
+        mouse_sgr: bool,
+    ) -> crate::tmux::PaneCursor {
+        crate::tmux::PaneCursor {
+            x: 0,
+            y: 0,
+            visible: true,
+            pane_height: 24,
+            history_size: 1800,
+            pane_width: 80,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+            position_reliable: true,
+        }
+    }
+
+    /// Live-send target is a full-screen app with SGR mouse tracking on:
+    /// the wheel is forwarded to the app (returns to the live edge) instead
+    /// of growing the useless normal-buffer capture window. This is the fix
+    /// for the "scroll up a little then snap to the very first part of the
+    /// session" report on alternate-screen agents.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_sgr_mouse_pane_forwards_instead_of_scrollback() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen SGR-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "forwarding pins the preview to the live edge, never the normal-buffer history"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A full-screen app WITHOUT mouse tracking (e.g. Claude Code's
+    /// fullscreen renderer: `1049h` + `1007h`, no mouse) does not scroll on
+    /// arrow keys (it reads them as cursor / input-history navigation), so we
+    /// forward `PageUp`/`PageDown` named keys instead and pin the preview to
+    /// the live edge, just like the mouse-tracking case. Regression for #2407.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_without_mouse_forwards_page_keys() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen no-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "arrow-key forwarding pins the preview to the live edge, never the normal-buffer history"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Passive preview (NOT live-send) over a full-screen agent must ALSO
+    /// forward the wheel. The alternate screen has no scrollback, so the
+    /// capture-window scroll is inert; without forwarding, "hover the
+    /// preview and scroll" does literally nothing (the reported regression
+    /// after Claude Code's fullscreen renderer landed). Forwarding pins the
+    /// preview to the live edge, exactly like the live-send path.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_passive_preview_forwards() {
+        let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(
+            env.view.live_send.is_none(),
+            "this exercises passive preview, not live-send"
+        );
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(
+            up,
+            "wheel over a full-screen pane in passive preview is forwarded"
+        );
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "passive forwarding pins the preview to the live edge"
+        );
+
+        env.view.preview_scroll_offset = 10;
+        let down = env.view.handle_scroll_down(50, 10);
+        assert!(down);
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// In live-send over a mouse-tracking agent, a plain (no-Shift) left
+    /// press/release is forwarded to the agent and consumed, and the held
+    /// button is tracked so its release can't be stranded.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_left_click_forwards() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+        // Forwarding never starts an aoe text selection.
+        assert!(env.view.drag_state.is_none());
+        assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Passive preview (NOT live-send) over a mouse-tracking agent ALSO forwards
+    /// a plain press/drag/release, so hovering an agent and dragging drives its
+    /// native selection / scroll, exactly like the live-send case (and like the
+    /// passive wheel path). The one-shot send carries it with no live worker.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_passive_preview_forwards() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = passive_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(
+            env.view.live_send.is_none(),
+            "this exercises passive preview, not live-send"
+        );
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            55,
+            12
+        ));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            55,
+            12
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+        // Forwarding never starts an aoe text selection, even passively.
+        assert!(env.view.drag_state.is_none());
+        assert!(env.view.preview_selection.is_none());
+    }
+
+    /// Shift+press is NOT forwarded: it falls through so aoe's own preview
+    /// text-selection (drag-to-copy) can run.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_shift_falls_through() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::SHIFT,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// A non-mouse agent never forwards; the event falls through to aoe.
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_non_mouse_agent_falls_through() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+    }
+
+    /// Once a press is forwarded, its drag and release keep forwarding even
+    /// after the pointer leaves the preview rect, so the agent always sees the
+    /// release (no stuck button).
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_drag_and_release_track_button() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Down(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        // (1, 1) is outside the preview rect, but the drag still forwards.
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1
+        ));
+        assert_eq!(env.view.mouse_forward_btn, Some(0));
+        assert!(env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            1,
+            1
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// A drag or release with no forwarded press in flight is ignored (it must
+    /// not start forwarding mid-gesture).
+    #[test]
+    #[serial]
+    fn forward_mouse_to_preview_orphan_drag_ignored() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Drag(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert!(!env.view.forward_mouse_to_preview(
+            MouseEventKind::Up(MouseButton::Left),
+            KeyModifiers::NONE,
+            50,
+            10
+        ));
+        assert_eq!(env.view.mouse_forward_btn, None);
+    }
+
+    /// Stage an in-flight Shift-selection drag held at the preview's top
+    /// (`row == pane.y`) or bottom edge, plus a capture window with NO aoe-side
+    /// scrollback, so `tick_preview_autoscroll` exercises the agent
+    /// scroll-forward fallback rather than the capture-window line scroll.
+    fn stage_edge_drag_no_scrollback(env: &mut TestEnv, at_top: bool) {
+        use crate::tui::home::PreviewTextView;
+        // Visible == captured: `scroll_preview_offset` has nowhere to go, the
+        // alternate-screen reality the fallback exists for. The clamp reads
+        // `preview_visible_rows`, so pin it to the captured-line count to make
+        // the max offset zero (no scrollback to move into).
+        env.view.preview_cache.captured_lines = 23;
+        env.view.preview_visible_rows = 23;
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_scroll_offset = 0;
+        let pane = Rect::new(30, 0, 100, 5);
+        env.view.preview_text_view = PreviewTextView {
+            pane,
+            first_line: 0,
+            total_lines: 23,
+        };
+        // Anchor away from the held edge, then drag onto it.
+        let (start_row, edge_row) = if at_top { (4, 0) } else { (0, 4) };
+        assert!(env.view.handle_drag_start(40, start_row));
+        assert!(env.view.handle_drag_move(40, edge_row));
+    }
+
+    /// Over a full-screen mouse-tracking agent the capture window has no
+    /// scrollback, so an edge-held selection forwards the same scroll input the
+    /// wheel does (a wheel-up/down mouse report, NOT PageUp, since the agent
+    /// owns the mouse) to scroll its own transcript instead of moving the inert
+    /// offset. The fallback delegates to `wheel_forward_key`, whose byte output
+    /// per branch is asserted in `wheel_forward_key_*`; here we verify the tick
+    /// forwards and pins the offset. Regression for the "autoscroll does nothing
+    /// over a mouse-tracking agent" report (PageUp was a no-op there).
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a wheel notch to the agent"
+        );
+        // The inert capture-window offset never moved; the agent was scrolled.
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// Same as above at the bottom edge: a wheel-down notch is forwarded.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_scroll_to_mouse_tracking_agent_at_bottom_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, true));
+        stage_edge_drag_no_scrollback(&mut env, false);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "bottom-edge tick forwards a wheel notch to the agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A full-screen agent WITHOUT mouse tracking (Claude Code's fullscreen
+    /// renderer: `1049h`, no mouse) gets `PageUp`/`PageDown` from the fallback
+    /// instead, matching the wheel path's no-mouse branch.
+    #[test]
+    #[serial]
+    fn autoscroll_forwards_page_keys_to_no_mouse_agent_at_top_edge() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            env.view.tick_preview_autoscroll(),
+            "top-edge tick forwards a page key to the no-mouse agent"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A normal-buffer pane (NOT alternate-screen) that has merely bottomed out
+    /// its scrollback must NOT get scroll input injected into its shell: the
+    /// tick is a no-op there.
+    #[test]
+    #[serial]
+    fn autoscroll_does_not_forward_to_normal_pane() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, false, false));
+        stage_edge_drag_no_scrollback(&mut env, true);
+        assert!(
+            !env.view.tick_preview_autoscroll(),
+            "a non-alternate-screen pane never gets forwarded scroll input"
+        );
+        assert_eq!(env.view.preview_scroll_offset, 0);
+    }
+
+    /// A full-screen app with mouse tracking but in the LEGACY (non-SGR)
+    /// encoding is still forwarded; the byte builder emits X10-encoded
+    /// bytes for it instead of SGR (see `wheel_mouse_bytes_legacy_encodes_x10`).
+    /// Forwarding pins the preview to the live edge like the SGR case.
+    #[test]
+    #[serial]
+    fn wheel_over_alt_screen_legacy_mouse_forwards() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(true, true, false));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up, "wheel over a full-screen legacy-mouse pane is handled");
+        assert_eq!(
+            env.view.preview_scroll_offset, 0,
+            "legacy mouse is forwarded too (X10 encoding), not dead-scrolled"
+        );
+    }
+
+    /// And a normal-screen agent (no alternate screen) keeps the capture
+    /// scroll even if it happens to have SGR mouse on: the preview's
+    /// scrollback is genuinely useful there.
+    #[test]
+    #[serial]
+    fn wheel_over_normal_screen_pane_uses_capture_scroll() {
+        let mut env = live_env_with_cursor(alt_screen_cursor(false, true, true));
+
+        let up = env.view.handle_scroll_up(50, 10);
+        assert!(up);
+        assert!(
+            env.view.preview_scroll_offset > 10,
+            "normal screen: capture-window scroll still drives the preview"
+        );
+    }
+
     /// Wheel-down over preview when offset is already at the bottom (0)
     /// must NOT advance the list cursor.
     #[test]
@@ -8146,7 +10261,9 @@ mod scroll_pane_isolation {
         assert!(env.view.live_send.is_some());
     }
 
-    /// Leader + q exits live mode and resets the live-only UI state.
+    /// Leader + q exits live mode and disarms the leader menu. The sidebar
+    /// collapse is now a persisted general state, so exiting live mode
+    /// deliberately leaves it as the user set it (no force-reveal).
     #[test]
     #[serial]
     fn live_leader_q_exits() {
@@ -8156,8 +10273,8 @@ mod scroll_pane_isolation {
         env.view.handle_key(key(KeyCode::Char('q')), None);
         assert!(env.view.live_send.is_none(), "leader+q exits live mode");
         assert!(
-            !env.view.sidebar_collapsed,
-            "exiting must re-reveal the sidebar"
+            env.view.sidebar_collapsed,
+            "collapse is persisted, not reset on live exit"
         );
         assert!(!env.view.live_send_pending_leader);
     }
@@ -8234,7 +10351,10 @@ mod scroll_pane_isolation {
             "committing a palette command must drop out of live mode"
         );
         assert!(env.view.command_palette.is_none());
-        assert!(!env.view.sidebar_collapsed, "live-only state is reset");
+        assert!(
+            !env.view.sidebar_collapsed,
+            "sidebar was never collapsed, so it stays expanded"
+        );
     }
 
     /// Collapsing the sidebar in live mode hands the preview the full
@@ -8282,6 +10402,308 @@ mod scroll_pane_isolation {
         // The which-key banner renders without panicking while armed.
         env.view.live_send_pending_leader = true;
         let _ = render(&mut env);
+    }
+
+    /// The collapse button (expanded) and the strip (collapsed) are
+    /// click-toggle affordances: clicking the button collapses, clicking
+    /// the strip re-expands, and each reports its hit rect while the other
+    /// is cleared.
+    #[test]
+    #[serial]
+    fn sidebar_collapse_button_and_strip_toggle() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let mut env = create_test_env_with_sessions(3);
+        let theme = crate::tui::styles::load_theme("empire");
+
+        let render = |env: &mut TestEnv| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    env.view.render(f, area, &theme, None, None, None);
+                })
+                .unwrap();
+        };
+
+        // Expanded: the collapse button has a real rect; clicking it collapses.
+        render(&mut env);
+        assert!(!env.view.sidebar_collapsed);
+        let btn = env.view.collapse_button_area;
+        assert!(
+            btn.width > 0 && btn.height > 0,
+            "collapse button must have a hit rect while expanded"
+        );
+        assert!(
+            env.view.handle_sidebar_collapse_click(btn.x, btn.y),
+            "clicking the collapse button is consumed"
+        );
+        assert!(
+            env.view.sidebar_collapsed,
+            "collapse button click collapses the sidebar"
+        );
+
+        // Collapsed: the strip has a real rect, the button rect is cleared,
+        // and clicking the strip re-expands.
+        render(&mut env);
+        let strip = env.view.expand_strip_area;
+        assert!(
+            strip.width > 0 && strip.height > 0,
+            "collapsed strip must have a hit rect"
+        );
+        assert_eq!(
+            env.view.collapse_button_area,
+            Rect::default(),
+            "collapse button rect cleared while collapsed"
+        );
+        assert!(
+            env.view
+                .handle_sidebar_collapse_click(strip.x + 1, strip.y + 1),
+            "clicking the strip is consumed"
+        );
+        assert!(
+            !env.view.sidebar_collapsed,
+            "strip click re-expands the sidebar"
+        );
+    }
+
+    /// A takeover view (settings/diff/serve) returns early in `render`
+    /// before the home-view paths run, so the collapse/expand and footer
+    /// hit rects must be cleared up front. Otherwise a stale rect from the
+    /// prior home frame could swallow a click on the takeover surface (the
+    /// collapse handler runs ahead of `hit_diff`).
+    #[test]
+    #[serial]
+    fn takeover_view_clears_sidebar_hit_rects() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let mut env = create_test_env_with_sessions(3);
+        let theme = crate::tui::styles::load_theme("empire");
+        let render = |env: &mut TestEnv| {
+            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            terminal
+                .draw(|f| {
+                    let area = f.area();
+                    env.view.render(f, area, &theme, None, None, None);
+                })
+                .unwrap();
+        };
+
+        // Home view populates the collapse button + footer rects.
+        render(&mut env);
+        assert!(env.view.collapse_button_area.width > 0);
+        assert!(!env.view.footer_buttons.is_empty());
+
+        // Opening settings is a full-screen takeover; the next render must
+        // clear the stale rects so a click can't toggle the hidden sidebar.
+        env.view.settings_view =
+            Some(crate::tui::settings::SettingsView::new("test", None).unwrap());
+        render(&mut env);
+        assert_eq!(env.view.collapse_button_area, Rect::default());
+        assert_eq!(env.view.expand_strip_area, Rect::default());
+        assert!(env.view.footer_buttons.is_empty());
+        assert!(
+            !env.view.handle_sidebar_collapse_click(0, 0),
+            "no sidebar rect can be hit while a takeover view owns the screen"
+        );
+    }
+}
+
+mod footer_toolbar {
+    //! The footer hint bar is a clickable toolbar: each shortcut renders a
+    //! hit rect paired with the key it synthesizes, a click dispatches that
+    //! key through the normal handler, and hover highlights the button.
+    use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn render_at(env: &mut TestEnv, w: u16, h: u16) {
+        let theme = crate::tui::styles::load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                env.view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+    }
+
+    fn button_key(env: &TestEnv, code: KeyCode) -> Option<KeyEvent> {
+        env.view
+            .footer_buttons
+            .iter()
+            .find(|(_, k)| k.code == code)
+            .map(|(_, k)| *k)
+    }
+
+    /// Each rendered shortcut produces a hit rect carrying the equivalent
+    /// key, and `footer_button_at` resolves a click inside one to that key.
+    #[test]
+    #[serial]
+    fn buttons_map_clicks_to_shortcuts() {
+        let mut env = create_test_env_with_sessions(3);
+        render_at(&mut env, 120, 12);
+
+        assert!(
+            !env.view.footer_buttons.is_empty(),
+            "footer should expose clickable buttons"
+        );
+        // New / View / Group / Cmds are always present in the home view.
+        assert_eq!(
+            button_key(&env, KeyCode::Char('n')).map(|k| k.modifiers),
+            Some(KeyModifiers::NONE),
+            "New maps to a plain 'n'"
+        );
+        let cmds = button_key(&env, KeyCode::Char('k')).expect("Cmds button present");
+        assert_eq!(cmds.modifiers, KeyModifiers::CONTROL, "Cmds maps to Ctrl+K");
+
+        // A click inside the New button's rect resolves to its key; a click
+        // outside every button resolves to nothing.
+        let (new_rect, _) = env
+            .view
+            .footer_buttons
+            .iter()
+            .find(|(_, k)| k.code == KeyCode::Char('n'))
+            .cloned()
+            .expect("New button rect");
+        assert_eq!(
+            env.view
+                .footer_button_at(new_rect.x, new_rect.y)
+                .map(|k| k.code),
+            Some(KeyCode::Char('n'))
+        );
+        assert!(
+            env.view
+                .footer_button_at(new_rect.x, new_rect.y + 5)
+                .is_none(),
+            "a click off the footer row hits no button"
+        );
+    }
+
+    /// Dispatching a footer button's key runs the same action as the
+    /// keypress: the New button opens the new-session dialog.
+    #[test]
+    #[serial]
+    fn clicking_new_opens_dialog() {
+        let mut env = create_test_env_with_sessions(3);
+        render_at(&mut env, 120, 12);
+        let key = button_key(&env, KeyCode::Char('n')).expect("New button");
+        assert!(env.view.new_dialog.is_none());
+        env.view.handle_key(key, None);
+        assert!(
+            env.view.new_dialog.is_some(),
+            "clicking New opens the new-session dialog"
+        );
+    }
+
+    /// While a non-live overlay (here the help screen) is open, the footer
+    /// is drawn underneath but the overlay owns clicks: `footer_button_at`
+    /// and `handle_sidebar_collapse_click` must report no hit so a click
+    /// can't fire a shortcut or toggle the sidebar behind the modal.
+    #[test]
+    #[serial]
+    fn overlay_blocks_footer_and_sidebar_clicks() {
+        let mut env = create_test_env_with_sessions(3);
+        render_at(&mut env, 120, 12);
+        let (rect, _) = env.view.footer_buttons[0];
+        // No overlay: the button resolves.
+        assert!(env.view.footer_button_at(rect.x, rect.y).is_some());
+
+        env.view.show_help = true;
+        assert!(
+            env.view.has_non_live_send_overlay(),
+            "help screen is a non-live overlay"
+        );
+        assert!(
+            env.view.footer_button_at(rect.x, rect.y).is_none(),
+            "footer click is blocked while an overlay owns the screen"
+        );
+        assert!(
+            !env.view.handle_sidebar_collapse_click(0, 0),
+            "sidebar toggle is blocked while an overlay owns the screen"
+        );
+    }
+
+    /// Strict-hotkey mode shifts the chords: Diff becomes Ctrl+D and Delete
+    /// becomes an uppercase 'D', and the buttons synthesize those exactly.
+    #[test]
+    #[serial]
+    fn strict_mode_buttons_carry_shifted_chords() {
+        let mut env = create_test_env_with_sessions(3);
+        env.view.strict_hotkeys = true;
+        render_at(&mut env, 120, 12);
+
+        let diff = button_key(&env, KeyCode::Char('d')).expect("Diff button (strict ^D)");
+        assert_eq!(
+            diff.modifiers,
+            KeyModifiers::CONTROL,
+            "strict Diff is Ctrl+D"
+        );
+        assert!(
+            button_key(&env, KeyCode::Char('D')).is_some(),
+            "strict Delete is an uppercase D"
+        );
+    }
+
+    /// Hover sets `footer_hover` to the button under the pointer, reports the
+    /// change, and clears when the pointer leaves the footer.
+    #[test]
+    #[serial]
+    fn hover_tracks_button_under_pointer() {
+        let mut env = create_test_env_with_sessions(3);
+        render_at(&mut env, 120, 12);
+        let (rect, key) = env.view.footer_buttons[1];
+
+        assert!(env.view.footer_hover.is_none());
+        let changed = env.view.handle_hover(rect.x + 1, rect.y);
+        assert!(changed, "moving onto a button is a hover change");
+        assert_eq!(env.view.footer_hover, Some(key));
+
+        // Same button, no change reported.
+        assert!(!env.view.handle_hover(rect.x, rect.y));
+
+        // Off the footer row clears the hover.
+        let changed = env.view.handle_hover(rect.x, rect.y.saturating_sub(5));
+        assert!(changed);
+        assert!(env.view.footer_hover.is_none());
+    }
+
+    /// The footer is replaced by the live-send banner, so it exposes no
+    /// clickable buttons while live mode owns the status bar.
+    #[test]
+    #[serial]
+    fn no_buttons_during_live_send() {
+        let mut env = create_test_env_with_sessions(3);
+        render_at(&mut env, 120, 12);
+        assert!(!env.view.footer_buttons.is_empty());
+
+        env.view.cursor = 1;
+        env.view.update_selected();
+        let id = match env.view.flat_items.get(1) {
+            Some(Item::Session { id, .. }) => id.clone(),
+            _ => panic!("expected a session at flat_items[1]"),
+        };
+        env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+            session_id: id,
+            title: "s".to_string(),
+            tmux_name: "fake".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
+            exit_chords: crate::tui::home::live_send::parse_chord_list(
+                crate::tui::home::live_send::DEFAULT_EXIT_CHORD,
+            ),
+            leader: None,
+        });
+        render_at(&mut env, 120, 12);
+        assert!(
+            env.view.footer_buttons.is_empty(),
+            "live-send banner replaces the footer toolbar"
+        );
+        assert_eq!(env.view.footer_button_at(0, 11), None);
     }
 }
 
@@ -8543,6 +10965,60 @@ mod click_to_select {
 
     #[test]
     #[serial]
+    fn double_click_tears_down_live_send_before_tmux_attach() {
+        // Regression for #2290: with `click_action = LiveSend` the first
+        // click of a double-click enters live-send for the row, then the
+        // second click resolves to a tmux attach via
+        // `default_attach_mode = Tmux`. The attach must exit live mode
+        // first, otherwise the worker is stranded against a pane we're
+        // leaving and detaching drops the user back into live mode.
+        use crate::session::config::{save_config, ClickAction, Config};
+        let mut env = create_test_env_with_sessions(3);
+        setup_inner(&mut env);
+        env.view.cursor = 0;
+        env.view.update_selected();
+
+        let mut config = Config::default();
+        config.session.click_action = ClickAction::LiveSend;
+        save_config(&config).unwrap();
+
+        // Simulate the first click of the double having already entered
+        // live-send (the real install runs in App::execute_action, which a
+        // HomeView unit test can't drive): pin live_send to the row we are
+        // about to double-click.
+        let expected_id = match &env.view.flat_items[2] {
+            crate::session::Item::Session { id, .. } => id.clone(),
+            _ => panic!("flat_items[2] should be a session"),
+        };
+        env.view.live_send = Some(crate::tui::home::live_send::LiveSendState {
+            session_id: expected_id.clone(),
+            title: "row-2".to_string(),
+            tmux_name: "aoe_test_2290".to_string(),
+            target: crate::tui::home::live_send::LiveSendTarget::Agent,
+            exit_chords: Vec::new(),
+            leader: None,
+        });
+
+        let t0 = std::time::Instant::now();
+        // Seed last_click so the next click within the threshold is treated
+        // as the second click of a double-click on the same row.
+        env.view.last_click = Some((t0, 5, 3));
+        let t1 = t0 + std::time::Duration::from_millis(100);
+        let action = env.view.handle_click_at(t1, 5, 3);
+
+        assert_eq!(
+            action,
+            Some(crate::tui::app::Action::AttachSession(expected_id)),
+            "double-click must still resolve to a tmux attach under default_attach_mode (Tmux)"
+        );
+        assert!(
+            env.view.live_send.is_none(),
+            "the tmux attach path must exit live mode first, not strand the worker"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn click_on_already_selected_row_does_not_move_cursor() {
         let mut env = create_test_env_with_sessions(3);
         setup_inner(&mut env);
@@ -8636,6 +11112,125 @@ mod click_to_select {
             second,
             Some(crate::tui::app::Action::AttachSession(expected_id)),
             "second click within threshold should attach the session"
+        );
+    }
+
+    /// A double-click on the preview pane produces the SAME activation Action a
+    /// sidebar double-click would (parity gesture): the first press is a no-op
+    /// that records timing, the second within threshold attaches the previewed
+    /// session.
+    #[test]
+    #[serial]
+    fn preview_double_click_attaches_like_sidebar() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+        let expected_id = env
+            .view
+            .selected_session
+            .clone()
+            .expect("a session is selected");
+
+        // (50, 10) is inside preview_area (30, 0, 100, 40).
+        let t0 = Instant::now();
+        assert_eq!(
+            env.view.preview_double_click_action_at(
+                t0,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10
+            ),
+            None,
+            "a single preview press does not activate"
+        );
+        let t1 = t0 + Duration::from_millis(150);
+        assert_eq!(
+            env.view.preview_double_click_action_at(
+                t1,
+                MouseEventKind::Down(MouseButton::Left),
+                KeyModifiers::NONE,
+                50,
+                10
+            ),
+            Some(crate::tui::app::Action::AttachSession(expected_id)),
+            "a double-click on the preview attaches the session, same as the sidebar"
+        );
+    }
+
+    /// Shift+press (aoe's own selection escape hatch) and presses outside the
+    /// preview never activate, even repeated within the double-click window.
+    #[test]
+    #[serial]
+    fn preview_shift_and_off_pane_presses_never_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        let down = MouseEventKind::Down(MouseButton::Left);
+        // Shift falls through to aoe selection: never tracked, never activates.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::SHIFT, 50, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::SHIFT, 50, 10),
+            None
+        );
+        // A press in the list area (5, 3), outside the preview, is ignored too.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 5, 3),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 5, 3),
+            None
+        );
+    }
+
+    /// Two presses on the same preview row but different columns are unrelated
+    /// clicks (e.g. tapping two different words), not a double-click: only a
+    /// same-cell second press within the window activates.
+    #[test]
+    #[serial]
+    fn preview_two_presses_on_same_row_different_col_do_not_activate() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
+        use std::time::{Duration, Instant};
+
+        let mut env = create_test_env_with_sessions(3);
+        env.view.preview_area = Rect::new(30, 0, 100, 40);
+        env.view.cursor = 1;
+        env.view.update_selected();
+
+        let down = MouseEventKind::Down(MouseButton::Left);
+        let t0 = Instant::now();
+        let t1 = t0 + Duration::from_millis(150);
+        // Same row 10, columns 40 then 70: within the time window but a
+        // different cell, so the second press is a fresh single click.
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t0, down, KeyModifiers::NONE, 40, 10),
+            None
+        );
+        assert_eq!(
+            env.view
+                .preview_double_click_action_at(t1, down, KeyModifiers::NONE, 70, 10),
+            None,
+            "a different-column second press on the same row must not activate"
         );
     }
 
@@ -9259,9 +11854,11 @@ mod preview_drag_select {
         let total_lines = text.lines.len();
         env.view.preview_cache.parsed_text = Some(text);
         env.view.preview_cache.captured_lines = total_lines;
-        // `dimensions.1 - 1` is the visible-height the scroll clamp uses;
-        // pin it to the pane height so the auto-scroll max offset matches
-        // what `first_line` implies.
+        // `scroll_preview_offset` clamps the auto-scroll max offset against
+        // `preview_visible_rows` (the rendered output-body height, same as the
+        // per-frame `clamp_scroll_to_capture`); pin it to the pane height so the
+        // max offset matches what `first_line` implies.
+        env.view.preview_visible_rows = pane.height as usize;
         env.view.preview_cache.dimensions = (pane.width, pane.height + 1);
         env.view.preview_area = pane;
         env.view.preview_scroll_offset = total_lines
@@ -10951,7 +13548,8 @@ mod default_attach_mode {
             "cache should initialize to the historical Tmux default"
         );
         write_global_default_attach_mode(NewSessionAttachMode::LiveSend);
-        env.view.refresh_from_config();
+        env.view
+            .refresh_from_config(ConfigRefreshOrigin::Interactive);
         assert_eq!(
             env.view.profile_default_attach_mode,
             NewSessionAttachMode::LiveSend,
@@ -11568,7 +14166,7 @@ mod right_click_context_menu {
             .context_menu
             .as_ref()
             .expect("context_menu should be open");
-        assert_eq!(menu.selected_action(), ContextMenuAction::Rename);
+        assert_eq!(menu.selected_action(), ContextMenuAction::NewFromSelection);
         // The selected item is a session, not a group.
         assert!(matches!(
             env.view.flat_items[env.view.cursor],
@@ -11616,7 +14214,8 @@ mod right_click_context_menu {
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1);
         assert!(env.view.context_menu.is_some());
-        // First item is Rename; Enter submits it.
+        // First item is New Session; Rename is one Down away. Enter submits it.
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
             env.view.context_menu.is_none(),
@@ -11632,12 +14231,16 @@ mod right_click_context_menu {
     #[serial]
     fn down_then_enter_in_menu_opens_delete_dialog() {
         let mut env = create_test_env_with_sessions(2);
+        disable_delete_to_trash();
         setup_inner(&mut env);
-        // Attention sort surfaces the full session menu (Rename / Archive /
-        // Snooze / Delete), so Delete is three Downs away.
+        // Attention sort surfaces the full session menu (New Session / Rename
+        // / Archive / Snooze / Mark unread / Delete), so Delete is five Downs
+        // away. (Unread defaults on, so the "Mark unread" row is present.)
         env.view.sort_order = SortOrder::Attention;
         env.view.flat_items = env.view.build_flat_items();
         env.view.handle_right_click(5, 1);
+        env.view.handle_key(key(KeyCode::Down), None);
+        env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
         env.view.handle_key(key(KeyCode::Down), None);
@@ -11661,9 +14264,9 @@ mod right_click_context_menu {
         assert!(env.view.unified_delete_dialog.is_none());
     }
 
-    /// Right-click a session, pick the Archive item (Rename -> Archive is one
-    /// Down), and the row gets archived through the same `z` codepath. No
-    /// follow-up dialog: archiving is immediate.
+    /// Right-click a session, pick the Archive item (New Session -> Rename ->
+    /// Archive is two Downs), and the row gets archived through the same `z`
+    /// codepath. No follow-up dialog: archiving is immediate.
     #[test]
     #[serial]
     fn right_click_archive_action_archives_session() {
@@ -11676,6 +14279,7 @@ mod right_click_context_menu {
             "precondition: session starts unarchived"
         );
 
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Archive
         env.view.handle_key(key(KeyCode::Enter), None);
 
@@ -11719,10 +14323,21 @@ mod right_click_context_menu {
             .iter()
             .map(|(_, l)| *l)
             .collect();
-        // Default sort here is Newest, where Snooze is gated out, so the
-        // archived-row menu is just Rename / Unarchive / Delete.
-        assert_eq!(labels, vec!["Rename", "Unarchive", "Delete"]);
+        // Default sort here is Newest, where Snooze is gated out. The unread
+        // toggle is always-on (any sort) and defaults on, so the archived-row
+        // menu is New Session / Rename / Unarchive / Mark unread / Delete.
+        assert_eq!(
+            labels,
+            vec![
+                "New Session",
+                "Rename",
+                "Unarchive",
+                "Mark unread",
+                "Delete"
+            ]
+        );
 
+        env.view.handle_key(key(KeyCode::Down), None); // New Session -> Rename
         env.view.handle_key(key(KeyCode::Down), None); // Rename -> Unarchive
         env.view.handle_key(key(KeyCode::Enter), None);
         assert!(
@@ -11995,18 +14610,22 @@ mod right_click_context_menu {
 
     #[test]
     #[serial]
-    fn session_menu_n_hotkey_is_inert() {
-        // Sanity: the session-row menu only has Rename/Delete actions,
-        // so 'n' must NOT submit NewSession when the wrong menu is open.
-        // This proves the hotkey gate (action must be in items) holds.
+    fn session_menu_n_hotkey_opens_new_session() {
+        // The session-row menu now carries a New Session entry (issue #2023),
+        // so 'n' submits NewFromSelection just like the group/project menus,
+        // closing the menu and opening the new-session dialog prefilled from
+        // the right-clicked session.
         let mut env = create_test_env_with_sessions(2);
         setup_inner(&mut env);
         env.view.handle_right_click(5, 1); // row 1 = first session
         send_key(&mut env, crossterm::event::KeyCode::Char('n'));
-        assert!(env.view.context_menu.is_some(), "menu should stay open");
         assert!(
-            env.view.new_dialog.is_none(),
-            "n on session menu must not open new-session"
+            env.view.context_menu.is_none(),
+            "menu should close on submit"
+        );
+        assert!(
+            env.view.new_dialog.is_some(),
+            "n on session menu must open the new-session dialog"
         );
     }
 }
@@ -12028,7 +14647,14 @@ mod apply_session_id_updates {
 
     impl TmuxSession {
         fn create(id: &str, title: &str) -> Self {
-            let name = crate::tmux::Session::generate_name(id, title);
+            Self::create_named(crate::tmux::Session::generate_name(id, title))
+        }
+
+        fn create_terminal(id: &str, title: &str) -> Self {
+            Self::create_named(crate::tmux::TerminalSession::generate_name(id, title))
+        }
+
+        fn create_named(name: String) -> Self {
             let _ = Command::new("tmux")
                 .args(["kill-session", "-t", &name])
                 .output();
@@ -12131,6 +14757,31 @@ mod apply_session_id_updates {
 
         let updated = view.apply_session_id_updates();
         assert!(updated, "Applied CAS must report a touch");
+        assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
+    }
+
+    #[test]
+    #[serial]
+    fn apply_session_id_updates_publishes_to_terminal_session() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        setup_test_home(&temp);
+
+        let profile = "apply-terminal-publish";
+        let mut inst = fresh_instance(profile, "terminal-post-cas");
+        inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+        let mut view = build_view_with_inst(profile, &inst);
+
+        let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
+        let agent_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+
+        attach_poller_with_update(&mut view, &inst.id, NEW_SID);
+
+        let updated = view.apply_session_id_updates();
+        assert!(updated, "Applied CAS must report a touch");
+        assert!(captured_env(&agent_name).is_none());
         assert_eq!(captured_env(tmux.name()).as_deref(), Some(NEW_SID));
     }
 

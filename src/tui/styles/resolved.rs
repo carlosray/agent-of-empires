@@ -34,7 +34,9 @@ use super::{contrast::contrast_ratio as wcag_contrast_ratio, load_theme, Theme, 
 pub enum ResolvedThemeSource {
     Builtin,
     Custom,
-    /// The requested theme name didn't match any builtin or custom
+    /// Contributed by an active plugin's manifest.
+    Plugin,
+    /// The requested theme name didn't match any builtin, custom, or plugin
     /// theme; the resolver returned the `default` builtin as a safety net.
     Fallback,
 }
@@ -90,7 +92,7 @@ pub fn resolve_theme(name: &str) -> ResolvedTheme {
     let source = classify_source(name);
     debug!("resolve_theme: classify_source -> {:?}", source);
     let resolved_name = if matches!(source, ResolvedThemeSource::Fallback) {
-        "default".to_string()
+        "zinc".to_string()
     } else {
         name.to_string()
     };
@@ -130,6 +132,12 @@ fn classify_source(name: &str) -> ResolvedThemeSource {
         .any(|(n, _)| n == name)
     {
         return ResolvedThemeSource::Custom;
+    }
+    if super::discover_plugin_themes()
+        .iter()
+        .any(|(n, _)| n == name)
+    {
+        return ResolvedThemeSource::Plugin;
     }
     ResolvedThemeSource::Fallback
 }
@@ -249,6 +257,7 @@ fn web_projection(theme: &Theme, appearance: ThemeAppearance) -> CssVarProjectio
     css.insert("--color-status-warning".into(), hex(theme.waiting));
     css.insert("--color-status-fresh-idle".into(), hex(theme.fresh_idle));
     css.insert("--color-status-idle".into(), hex(theme.idle));
+    css.insert("--color-status-unread".into(), hex(theme.unread));
     css.insert("--color-status-error".into(), hex(theme.error));
     css.insert(
         "--color-status-starting".into(),
@@ -446,7 +455,7 @@ mod tests {
     fn unknown_theme_resolves_to_fallback() {
         let r = resolve_theme("does-not-exist");
         assert_eq!(r.source, ResolvedThemeSource::Fallback);
-        assert_eq!(r.name, "default");
+        assert_eq!(r.name, "zinc");
     }
 
     #[test]

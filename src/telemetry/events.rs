@@ -31,7 +31,15 @@ use serde::Serialize;
 /// v11 (#1888): added the structured-interaction aggregates (`approvals_resolved`,
 /// `approvals_by_decision`, `agent_switches`, `view_toggles`,
 /// `plan_mode_seen`, `prompts_queued`).
-pub const SCHEMA_VERSION: u32 = 11;
+/// v12: retired `view_toggles`. The terminal<->structured swap it counted has no
+/// trigger in the shipped UI (structured view is the default since #1925), so it
+/// only ever reported zero. The `acp_enable` / `acp_disable` endpoints stay; they
+/// just no longer feed a dead metric.
+/// v13 (#2367): added the plugin census `plugins_by_source` (installed count per
+/// source bucket) and `plugins_active` (active state for builtin + featured ids
+/// only; unfeatured GitHub and local installs are counted by source but never
+/// named).
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Which surface emitted the event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -258,16 +266,28 @@ pub struct UsageSnapshot {
     pub approvals_by_decision: BTreeMap<String, u32>,
     /// Mid-session agent switches since the last snapshot.
     pub agent_switches: u32,
-    /// Structured-view/terminal view toggles since the last snapshot. Only real
-    /// transitions count; an enable on an already-structured session (or a disable
-    /// on an already-terminal session) is a no-op and is not counted.
-    pub view_toggles: u32,
     /// A session entered plan mode at least once since the last snapshot.
     pub plan_mode_seen: bool,
     /// Prompts the web structured view queued (parked because the agent was busy)
     /// since the last snapshot. Reported by the browser, the only surface that
     /// owns the prompt queue; the daemon never sees the queue directly.
     pub prompts_queued: u32,
+
+    /// Installed-plugin census: source bucket (`builtin` / `featured` /
+    /// `community` / `local`) -> count. Counts the whole installed population
+    /// per source, no identity, so it is safe for every source. Empty (and so
+    /// omitted) when no plugins are loaded, e.g. a TUI-only build with no
+    /// installs. See `telemetry::plugins`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins_by_source: BTreeMap<String, u32>,
+    /// Active-state for the plugins whose identity is safe to name: builtin
+    /// (compiled in) and featured (in the curated index). Allowlisted id ->
+    /// active. Unfeatured GitHub (possibly private) and local installs are
+    /// counted in [`Self::plugins_by_source`] but never named here, per the
+    /// telemetry privacy rule. Empty (and so omitted) when no nameable plugin
+    /// is loaded. See `telemetry::plugins`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugins_active: BTreeMap<String, bool>,
 }
 
 /// Resolved structured-interaction counts for one snapshot window, the input the
@@ -280,7 +300,6 @@ pub struct StructuredInteractionCounts {
     pub approvals_allow_always: u32,
     pub approvals_deny: u32,
     pub agent_switches: u32,
-    pub view_toggles: u32,
     pub plan_mode_seen: bool,
     pub prompts_queued: u32,
 }

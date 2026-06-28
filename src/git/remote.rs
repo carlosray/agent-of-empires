@@ -182,6 +182,33 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         )));
     }
 
+    // Lock the `main` worktree for the same cross-boundary prune protection
+    // `GitWorktree::create_worktree` applies to every session worktree (#2414):
+    // this is the one aoe-created worktree that does not go through
+    // `create_worktree`, so without this a prune from a context that cannot see
+    // `<destination>/main` would reap its admin entry. Best-effort: a lock
+    // failure only forfeits that protection, so warn and keep the clone.
+    match super::GitWorktree::new(destination.to_path_buf()) {
+        Ok(git_wt) => {
+            if let Err(e) = git_wt.lock_worktree(&worktree_path) {
+                tracing::warn!(
+                    target: "git.fetch",
+                    path = %worktree_path.display(),
+                    error = %e,
+                    "Bare clone: could not lock main worktree (cross-boundary prune protection unavailable)"
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "git.fetch",
+                path = %destination.display(),
+                error = %e,
+                "Bare clone: could not open repo to lock main worktree (cross-boundary prune protection unavailable)"
+            );
+        }
+    }
+
     tracing::info!(
         target: "git.fetch",
         "Bare clone complete: {} -> {}",
@@ -329,6 +356,57 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
     parse_owner_from_remote_url(url)
 }
 
+/// Extract the `owner/repo` slug from a git remote URL, stripping any `.git`
+/// suffix and trailing slash. Handles the same formats as
+/// [`parse_owner_from_remote_url`]. Returns `None` unless the URL is a canonical
+/// hosted repo: a known remote scheme (`http`/`https`/`ssh`) or SSH shorthand,
+/// with exactly an `owner/repo` path. Local schemes like `file://` are rejected
+/// so they never produce a bogus slug.
+pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
+    // Reduce to the path after the host: `owner/repo(.git)`.
+    let path = if !url.contains("://") {
+        // SSH shorthand: git@host:owner/repo.git
+        let colon_pos = url.find(':')?;
+        if !url[..colon_pos].contains('@') {
+            return None;
+        }
+        let scp_path = &url[colon_pos + 1..];
+        // An absolute path (`git@host:/foo/bar.git`) is a filesystem path, not a
+        // hosted owner/repo slug; reject it.
+        if scp_path.starts_with('/') {
+            return None;
+        }
+        scp_path
+    } else {
+        let (scheme, without_scheme) = url.split_once("://")?;
+        if !matches!(scheme, "http" | "https" | "ssh") {
+            return None;
+        }
+        &without_scheme[without_scheme.find('/')? + 1..]
+    };
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut segments = path.split('/').filter(|s| !s.is_empty());
+    let owner = segments.next()?;
+    let repo = segments.next()?;
+    // Reject deeper paths (e.g. `file://`-style or nested paths): a hosted repo
+    // is exactly `owner/repo`.
+    if segments.next().is_some() {
+        return None;
+    }
+    Some(format!("{}/{}", owner, repo))
+}
+
+/// Look up the `owner/repo` slug of a git repository by reading the `origin`
+/// remote URL. Returns `None` if the path is not a git repo, has no origin
+/// remote, or the URL cannot be parsed into an owner/repo pair.
+pub fn get_remote_slug(path: &Path) -> Option<String> {
+    let repo = open_repo_at(path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url().ok()?;
+    parse_slug_from_remote_url(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -339,6 +417,48 @@ mod tests {
             parse_owner_from_remote_url("git@github.com:agent-of-empires/agent-of-empires.git"),
             Some("agent-of-empires".to_string()),
         );
+    }
+
+    #[test]
+    fn test_parse_slug_formats() {
+        for url in [
+            "git@github.com:mozilla-ai/any-llm.git",
+            "https://github.com/mozilla-ai/any-llm.git",
+            "ssh://git@github.com/mozilla-ai/any-llm.git",
+            "https://github.com/mozilla-ai/any-llm", // no .git suffix
+            "git@github.com:mozilla-ai/any-llm",
+        ] {
+            assert_eq!(
+                parse_slug_from_remote_url(url),
+                Some("mozilla-ai/any-llm".to_string()),
+                "failed for {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_slug_rejects_incomplete() {
+        assert_eq!(parse_slug_from_remote_url(""), None);
+        // Owner but no repo segment.
+        assert_eq!(parse_slug_from_remote_url("git@github.com:owner"), None);
+        assert_eq!(parse_slug_from_remote_url("https://github.com/owner"), None);
+    }
+
+    #[test]
+    fn test_parse_slug_rejects_non_remote_schemes_and_deep_paths() {
+        // file:// and other local schemes must not yield a slug.
+        assert_eq!(parse_slug_from_remote_url("file:///tmp/repo.git"), None);
+        assert_eq!(
+            parse_slug_from_remote_url("file://host/owner/repo.git"),
+            None
+        );
+        // Deeper paths are not a canonical hosted owner/repo.
+        assert_eq!(
+            parse_slug_from_remote_url("https://example.com/group/sub/repo.git"),
+            None
+        );
+        // Absolute-path SSH shorthand is a filesystem path, not owner/repo.
+        assert_eq!(parse_slug_from_remote_url("git@host:/foo/bar.git"), None);
     }
 
     #[test]
@@ -423,6 +543,52 @@ mod tests {
         // Verify main is a valid worktree
         let main_path = dest_path.join("main");
         assert!(main_path.join(".git").exists(), "worktree .git missing");
+    }
+
+    #[test]
+    fn test_clone_bare_repo_locks_main_worktree() {
+        use tempfile::TempDir;
+
+        // Regression for #2414: the `main` worktree the bare clone creates is
+        // the one aoe-created worktree that does not go through
+        // `create_worktree`, so it must still be locked or a prune from a
+        // context that cannot see it would reap its admin entry.
+        let source_dir = TempDir::new().unwrap();
+        let source_repo = git2::Repository::init(source_dir.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = {
+            let mut index = source_repo.index().unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = source_repo.find_tree(tree_id).unwrap();
+        source_repo
+            .commit(Some("HEAD"), &sig, &sig, "Initial", &tree, &[])
+            .unwrap();
+
+        let dest_dir = TempDir::new().unwrap();
+        let dest_path = dest_dir.path().join("test-bare-clone");
+        let url = format!("file://{}", source_dir.path().display());
+        clone_bare_repo(&url, &dest_path).unwrap();
+
+        let admin_dir = dest_path.join(".bare/worktrees/main");
+        assert!(
+            admin_dir.join("locked").exists(),
+            "clone_bare_repo should lock the main worktree"
+        );
+
+        // Hide the checkout so a prune sees it as missing; the locked admin
+        // entry must survive.
+        let hidden = dest_path.join("main-HIDDEN");
+        std::fs::rename(dest_path.join("main"), &hidden).unwrap();
+        std::process::Command::new("git")
+            .args(["worktree", "prune"])
+            .current_dir(&dest_path)
+            .output()
+            .unwrap();
+        assert!(
+            admin_dir.exists(),
+            "locked main worktree admin entry must survive a prune while its checkout is unreachable"
+        );
     }
 
     #[test]

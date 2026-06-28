@@ -51,14 +51,22 @@ struct PairedTerminal {
 }
 
 impl PairedTerminal {
-    fn generate_name(kind: TerminalKind, id: &str, title: &str) -> String {
+    fn generate_name(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
         let safe_title = sanitize_session_name(title);
-        format!("{}{}_{}", kind.prefix(), safe_title, truncate_id(id, 8))
+        let base = format!("{}{}_{}", kind.prefix(), safe_title, truncate_id(id, 8));
+        // Index 0 keeps the historical name verbatim, so existing tmux
+        // sessions, URLs, and the native TUI (which only ever uses index 0)
+        // are untouched. Additional web terminals get a `_t{N}` suffix.
+        if index == 0 {
+            base
+        } else {
+            format!("{base}_t{index}")
+        }
     }
 
-    fn new(kind: TerminalKind, id: &str, title: &str) -> Self {
+    fn new(kind: TerminalKind, id: &str, title: &str, index: u32) -> Self {
         Self {
-            name: Self::generate_name(kind, id, title),
+            name: Self::generate_name(kind, id, title, index),
             kind,
         }
     }
@@ -89,7 +97,7 @@ impl PairedTerminal {
             return Ok(());
         }
 
-        let mut args = build_terminal_create_args(&self.name, working_dir, command, size);
+        let mut args = super::session::build_create_args(&self.name, working_dir, command, size);
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_mouse_on_args(&mut args, &self.name);
@@ -170,30 +178,9 @@ impl PairedTerminal {
     }
 
     fn capture_pane(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
-            return Ok(String::new());
-        }
-
-        // Use `^.0` to target the first window's first pane regardless of
-        // base-index or which pane is active.  See #435, #488.
-        let target = format!("{}:^.0", self.name);
-        let output = Command::new("tmux")
-            .args([
-                "capture-pane",
-                "-t",
-                &target,
-                "-p",
-                "-e",
-                "-S",
-                &format!("-{}", lines),
-            ])
-            .output()?;
-
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Ok(String::new())
-        }
+        // Shared with the agent session / web live view paths: same
+        // `^.0` targeting and trailing-blank preservation semantics.
+        super::Session::from_name(&self.name).capture_pane(lines)
     }
 }
 
@@ -203,13 +190,25 @@ pub struct TerminalSession {
 
 impl TerminalSession {
     pub fn new(id: &str, title: &str) -> Result<Self> {
+        Self::new_indexed(id, title, 0)
+    }
+
+    pub fn new_indexed(id: &str, title: &str, index: u32) -> Result<Self> {
         Ok(Self {
-            inner: PairedTerminal::new(TerminalKind::Host, id, title),
+            inner: PairedTerminal::new(TerminalKind::Host, id, title, index),
         })
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
-        PairedTerminal::generate_name(TerminalKind::Host, id, title)
+        Self::generate_name_indexed(id, title, 0)
+    }
+
+    pub fn generate_name_indexed(id: &str, title: &str, index: u32) -> String {
+        PairedTerminal::generate_name(TerminalKind::Host, id, title, index)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.inner.name
     }
 
     pub fn exists(&self) -> bool {
@@ -258,13 +257,25 @@ pub struct ContainerTerminalSession {
 
 impl ContainerTerminalSession {
     pub fn new(id: &str, title: &str) -> Result<Self> {
+        Self::new_indexed(id, title, 0)
+    }
+
+    pub fn new_indexed(id: &str, title: &str, index: u32) -> Result<Self> {
         Ok(Self {
-            inner: PairedTerminal::new(TerminalKind::Container, id, title),
+            inner: PairedTerminal::new(TerminalKind::Container, id, title, index),
         })
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
-        PairedTerminal::generate_name(TerminalKind::Container, id, title)
+        Self::generate_name_indexed(id, title, 0)
+    }
+
+    pub fn generate_name_indexed(id: &str, title: &str, index: u32) -> String {
+        PairedTerminal::generate_name(TerminalKind::Container, id, title, index)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.inner.name
     }
 
     pub fn exists(&self) -> bool {
@@ -301,35 +312,47 @@ impl ContainerTerminalSession {
     }
 }
 
-/// Build the argument list for tmux new-session command (terminal sessions).
-/// Extracted for testability.
-fn build_terminal_create_args(
-    session_name: &str,
-    working_dir: &str,
-    command: Option<&str>,
-    size: Option<(u16, u16)>,
-) -> Vec<String> {
-    let mut args = vec![
-        "new-session".to_string(),
-        "-d".to_string(),
-        "-s".to_string(),
-        session_name.to_string(),
-        "-c".to_string(),
-        working_dir.to_string(),
-    ];
+/// Kill every paired terminal tmux session (host and container, any index)
+/// belonging to `id`. The single-index `kill` methods only target one
+/// deterministic name; this scans the live session list so the multi-terminal
+/// web tabs (`_t{N}` suffixes) and any title-change orphans are all reaped on
+/// session teardown. Mirrors [`kill_all_tool_sessions_for_id`].
+pub fn kill_all_terminals_for_id(id: &str) {
+    let needle = format!("_{}", truncate_id(id, 8));
 
-    if let Some((width, height)) = size {
-        args.push("-x".to_string());
-        args.push(width.to_string());
-        args.push("-y".to_string());
-        args.push(height.to_string());
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output();
+
+    if let Ok(out) = output {
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            for line in stdout.lines() {
+                if !line.starts_with(TERMINAL_PREFIX)
+                    && !line.starts_with(CONTAINER_TERMINAL_PREFIX)
+                {
+                    continue;
+                }
+                // The id segment is at the end for index 0, or immediately
+                // before the `_t{N}` suffix for additional terminals.
+                let Some(pos) = line.rfind(&needle) else {
+                    continue;
+                };
+                let after = &line[pos + needle.len()..];
+                if !after.is_empty() && !after.starts_with("_t") {
+                    continue;
+                }
+                if let Some(pid) = process::get_pane_pid(line) {
+                    process::kill_process_tree(pid);
+                }
+                let _ = Command::new("tmux")
+                    .args(["kill-session", "-t", line])
+                    .output();
+            }
+        }
     }
 
-    if let Some(cmd) = command {
-        args.push(cmd.to_string());
-    }
-
-    args
+    refresh_session_cache();
 }
 
 #[cfg(test)]
@@ -364,75 +387,38 @@ mod tests {
     }
 
     #[test]
+    fn test_terminal_index_zero_matches_legacy_name() {
+        // Index 0 must be byte-identical to the historical single-terminal
+        // name so existing tmux sessions, URLs, and the TUI keep working.
+        let legacy = TerminalSession::generate_name("abc123def456", "My Project");
+        let indexed_zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+        assert_eq!(legacy, indexed_zero);
+
+        let legacy_c = ContainerTerminalSession::generate_name("abc123def456", "My Project");
+        let indexed_zero_c =
+            ContainerTerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+        assert_eq!(legacy_c, indexed_zero_c);
+    }
+
+    #[test]
+    fn test_terminal_index_nonzero_suffixed_and_distinct() {
+        let zero = TerminalSession::generate_name_indexed("abc123def456", "My Project", 0);
+        let one = TerminalSession::generate_name_indexed("abc123def456", "My Project", 1);
+        let two = TerminalSession::generate_name_indexed("abc123def456", "My Project", 2);
+        assert_ne!(zero, one);
+        assert_ne!(one, two);
+        assert!(one.ends_with("_t1"));
+        assert!(two.ends_with("_t2"));
+        assert!(one.starts_with(&zero));
+    }
+
+    #[test]
     fn test_container_terminal_name_differs_from_host_terminal() {
         let host_name = TerminalSession::generate_name("abc123def456", "My Project");
         let container_name = ContainerTerminalSession::generate_name("abc123def456", "My Project");
         assert_ne!(host_name, container_name);
         assert!(host_name.starts_with(TERMINAL_PREFIX));
         assert!(container_name.starts_with(CONTAINER_TERMINAL_PREFIX));
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_without_size() {
-        let args = build_terminal_create_args("test_terminal", "/tmp/work", None, None);
-        assert_eq!(
-            args,
-            vec![
-                "new-session",
-                "-d",
-                "-s",
-                "test_terminal",
-                "-c",
-                "/tmp/work"
-            ]
-        );
-        assert!(!args.contains(&"-x".to_string()));
-        assert!(!args.contains(&"-y".to_string()));
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_with_size() {
-        let args = build_terminal_create_args("test_terminal", "/tmp/work", None, Some((100, 30)));
-        assert!(args.contains(&"-x".to_string()));
-        assert!(args.contains(&"100".to_string()));
-        assert!(args.contains(&"-y".to_string()));
-        assert!(args.contains(&"30".to_string()));
-
-        // Verify order: -x should come before width, -y before height
-        let x_idx = args.iter().position(|a| a == "-x").unwrap();
-        let y_idx = args.iter().position(|a| a == "-y").unwrap();
-        assert_eq!(args[x_idx + 1], "100");
-        assert_eq!(args[y_idx + 1], "30");
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_with_command() {
-        let args = build_terminal_create_args(
-            "test_terminal",
-            "/tmp/work",
-            Some("docker exec -it container /bin/bash"),
-            None,
-        );
-        assert_eq!(args.last().unwrap(), "docker exec -it container /bin/bash");
-    }
-
-    #[test]
-    fn test_build_terminal_create_args_with_size_and_command() {
-        let args = build_terminal_create_args(
-            "test_terminal",
-            "/tmp/work",
-            Some("docker exec -it container /bin/bash"),
-            Some((80, 24)),
-        );
-
-        // Size args should be present
-        assert!(args.contains(&"-x".to_string()));
-        assert!(args.contains(&"80".to_string()));
-        assert!(args.contains(&"-y".to_string()));
-        assert!(args.contains(&"24".to_string()));
-
-        // Command should be last
-        assert_eq!(args.last().unwrap(), "docker exec -it container /bin/bash");
     }
 
     fn tmux_available() -> bool {

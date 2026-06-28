@@ -72,6 +72,26 @@ fn record_and_check_respawn_budget(
     false
 }
 
+/// Build the banner published when a structured-view worker exhausts its
+/// respawn budget and the session is parked. When the session's project_path
+/// no longer exists on disk, every respawn is doomed for the same reason: the
+/// working directory was moved or deleted, not the adapter. Embed the exact
+/// `AcpError::ProjectPathMissing` Display text (`project path no longer exists:
+/// <path>`) so the web banner regex routes to the moved-cwd remediation instead
+/// of the misleading install-the-adapter copy. See #2260 and #1089.
+fn park_message(project_path: &str) -> String {
+    let base = format!(
+        "Structured view worker failed to stay up after {} restart attempts in {}s; auto-respawn paused.",
+        RECONCILER_MAX_RESPAWNS_IN_WINDOW,
+        RECONCILER_RESPAWN_WINDOW.as_secs(),
+    );
+    if !std::path::Path::new(project_path).exists() {
+        format!("{base} project path no longer exists: {project_path}")
+    } else {
+        format!("{base} Retry from the dashboard once the underlying issue is fixed.")
+    }
+}
+
 /// Per-target resume outcome. Drives whether the reconciler should
 /// retry on the next tick or leave `attempted` set so the same target
 /// isn't poked every 2s.
@@ -160,6 +180,19 @@ pub async fn reconcile_acp_workers(
         respawn_history.remove(id);
     }
 
+    // Out-of-band respawn requests (web "Update & restart" after a global
+    // adapter install, #2109). These sessions failed their spawn on a
+    // compatibility rejection and have no live worker, so the
+    // `reap_user_stopped` path above never sees them; they sit pinned in
+    // `attempted`. Clear the guard (and the respawn budget, like an
+    // explicit restart) so the resume pass below fresh-spawns them on the
+    // freshly-installed adapter and the next handshake clears the red X.
+    for id in state.acp_supervisor.take_respawn_requests() {
+        attempted.remove(&id);
+        parked.remove(&id);
+        respawn_history.remove(&id);
+    }
+
     // Idle auto-stop (#1689). Cadence-gated to IDLE_REAP_INTERVAL so the
     // batched activity query does not run on every 2s tick. Runs BEFORE
     // the resume snapshot below: a worker marked dormant here is excluded
@@ -200,7 +233,11 @@ pub async fn reconcile_acp_workers(
         instances
             .iter()
             .filter(|i| {
-                i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+                i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+                    && !i.is_idle_dormant()
             })
             .map(|i| {
                 (
@@ -324,16 +361,9 @@ pub async fn reconcile_acp_workers(
                 "structured-view worker respawn budget exhausted; parking session"
             );
             if parked.insert(id.clone()) {
-                state.acp_supervisor.publish_startup_error(
-                    &id,
-                    format!(
-                        "Structured view worker failed to stay up after {} restart attempts in {}s; \
-                         auto-respawn paused. Retry from the dashboard once the underlying \
-                         issue is fixed.",
-                        RECONCILER_MAX_RESPAWNS_IN_WINDOW,
-                        RECONCILER_RESPAWN_WINDOW.as_secs(),
-                    ),
-                );
+                state
+                    .acp_supervisor
+                    .publish_startup_error(&id, park_message(&project_path));
             }
             attempted.insert(id);
             continue;
@@ -480,7 +510,11 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
         instances
             .iter()
             .filter(|i| {
-                i.is_structured() && !i.is_archived() && !i.is_snoozed() && !i.is_idle_dormant()
+                i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+                    && !i.is_idle_dormant()
             })
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
@@ -800,6 +834,7 @@ async fn reap_rate_limit_resumes(state: &Arc<AppState>, attempted: &mut HashSet<
                 i.is_structured()
                     && !i.is_archived()
                     && !i.is_snoozed()
+                    && !i.is_trashed()
                     && !i.is_idle_dormant()
                     && attempted.contains(&i.id)
             })
@@ -1114,17 +1149,40 @@ async fn build_spawn_request(
     target: &ResumeTarget,
 ) -> Result<crate::acp::supervisor::SpawnRequest, ()> {
     let supervisor = Arc::clone(&state.acp_supervisor);
+
+    let inst_lock = state.instance_lock(&target.id).await;
+    // Re-read project_path under the per-session lock instead of trusting
+    // target.project_path, which the reconciler snapshotted up to a tick ago.
+    // A tied-worktree rename (rename_session / set_worktree_name) holds this
+    // same lock across `git worktree move` plus the metadata write, so once we
+    // hold it the move has landed and the path is final. Spawning at the stale
+    // pre-move path is the crash-loop in #2260. Bail if the session vanished
+    // mid-flight (e.g. deleted during the handshake); ensure_container below
+    // re-acquires the same lock, so this read-and-release must not hold it.
+    // Also read import_pending under the lock: if the daemon restarted before
+    // an imported session's first session/load completed, the reconciler must
+    // still seed the transcript from the replay. The supervisor clears any
+    // partial events from the interrupted attempt after it reserves the slot.
+    // See #2276.
+    let (cwd, seed_history_replay) = {
+        let _guard = inst_lock.lock().await;
+        let instances = state.instances.read().await;
+        let Some(inst) = instances.iter().find(|i| i.id == target.id) else {
+            return Err(());
+        };
+        (
+            PathBuf::from(&inst.project_path),
+            inst.import_pending == Some(true),
+        )
+    };
     let agent = supervisor
         .pick_agent_for_tool(
             &target.tool,
             target.agent_override.as_deref(),
             &target.source_profile,
-            std::path::Path::new(&target.project_path),
+            &cwd,
         )
         .await;
-    let cwd = PathBuf::from(&target.project_path);
-
-    let inst_lock = state.instance_lock(&target.id).await;
     let sandbox_info = match crate::acp::sandbox::ensure_container_for_session(
         &state.instances,
         &inst_lock,
@@ -1163,6 +1221,7 @@ async fn build_spawn_request(
         source_profile: Some(target.source_profile.clone()),
         yolo_mode: target.yolo_mode,
         agent_command_override: command_override_for_spawn(&target.tool, &target.command),
+        seed_history_replay,
     })
 }
 
@@ -1202,6 +1261,7 @@ async fn resume_target_for_session(state: &Arc<AppState>, id: &str) -> Option<Re
             && i.is_structured()
             && !i.is_archived()
             && !i.is_snoozed()
+            && !i.is_trashed()
             && !i.is_idle_dormant()
     })?;
     Some(ResumeTarget {
@@ -1377,7 +1437,7 @@ async fn sweep_orphan_workers(state: &Arc<AppState>, live: &HashSet<&String>) {
         // signal; the next daemon boot re-sweeps it, so this is acceptable.
         // See #1921.
         #[cfg(unix)]
-        tokio::spawn(crate::acp::worker_registry::reap_group_escalating(
+        tokio::spawn(crate::process::worker::reap_group_escalating(
             record.pid,
             std::time::Duration::from_secs(2),
         ));
@@ -1394,6 +1454,82 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     const HOUR_MS: i64 = 3_600_000;
+
+    // --- park banner classification (#2260) ---
+
+    /// When the parked session's project_path is gone, the banner must carry
+    /// the exact `ProjectPathMissing` Display text so the web routes to the
+    /// moved-cwd remediation instead of the install-the-adapter copy.
+    #[test]
+    fn park_message_names_missing_project_path() {
+        use super::park_message;
+        let missing = "/tmp/aoe-does-not-exist-2260/worktrees/Burmese";
+        let msg = park_message(missing);
+        assert!(
+            msg.contains(&format!("project path no longer exists: {missing}")),
+            "park message must embed the ProjectPathMissing text, got: {msg}"
+        );
+        // Defends the web regex contract: it must not steer to the adapter copy.
+        assert!(!msg.contains("Retry from the dashboard"));
+    }
+
+    /// When the project_path still exists, a park is not a moved-cwd problem,
+    /// so the generic retry copy is used (no false moved-cwd banner).
+    #[test]
+    fn park_message_generic_when_path_present() {
+        use super::park_message;
+        let present = std::env::temp_dir();
+        let msg = park_message(&present.to_string_lossy());
+        assert!(
+            !msg.contains("project path no longer exists"),
+            "an existing path must not produce the moved-cwd banner, got: {msg}"
+        );
+        assert!(msg.contains("Retry from the dashboard"));
+    }
+
+    // --- reconciler uses the live cwd, not the stale snapshot (#2260) ---
+
+    /// A tied-worktree rename moves the dir and updates the instance's
+    /// project_path, but the reconciler may already hold a ResumeTarget
+    /// snapshotted at the OLD path. build_spawn_request must re-read the
+    /// current project_path under the instance_lock so the respawn lands at
+    /// the new path; using the stale target path is the crash-loop in #2260.
+    #[tokio::test]
+    async fn build_spawn_request_uses_live_project_path_not_stale_target() {
+        use super::{build_spawn_request, ResumeTarget};
+        use crate::server::test_support::build_test_app_state;
+        use crate::session::{Instance, View};
+        use std::path::PathBuf;
+
+        let new_path = "/tmp/aoe-2260-after-rename";
+        let mut inst = Instance::new("renamed", new_path);
+        inst.id = "sess-2260".to_string();
+        inst.view = View::Structured; // structured, non-sandboxed
+        let state = build_test_app_state(vec![inst]);
+
+        // The reconciler snapshotted the pre-move path a tick ago.
+        let target = ResumeTarget {
+            id: "sess-2260".to_string(),
+            tool: "claude".to_string(),
+            agent_override: Some("claude".to_string()),
+            model: None,
+            project_path: "/tmp/aoe-2260-before-rename".to_string(),
+            stored_acp_session_id: None,
+            source_profile: "default".to_string(),
+            in_flight_turn: false,
+            yolo_mode: false,
+            command: String::new(),
+        };
+
+        let req = build_spawn_request(&state, &target)
+            .await
+            .expect("spawn request builds for a non-sandboxed structured session");
+        assert_eq!(
+            req.cwd,
+            PathBuf::from(new_path),
+            "respawn must target the current project_path, not the stale snapshot"
+        );
+    }
 
     // --- reconciler respawn budget (#1945) ---
 

@@ -12,7 +12,7 @@
 // instances on ports 8081 / 8080 are visually distinguishable).
 
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render } from "@testing-library/react";
+import { cleanup, fireEvent, render } from "@testing-library/react";
 
 import { TopBar } from "../TopBar";
 import type { SessionResponse, Workspace } from "../../lib/types";
@@ -27,6 +27,7 @@ function renderTopBar(
     isOffline?: boolean;
     activeWorkspace?: Workspace;
     activeSession?: SessionResponse | null;
+    onOpenTips?: () => void;
   } = {},
 ) {
   return render(
@@ -36,7 +37,10 @@ function renderTopBar(
       onToggleSidebar={vi.fn()}
       onOpenPalette={vi.fn()}
       onToggleDiff={vi.fn()}
-      diffCollapsed={true}
+      paneIds={["diff", "terminal"]}
+      paneDescriptor={(id) => ({ title: id, icon: (() => null) as never })}
+      isPaneOpen={() => true}
+      onTogglePane={vi.fn()}
       onOpenHelp={vi.fn()}
       onOpenAbout={vi.fn()}
       onStartTutorial={vi.fn()}
@@ -44,7 +48,10 @@ function renderTopBar(
       loginRequired={false}
       isOffline={overrides.isOffline ?? false}
       isDevBuild={overrides.isDevBuild ?? false}
+      onOpenTips={overrides.onOpenTips ?? vi.fn()}
       onGoDashboard={vi.fn()}
+      sidebarColumnVisible={false}
+      rightColumnVisible={false}
     />,
   );
 }
@@ -93,5 +100,13 @@ describe("TopBar", () => {
     });
     expect(getByText("offline")).toBeTruthy();
     expect(getByLabelText("Debug build")).toBeTruthy();
+  });
+
+  it("exposes a Tips entry in the overflow menu that fires onOpenTips", () => {
+    const onOpenTips = vi.fn();
+    const { getByRole } = renderTopBar({ onOpenTips });
+    fireEvent.click(getByRole("button", { name: "More options" }));
+    fireEvent.click(getByRole("menuitem", { name: "Tips" }));
+    expect(onOpenTips).toHaveBeenCalledTimes(1);
   });
 });

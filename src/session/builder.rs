@@ -3,12 +3,12 @@
 //! This module provides shared logic for building new session instances,
 //! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
 
-use crate::containers::{self, ContainerRuntimeInterface};
+use crate::containers;
 use crate::git::error::GitError;
 use crate::git::GitWorktree;
 
@@ -441,12 +441,21 @@ pub fn build_instance(
     let mut workspace_info = None;
     let mut created_workspace_worktrees: Vec<CreatedWorktree> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let taken_branches = collect_taken_branches_for_derived_dedupe(
+        existing_branches,
+        &params.path,
+        &params.extra_repo_paths,
+        params.worktree_enabled,
+        params.create_new_branch,
+        params.scratch,
+    );
     let final_title = resolve_title(
         &params.title,
         params.worktree_branch.as_deref(),
         params.worktree_enabled,
         existing_titles,
-    );
+        &taken_branches,
+    )?;
     let branch_source = resolve_worktree_branch(
         params.worktree_enabled,
         params.worktree_branch.as_deref(),
@@ -458,14 +467,7 @@ pub fn build_instance(
         Some(BranchSource::Explicit(name)) => Some(name),
         Some(BranchSource::Derived(name)) => {
             if params.create_new_branch {
-                let mut taken: std::collections::HashSet<String> =
-                    existing_branches.iter().map(|s| (*s).to_string()).collect();
-                if let Ok(local) =
-                    crate::git::diff::list_branches(std::path::Path::new(&params.path))
-                {
-                    taken.extend(local);
-                }
-                Some(dedupe_branch_name(&name, &taken))
+                Some(dedupe_branch_name(&name, &taken_branches))
             } else {
                 Some(name)
             }
@@ -529,7 +531,11 @@ pub fn build_instance(
             // Single worktree mode (existing logic)
             let path = PathBuf::from(&params.path);
             if !GitWorktree::is_git_repo(&path) {
-                bail!("Path is not in a git repository");
+                bail!(
+                    "Worktree mode requires a git repository, but this path is not one: {}\n\
+                     Tip: start an in-place session (no worktree) here, or point at a git repository.",
+                    path.display()
+                );
             }
             let main_repo_path_raw = GitWorktree::find_main_repo(&path)?;
             let main_repo_path = main_repo_path_raw
@@ -703,6 +709,8 @@ pub fn build_instance(
                 Some(params.extra_env.clone())
             },
             custom_instruction: config.sandbox.custom_instruction.clone(),
+            before_start_env: Vec::new(),
+            container_workdir: None,
         });
     }
 
@@ -788,20 +796,55 @@ pub(crate) fn resolve_title(
     worktree_branch: Option<&str>,
     worktree_enabled: bool,
     existing_titles: &[&str],
-) -> String {
-    if title.is_empty() {
+    taken_branches: &HashSet<String>,
+) -> Result<String> {
+    let taken_branch_keys = branch_collision_keys(taken_branches);
+    let resolved = if title.is_empty() {
         if worktree_enabled {
             if let Some(branch) = worktree_branch.filter(|b| !b.trim().is_empty()) {
                 branch.trim().to_string()
             } else {
-                civilizations::generate_random_title(existing_titles)
+                civilizations::generate_random_title_filtered(existing_titles, |candidate| {
+                    branch_key_taken(&branch_name_from_title(candidate), &taken_branch_keys)
+                })
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Could not generate a unique worktree title or branch; please enter one manually."
+                    )
+                })?
             }
         } else {
             civilizations::generate_random_title(existing_titles)
         }
     } else {
         title.to_string()
+    };
+
+    Ok(resolved)
+}
+
+pub(crate) fn collect_taken_branches_for_derived_dedupe(
+    existing_branches: &[&str],
+    path: &str,
+    extra_repo_paths: &[String],
+    worktree_enabled: bool,
+    create_new_branch: bool,
+    scratch: bool,
+) -> HashSet<String> {
+    let mut taken: HashSet<String> = existing_branches.iter().map(|s| (*s).to_string()).collect();
+
+    if worktree_enabled && create_new_branch && !scratch {
+        for repo in std::iter::once(path)
+            .chain(extra_repo_paths.iter().map(String::as_str))
+            .filter(|s| !s.trim().is_empty())
+        {
+            if let Ok(local) = crate::git::diff::list_branches(std::path::Path::new(repo)) {
+                taken.extend(local);
+            }
+        }
     }
+
+    taken
 }
 
 /// Origin of an effective worktree branch name. The builder uses this to decide
@@ -886,14 +929,30 @@ pub(crate) fn git_sanitize_branch_name(s: &str) -> String {
 /// Find the next branch name not present in `taken`.
 /// If `base` is free, returns it unchanged. Otherwise appends `-2`, `-3`, …
 /// until a free name is found.
-fn dedupe_branch_name(base: &str, taken: &std::collections::HashSet<String>) -> String {
-    if !taken.contains(base) {
+fn branch_collision_key(branch: &str) -> String {
+    branch.to_ascii_lowercase()
+}
+
+fn branch_collision_keys(taken: &HashSet<String>) -> HashSet<String> {
+    taken
+        .iter()
+        .map(|branch| branch_collision_key(branch))
+        .collect()
+}
+
+fn branch_key_taken(branch: &str, taken_keys: &HashSet<String>) -> bool {
+    taken_keys.contains(&branch_collision_key(branch))
+}
+
+fn dedupe_branch_name(base: &str, taken: &HashSet<String>) -> String {
+    let taken_keys = branch_collision_keys(taken);
+    if !branch_key_taken(base, &taken_keys) {
         return base.to_string();
     }
     let mut n = 2usize;
     loop {
         let candidate = format!("{}-{}", base, n);
-        if !taken.contains(&candidate) {
+        if !branch_key_taken(&candidate, &taken_keys) {
             return candidate;
         }
         n += 1;
@@ -930,6 +989,23 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
     let mut last_was_dash = false;
 
     let mut push_processed = |ch: char| {
+        // Preserve '/' as git's namespace separator (so a title like
+        // `jacob/feature-1` yields a branch `jacob/feature-1`). The worktree
+        // folder leaf is sanitized separately via `sanitize_branch_name`, so
+        // the slash never reaches a path. Never emit a leading, trailing, or
+        // doubled slash; trim any pending dash before it.
+        if ch == '/' {
+            while branch.ends_with('-') {
+                branch.pop();
+            }
+            if branch.is_empty() || branch.ends_with('/') {
+                return;
+            }
+            branch.push('/');
+            last_was_dash = true;
+            return;
+        }
+
         let next = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
             Some(ch.to_ascii_lowercase())
         } else if ch.is_whitespace() || ch.is_ascii_punctuation() {
@@ -958,7 +1034,7 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
         }
     }
 
-    while branch.ends_with('-') {
+    while branch.ends_with('-') || branch.ends_with('/') {
         branch.pop();
     }
 
@@ -973,15 +1049,41 @@ pub(crate) fn branch_name_from_title(title: &str) -> String {
 mod tests {
     use super::*;
 
+    fn roman_for_test(n: u32) -> String {
+        let mut remaining = n;
+        let mut result = String::new();
+        for (value, numeral) in [
+            (1000, "M"),
+            (900, "CM"),
+            (500, "D"),
+            (400, "CD"),
+            (100, "C"),
+            (90, "XC"),
+            (50, "L"),
+            (40, "XL"),
+            (10, "X"),
+            (9, "IX"),
+            (5, "V"),
+            (4, "IV"),
+            (1, "I"),
+        ] {
+            while remaining >= value {
+                result.push_str(numeral);
+                remaining -= value;
+            }
+        }
+        result
+    }
+
     #[test]
     fn test_empty_title_with_worktree_uses_branch_name() {
-        let title = resolve_title("", Some("feature-auth"), true, &[]);
+        let title = resolve_title("", Some("feature-auth"), true, &[], &HashSet::new()).unwrap();
         assert_eq!(title, "feature-auth");
     }
 
     #[test]
     fn test_empty_title_without_worktree_uses_civilization() {
-        let title = resolve_title("", None, false, &[]);
+        let title = resolve_title("", None, false, &[], &HashSet::new()).unwrap();
         assert!(
             civilizations::CIVILIZATIONS.contains(&title.as_str()),
             "Expected a civilization name, got: {}",
@@ -991,14 +1093,70 @@ mod tests {
 
     #[test]
     fn test_provided_title_with_worktree_keeps_title() {
-        let title = resolve_title("My Session", Some("feature-auth"), true, &[]);
+        let title = resolve_title(
+            "My Session",
+            Some("feature-auth"),
+            true,
+            &[],
+            &HashSet::new(),
+        )
+        .unwrap();
         assert_eq!(title, "My Session");
     }
 
     #[test]
     fn test_provided_title_without_worktree_keeps_title() {
-        let title = resolve_title("Custom Name", None, false, &[]);
+        let title = resolve_title("Custom Name", None, false, &[], &HashSet::new()).unwrap();
         assert_eq!(title, "Custom Name");
+    }
+
+    #[test]
+    fn test_empty_worktree_title_skips_civ_with_taken_branch() {
+        let existing: Vec<&str> = civilizations::CIVILIZATIONS
+            .iter()
+            .copied()
+            .filter(|civ| *civ != "Tatars")
+            .collect();
+        let mut taken = HashSet::new();
+        taken.insert("tatars".to_string());
+
+        let title = resolve_title("", None, true, &existing, &taken).unwrap();
+
+        assert_ne!(title, "Tatars");
+        assert!(
+            title.contains(" II"),
+            "expected suffixed fallback after the only bare civ branch was taken, got: {title}"
+        );
+    }
+
+    #[test]
+    fn test_empty_worktree_title_errors_when_generation_exhausts() {
+        let existing: Vec<&str> = civilizations::CIVILIZATIONS.to_vec();
+        let mut taken = HashSet::new();
+
+        for civ in civilizations::CIVILIZATIONS {
+            for n in 2..=1000 {
+                taken.insert(branch_name_from_title(&format!(
+                    "{} {}",
+                    civ,
+                    roman_for_test(n)
+                )));
+            }
+        }
+
+        let timestamp = chrono::Utc::now().timestamp();
+        for civ in civilizations::CIVILIZATIONS {
+            for n in timestamp - 60..timestamp + 1060 {
+                taken.insert(branch_name_from_title(&format!("{} {}", civ, n)));
+            }
+        }
+
+        let err = resolve_title("", None, true, &existing, &taken).unwrap_err();
+
+        assert!(
+            err.to_string().contains("please enter one manually"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -1087,10 +1245,25 @@ mod tests {
             branch_name_from_title("Fix: login @ mobile #42"),
             "fix-login-mobile-42"
         );
+        // '/' is the legal git namespace separator and is preserved; '.' is
+        // still folded to '-'.
         assert_eq!(
             branch_name_from_title("feat/auth.refactor"),
-            "feat-auth-refactor"
+            "feat/auth-refactor"
         );
+    }
+
+    #[test]
+    fn test_branch_name_from_title_preserves_slashes() {
+        // The motivating case: a `user/topic` title keeps its slash in the
+        // branch, while the worktree folder leaf is sanitized elsewhere.
+        assert_eq!(branch_name_from_title("jacob/feature-1"), "jacob/feature-1");
+        // No leading, trailing, or doubled slash; dashes around a slash are
+        // trimmed.
+        assert_eq!(branch_name_from_title("/leading"), "leading");
+        assert_eq!(branch_name_from_title("trailing/"), "trailing");
+        assert_eq!(branch_name_from_title("a//b"), "a/b");
+        assert_eq!(branch_name_from_title("a / b"), "a/b");
     }
 
     #[test]
@@ -1120,13 +1293,21 @@ mod tests {
 
     #[test]
     fn test_dedupe_branch_name_appends_suffix_on_collision() {
-        let mut taken = std::collections::HashSet::new();
+        let mut taken = HashSet::new();
         taken.insert("fix-bug".to_string());
         assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug-2");
 
         taken.insert("fix-bug-2".to_string());
         taken.insert("fix-bug-3".to_string());
         assert_eq!(dedupe_branch_name("fix-bug", &taken), "fix-bug-4");
+    }
+
+    #[test]
+    fn test_dedupe_branch_name_matches_case_insensitively() {
+        let mut taken = HashSet::new();
+        taken.insert("Tatars".to_string());
+
+        assert_eq!(dedupe_branch_name("tatars", &taken), "tatars-2");
     }
 
     /// Init a non-bare repo named `name` inside its own TempDir with one

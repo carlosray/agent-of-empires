@@ -168,6 +168,47 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
   });
 
+  it("folds a run ending in an empty TodoWrite clear into the todo group (#2003)", () => {
+    // The real regression carries the bare tool name "TodoWrite", so the
+    // `_aoe_title` "Update TODOs" rescue branch does NOT fire and the
+    // empty clear must be recognized purely by its `todos: []` array.
+    const todoWrite = (id: string, todos: Array<{ content: string; status: string }>): ActivityRow => ({
+      id: `start-${id}`,
+      kind: "tool_start",
+      text: "TodoWrite",
+      toolCallId: id,
+      tool: {
+        id,
+        name: "TodoWrite",
+        kind: "think",
+        args_preview: JSON.stringify({ todos }),
+        started_at: "2026-05-12T00:00:00Z",
+      },
+      at: "2026-05-12T00:00:00Z",
+    });
+    const messages = activityToThreadMessages(
+      [
+        userRow("go"),
+        todoWrite("td1", [{ content: "a", status: "pending" }]),
+        todoWrite("td2", [{ content: "a", status: "in_progress" }]),
+        todoWrite("td3", []),
+      ],
+      false,
+    );
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+    }>;
+    const toolParts = parts.filter((p) => p.type === "tool-call");
+    // The empty clear is a real todo snapshot, so it stays in the fold
+    // instead of leaking out as a separate ungrouped think card.
+    expect(toolParts).toHaveLength(1);
+    expect(toolParts[0]!.toolName).toBe(TODO_GROUP_NAME);
+    const payload = JSON.parse((toolParts[0] as { argsText?: string }).argsText!);
+    expect(payload.children.map((c: { toolCallId: string }) => c.toolCallId)).toEqual(["td1", "td2", "td3"]);
+  });
+
   it("uses the generic group for todo-shaped runs when todos are disabled", () => {
     const messages = activityToThreadMessages(
       [
@@ -286,6 +327,31 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(parsed._aoe_parent_tool_call_id).toBe("task-parent-1");
   });
 
+  it("smuggles memory_recall through args_preview as _aoe_memory_recall (#2142)", () => {
+    const memTool: ToolCall = {
+      id: "mem-1",
+      name: "Recalled synthesized memory",
+      kind: "read",
+      args_preview: "{}",
+      started_at: "2026-05-12T00:00:00Z",
+      memory_recall: { mode: "synthesize", synthesized_text: "remembered" },
+    };
+    const row: ActivityRow = {
+      id: "start-mem-1",
+      kind: "tool_start",
+      text: "Recalled synthesized memory",
+      toolCallId: "mem-1",
+      tool: memTool,
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), row], false);
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{ type: string; argsText?: string }>;
+    const part = parts.find((p) => p.type === "tool-call")!;
+    const parsed = JSON.parse(part.argsText!);
+    expect(parsed._aoe_memory_recall).toEqual({ mode: "synthesize", synthesized_text: "remembered" });
+  });
+
   it("collapses a parent Task + its children into a _aoe_subagent_task part (#1041)", () => {
     const parent: ToolCall = {
       id: "task-1",
@@ -337,6 +403,56 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     // The original child part should not appear as a top-level tool-call.
     const directChild = parts.find((p) => p.type === "tool-call" && p.toolName !== SUBAGENT_TASK_NAME);
     expect(directChild).toBeUndefined();
+  });
+
+  it("collapses a childless async Task launch into an async _aoe_subagent_task part", () => {
+    // The async sub-agent model emits the Task with zero inline children
+    // and a completion carrying async_subagent (forwarded to the
+    // tool_complete row as asyncSubagent). It must still render as a
+    // subagent card, not fall through to a generic tool card that leaks
+    // the launch marker body.
+    const parent: ToolCall = {
+      id: "task-async",
+      name: "Map backend lifecycle",
+      kind: "think",
+      args_preview: JSON.stringify({
+        description: "Map backend lifecycle",
+        _aoe_title: "Map backend lifecycle",
+      }),
+      started_at: "2026-05-12T00:00:00Z",
+    };
+    const parentRow: ActivityRow = {
+      id: "start-task-async",
+      kind: "tool_start",
+      text: "Task",
+      toolCallId: "task-async",
+      tool: parent,
+      at: "2026-05-12T00:00:00Z",
+    };
+    const doneRow: ActivityRow = {
+      id: "done-task-async",
+      kind: "tool_complete",
+      text: "Async agent launched successfully\nagentId: secret (internal ID)",
+      toolCallId: "task-async",
+      asyncSubagent: true,
+      at: "2026-05-12T00:00:01Z",
+    };
+    const messages = activityToThreadMessages([userRow("go"), parentRow, doneRow], false);
+    const assistant = messages.find((m) => m.role === "assistant")!;
+    const parts = assistant.content as Array<{
+      type: string;
+      toolName?: string;
+      argsText?: string;
+    }>;
+    const subagentParts = parts.filter((p) => p.type === "tool-call" && p.toolName === SUBAGENT_TASK_NAME);
+    expect(subagentParts).toHaveLength(1);
+    const payload = JSON.parse(subagentParts[0]!.argsText!);
+    expect(payload.async).toBe(true);
+    expect(payload.children).toHaveLength(0);
+    expect(payload.parent.toolCallId).toBe("task-async");
+    // No generic tool-call part should survive for the async Task.
+    const directTask = parts.find((p) => p.type === "tool-call" && p.toolName !== SUBAGENT_TASK_NAME);
+    expect(directTask).toBeUndefined();
   });
 
   it("leaves orphan children in place when their parent is absent", () => {
@@ -477,6 +593,37 @@ describe("activityToThreadMessages; diff-comments user card (#1123)", () => {
       id: "user-seq-2",
       kind: "user_diff_comments",
       text: "plain body\n",
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    expect(user.metadata).toBeUndefined();
+  });
+});
+
+describe("activityToThreadMessages; elicitation answer (#2209)", () => {
+  it("emits a user message with the answers on metadata.custom", () => {
+    const row: ActivityRow = {
+      id: "elicitation-el-1",
+      kind: "elicitation_answered",
+      text: "Proceed?: Yes",
+      elicitationAnswers: [{ question: "Proceed?", answer: "Yes" }],
+      at: "2026-05-12T00:00:00Z",
+    };
+    const messages = activityToThreadMessages([row], false);
+    const user = messages.find((m) => m.role === "user")!;
+    const parts = user.content as Array<{ type: string; text?: string }>;
+    expect(parts[0]!.type).toBe("text");
+    expect(parts[0]!.text).toBe("Proceed?: Yes");
+    const custom = (user.metadata as { custom?: { elicitationAnswers?: unknown[] } } | undefined)?.custom;
+    expect(custom?.elicitationAnswers).toHaveLength(1);
+  });
+
+  it("omits metadata when the structured answers are absent", () => {
+    const row: ActivityRow = {
+      id: "elicitation-el-2",
+      kind: "elicitation_answered",
+      text: "Q: A",
       at: "2026-05-12T00:00:00Z",
     };
     const messages = activityToThreadMessages([row], false);

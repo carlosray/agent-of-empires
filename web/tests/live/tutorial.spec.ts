@@ -32,6 +32,14 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
       Object.defineProperty(navigator, "webdriver", { get: () => false });
     });
 
+    // Tips also auto-pop for returning users (tour seen) in a non-automated
+    // session. This spec reloads into exactly that state, so turn tips off here
+    // to keep the tour the only modal under test; tips have their own spec.
+    const disableTipsRes = await page.request.post(`${serve.baseUrl}/api/tips/show`, {
+      data: { enabled: false },
+    });
+    expect(disableTipsRes.ok(), "failed to disable tips before tutorial isolation").toBeTruthy();
+
     await page.goto(serve.baseUrl);
 
     // Phase 1 of onboarding (#1834): the theme welcome modal shows first on a
@@ -55,14 +63,20 @@ base("first-run tutorial: auto-launch, skip, persist, re-trigger", async ({ page
     const resp = await postSeen;
     expect(resp.status()).toBe(200);
     await expect(page.getByText(FIRST_STEP)).toBeHidden();
+    // The POST returns 200 before the server has flushed the flag to
+    // config.toml, so GET /api/settings can briefly still report false.
+    // Poll with the same 10s budget the rest of this spec uses; the default
+    // 5s poll window is too tight under CI load and flakes here.
     await expect
-      .poll(() =>
-        page.evaluate(async () => {
-          const res = await fetch("/api/settings", { cache: "no-store" });
-          if (!res.ok) return false;
-          const cfg = await res.json();
-          return cfg?.app_state?.has_seen_web_tour === true;
-        }),
+      .poll(
+        () =>
+          page.evaluate(async () => {
+            const res = await fetch("/api/settings", { cache: "no-store" });
+            if (!res.ok) return false;
+            const cfg = await res.json();
+            return cfg?.app_state?.has_seen_web_tour === true;
+          }),
+        { timeout: 10_000 },
       )
       .toBe(true);
 

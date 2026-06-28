@@ -28,7 +28,7 @@ jobs:
     # waits here, so no build compute or release publish runs without sign-off.
     environment: release
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ env.RELEASE_REF }}
           # No job here pushes back to the repo; the Release is created via
@@ -94,7 +94,7 @@ jobs:
             name: aoe-linux-arm64
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
@@ -192,7 +192,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
@@ -200,7 +200,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install git-cliff
-        uses: taiki-e/install-action@e49978b799e49ff429d162b7a30601a569ab6538 # v2.81.1
+        uses: taiki-e/install-action@15449e3094499af05d8d964a1c884208e4b8b595 # v2.81.11
         with:
           tool: git-cliff
 
@@ -272,7 +272,7 @@ jobs:
     env:
       CLAWHUB_TOKEN: ${{ secrets.CLAWHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           ref: ${{ env.RELEASE_REF }}
           persist-credentials: false
@@ -284,10 +284,6 @@ jobs:
         if: env.CLAWHUB_TOKEN != ''
         run: |
           bun install -g clawhub
-          # Workaround: clawhub CLI v0.7.0 doesn't send acceptLicenseTerms
-          GLOBAL_DIR="$(bun pm ls -g 2>/dev/null | head -1 | sed 's/ .*//')"
-          PUBLISH_JS="${GLOBAL_DIR}/node_modules/clawhub/dist/cli/commands/publish.js"
-          sed -i 's/slug,/slug, acceptLicenseTerms: true,/' "$PUBLISH_JS"
 
       - name: Publish skill
         if: env.CLAWHUB_TOKEN != ''

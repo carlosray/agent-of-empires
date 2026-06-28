@@ -4,7 +4,7 @@ pub(crate) mod bindings;
 mod input;
 mod live_send;
 mod operations;
-mod render;
+pub(crate) mod render;
 
 #[cfg(test)]
 mod tests;
@@ -23,7 +23,7 @@ use ratatui::prelude::Rect;
 use tui_input::Input;
 
 use crate::session::{
-    append_archived_section, append_archived_section_by_project,
+    append_archived_section, append_archived_section_by_project, append_trash_section,
     config::{load_config, save_config, GroupByMode, SortOrder},
     flatten_sessions_by_attention, flatten_tree, flatten_tree_all_profiles, resolve_config_or_warn,
     DefaultTerminalMode, EnsureReadyOutcome, Group, GroupTree, Instance, Item, Storage,
@@ -43,6 +43,7 @@ use super::dialogs::{
     UpdateConfirmDialog, WorktreeNameDialog,
 };
 use super::diff::DiffView;
+use super::restart_poller::RestartPoller;
 use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
@@ -377,6 +378,15 @@ pub(super) fn get_indent(depth: usize) -> &'static str {
 }
 
 pub(super) const ICON_IDLE: &str = "⠒";
+/// Unread rows swap the muted idle braille dot for a solid filled circle so
+/// the marker reads at a glance (and matches the web sidebar's unread dot).
+/// Paired with bold + `theme.unread` in the row formatter.
+pub(super) const ICON_UNREAD: &str = "●";
+/// How long a session row must stay selected (with the list in the foreground)
+/// before its unread marker clears. Long enough that arrowing past a row to get
+/// somewhere doesn't read it, short enough that pausing to read the preview
+/// does. See `tick_unread_dwell`.
+pub(super) const UNREAD_DWELL: std::time::Duration = std::time::Duration::from_secs(2);
 pub(super) const ICON_ERROR: &str = "✕";
 pub(super) const ICON_UNKNOWN: &str = "⠤";
 pub(super) const ICON_STOPPED: &str = "⠒";
@@ -499,6 +509,7 @@ pub struct HomeView {
     pub(super) sort_picker_dialog: Option<SortPickerDialog>,
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
+    pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
@@ -507,6 +518,25 @@ pub struct HomeView {
     /// telemetry existed. Startup gating keeps it from rendering over the
     /// changelog or the version update modal.
     pub(super) telemetry_consent_dialog: Option<super::dialogs::TelemetryConsentDialog>,
+    /// Tips overlay (the browsable list from `crate::tips`), when open. Reached
+    /// from the command palette, the `?` help screen, or the tips badge.
+    pub(super) tips_dialog: Option<super::dialogs::TipsDialog>,
+    /// Cached count of eligible, unseen tips for the home-view badge. Recomputed
+    /// from `app_state` on config refresh and after tips state changes, so the
+    /// badge doesn't read config on every frame. Zero when tips are disabled.
+    pub(super) tips_unseen: usize,
+    /// An earned tip queued to pop gently once the user is back on the idle home
+    /// view (set after the new-session dialog closes; see #2262). Drained on the
+    /// next keystroke into a small one-tip overlay so it never interrupts an
+    /// in-flight action.
+    pub(super) pending_tip_pop: Option<&'static crate::tips::Tip>,
+    /// Screen rect of the tips badge in the footer, captured each frame so a
+    /// click can target it. `None` when the badge isn't drawn (nothing unseen,
+    /// tips disabled, live-send banner up, or no room for it).
+    pub(super) tips_badge_rect: Option<ratatui::layout::Rect>,
+    /// Whether the mouse is currently over the tips badge, so it can paint a
+    /// hover highlight like a session row does. Updated by `handle_hover`.
+    pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
@@ -563,10 +593,12 @@ pub struct HomeView {
     /// shows the which-key menu. Always false outside live mode; cleared on
     /// live-send exit. See `handle_live_send_key`.
     pub(super) live_send_pending_leader: bool,
-    /// When true, the session list (sidebar) is hidden so the preview pane
-    /// gets the full terminal width. Toggled from live mode via the leader
-    /// (`leader b`) for a distraction-free structured view; reset on live-send
-    /// exit so the list always reappears in the normal home view.
+    /// When true, the session list (sidebar) collapses to a narrow,
+    /// click-to-expand strip so the preview pane gets nearly the full
+    /// terminal width. Toggled by the collapse button on the list border,
+    /// by clicking the collapsed strip, or from live mode via the leader
+    /// (`leader b`). Persisted to `app_state.home_sidebar_collapsed` so the
+    /// choice survives restarts.
     pub(super) sidebar_collapsed: bool,
     /// `(session_id, cols, rows)` of the last NON-live preview resize we sent
     /// to the selected agent's pane, so the 250ms preview poll doesn't
@@ -620,6 +652,14 @@ pub struct HomeView {
 
     // Performance: background stop (docker stop can block up to ~10s)
     pub(super) stop_poller: StopPoller,
+
+    // Performance: background restart (the start cascade shells out to docker
+    // and runs the before_start host hook, which can block for seconds)
+    pub(super) restart_poller: RestartPoller,
+    /// Sessions whose restart cascade is in flight on the restart poller.
+    /// Suppresses the StatusPoller's missing-tmux Error transition until the
+    /// worker reports back via `apply_restart_results`.
+    pub(super) restart_in_flight: std::collections::HashSet<String>,
 
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
@@ -695,6 +735,27 @@ pub struct HomeView {
     /// keep working; clicks use the inner rect so we don't try to select
     /// the border row.
     pub(super) list_inner_area: Rect,
+    /// Clickable rect of the collapse button drawn on the list block's
+    /// top-right border (expanded side-by-side/stacked view). Zeroed on
+    /// frames where the button isn't drawn (e.g. while collapsed) so a
+    /// stale rect can't swallow clicks.
+    pub(super) collapse_button_area: Rect,
+    /// Clickable rect of the narrow strip shown in place of the list when
+    /// collapsed. Clicking anywhere in it re-expands the sidebar. Zeroed
+    /// while the full list is drawn.
+    pub(super) expand_strip_area: Rect,
+    /// Clickable footer-toolbar buttons captured during `render_status_bar`,
+    /// each paired with the `KeyEvent` a click synthesizes (so a click is
+    /// dispatched through the exact same path as pressing the shortcut).
+    /// Rebuilt every frame; empty in live mode and the takeover views.
+    pub(super) footer_buttons: Vec<(Rect, crossterm::event::KeyEvent)>,
+    /// The `KeyEvent` of the footer button the pointer is currently over, used
+    /// to draw a hover highlight. Recomputed on every `Moved` event. Keyed by
+    /// the button's shortcut rather than its index into `footer_buttons` so the
+    /// highlight follows the right button when a sort/group/view-mode change
+    /// reorders the toolbar between the move and the next render, and can never
+    /// index a button that no longer exists.
+    pub(super) footer_hover: Option<crossterm::event::KeyEvent>,
     /// Last reported mouse position when it was over `list_inner_area`,
     /// `None` when the cursor is outside the list. Stored as a position
     /// rather than a resolved item index so wheel scrolls implicitly
@@ -705,6 +766,28 @@ pub struct HomeView {
     /// `DOUBLE_CLICK_THRESHOLD` on the same row, which then activates the
     /// session (same as pressing Enter on the selected row).
     pub(super) last_click: Option<(std::time::Instant, u16, u16)>,
+
+    /// Same as `last_click`, but for left-presses on the preview pane. Kept
+    /// separate so preview and sidebar double-click detection don't cross-talk.
+    /// A second qualifying press within `DOUBLE_CLICK_THRESHOLD` activates the
+    /// previewed session, matching a sidebar double-click.
+    pub(super) last_preview_click: Option<(std::time::Instant, u16, u16)>,
+
+    /// Dwell tracker for unread clear-on-read: the currently-selected session
+    /// id and the instant the selection landed on it (while the list is the
+    /// foreground, no dialog/live-send). When the same row stays selected for
+    /// `UNREAD_DWELL`, the marker is cleared, distinguishing "scrolled past"
+    /// from "actually read." Reset on selection change and on leaving the list.
+    pub(super) unread_dwell: Option<(String, std::time::Instant)>,
+
+    /// Session id the user just flagged unread by hand (`u`) and has not yet
+    /// navigated away from. While this row stays selected, dwell-to-read won't
+    /// undo the mark, so flagging a session and keeping the cursor on it
+    /// sticks. It is released the moment the cursor leaves the row (see
+    /// `tick_unread_dwell`), so returning to it later lets the dwell clear it
+    /// like any other unread row. In-memory only: a manual flag is a
+    /// this-visit hint, not a durable badge.
+    pub(super) manual_unread_hold: Option<String>,
 
     // Terminal mode for sandboxed sessions (per-session, ephemeral)
     pub(super) terminal_modes: HashMap<String, TerminalMode>,
@@ -763,6 +846,12 @@ pub struct HomeView {
     /// today), updated on each `Drag(Left)`, cleared on `Up(Left)`.
     pub(super) drag_state: Option<DragKind>,
 
+    /// The SGR base button code (0/1/2) of a mouse press currently being
+    /// forwarded to the previewed agent (`forward_mouse_to_preview`), so its
+    /// drag and release reach the agent even after the pointer leaves the
+    /// preview rect. `None` when no forwarded button is held.
+    pub(super) mouse_forward_btn: Option<u16>,
+
     /// Last pointer cell reported during a `PreviewSelect` drag, `None`
     /// outside one. The event-loop ticker reads it (`tick_preview_autoscroll`)
     /// to keep scrolling while the cursor is held at the pane edge:
@@ -811,6 +900,14 @@ pub struct HomeView {
     /// `app_state.archived_section_collapsed`.
     pub(super) archived_section_collapsed: bool,
 
+    /// Collapsed state of the synthetic "Trash" sidebar section. Defaults to
+    /// `true` (collapsed): trash is a recovery shelf, kept out of the way
+    /// until the user opens it. In-memory only (not persisted): a fresh
+    /// session starts with trash collapsed, which is the right default for a
+    /// rarely-used shelf.
+    // ponytail: in-memory only; persist to app_state if users ask for it.
+    pub(super) trashed_section_collapsed: bool,
+
     /// Channel that startup-recovery workers send results back on. `None`
     /// when no recovery was attempted at construction (live tmux, daemon
     /// owns recovery, lock contended, or no candidates). Drained on every
@@ -857,24 +954,95 @@ pub struct HomeView {
     /// `groups.json` so peer-process writes propagate within the
     /// primitive's debounce window.
     pub(super) file_watch: std::sync::Arc<crate::file_watch::FileWatchService>,
-    /// Set by the per-profile forwarder tasks; swapped to `false` by the
-    /// tick loop when it consumes the kick. Cap-1 fan-in across all
-    /// profile forwarders: idempotent `store(true, Release)` collapses
-    /// multiple events between two reloads into one reload regardless of
-    /// source file.
-    pub(super) disk_dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Per-profile subscription pairs; see `rewire_disk_subscriptions`
-    /// for the canonical drop-then-abort removal order.
-    pub(super) disk_watch_handles: HashMap<String, DiskWatchEntry>,
-    /// Tracks tick-driven reload failures so a malformed `sessions.json`
-    /// or `groups.json` does not crash the TUI. Populated by
-    /// `handle_tick_reload_storage`; consumed once per tick to surface a
-    /// single aggregated `info_dialog` and avoid spamming on every tick
-    /// while a file remains broken.
+    /// Per-profile storage-mirror subscriptions and the shared dirty
+    /// latch they feed. The dirty flag is swapped to `false` by the tick
+    /// loop when it consumes the kick; idempotent `store(true, Release)`
+    /// is a cap-1 fan-in across all profile forwarders, collapsing
+    /// multiple events between two reloads into one `reload_storage_only`
+    /// regardless of source file.
+    pub(super) disk_watch: DiskWatchState,
+    /// Per-key config-file subscriptions (global + per-profile) and the
+    /// shared dirty latch they feed. Distinct from `disk_watch.dirty`
+    /// because config reloads call `refresh_from_config` while storage
+    /// reloads call `reload_storage_only`; the two paths must remain
+    /// independently schedulable on the same tick (config first, then
+    /// storage; see `App::run`).
+    pub(super) config_watch: ConfigWatchState,
+    /// Monotonic counter incremented on every watcher-driven config
+    /// refresh attempt (`try_refresh_from_config_watcher` invocation,
+    /// including parse failures that return Err before
+    /// `apply_config_to_state` runs). Surfaced to e2e tests via
+    /// `<app_dir>/.aoe_e2e_refresh_count` when `AOE_E2E_DEBUG=1` is
+    /// set on the TUI process; harness-driven tests poll the file for
+    /// a post-edit refresh attempt as a deterministic completion
+    /// signal. Production builds and non-e2e test runs never set the
+    /// env var, so the file is never written.
+    pub(super) watcher_config_refresh_count: std::sync::atomic::AtomicU64,
+    /// Tracks tick-driven reload failures so a malformed `sessions.json`,
+    /// `groups.json`, or `config.toml` does not crash the TUI. Populated
+    /// by `handle_tick_reload_*`; consumed once per tick to surface a
+    /// single aggregated `info_dialog` (multi-source body) and avoid
+    /// spamming on every tick while a file remains broken.
     pub(super) reload_failure_state: ReloadFailureState,
+    /// Theme name queued by `apply_config_to_state` on the Watcher path.
+    /// Drained by the tick loop in `App::run` via `take_pending_watcher_theme`
+    /// so `App::set_theme` can be called (theme state lives on `App`, not
+    /// `HomeView`). The Interactive path dispatches `Action::SetTheme`
+    /// directly and never sets this field. On a settings save the watcher
+    /// echo also fires this path (idempotent: the Interactive dispatch
+    /// already applied the same theme).
+    pub(super) pending_watcher_theme: Option<String>,
 }
 
-/// Per-profile subscription pair, held in `HomeView::disk_watch_handles`.
+/// Identifies config-watch entries without letting a profile literally named
+/// `"<global>"` collide with the app-wide config subscription.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) enum ConfigWatchKey {
+    /// The app-wide `<app_dir>/config.toml` subscription.
+    Global,
+    /// A per-profile `<profile>/config.toml` subscription.
+    Profile(String),
+}
+
+impl ConfigWatchKey {
+    fn profile(name: &str) -> Self {
+        Self::Profile(name.to_string())
+    }
+}
+
+const RELOAD_FAILED_TITLE: &str = "Reload Failed";
+const WATCHER_WARNING_TITLE: &str = "Watcher Warning";
+
+/// Distinguishes user-driven config reloads from watcher kicks so
+/// `refresh_from_config` can suppress interactive-only dialogs on
+/// background refreshes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ConfigRefreshOrigin {
+    /// A user action triggered the reload and may surface dialogs.
+    Interactive,
+    /// A watcher kick triggered the reload and should stay silent.
+    Watcher,
+}
+
+/// Eligible, unseen tip count for the home-view badge, honoring the
+/// `session.show_tips` setting. Shared by the constructor, config refresh, and
+/// the tips-state writers so the cached badge count can't drift.
+pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
+    if !config.session.show_tips {
+        return 0;
+    }
+    crate::tips::unseen_count(
+        crate::tips::TipSurface::Tui,
+        &config.app_state.tips_seen,
+        &crate::tips::TipSignals {
+            new_session_with_selection_count: config.app_state.new_session_with_selection_count,
+            used_new_from_selection: config.app_state.used_new_from_selection,
+        },
+    )
+}
+
+/// Per-profile subscription pair, held in `HomeView::disk_watch.handles`
+/// and `HomeView::config_watch.handles`.
 ///
 /// Two teardown paths exist:
 /// 1. Explicit-remove (rewire / profile delete via `drop_disk_watch_entry`):
@@ -882,22 +1050,34 @@ pub struct HomeView {
 ///    forwarder's `rx.recv().await` returns `None` and exits naturally;
 ///    `forwarder.abort()` then runs as a fast-path safeguard for any
 ///    `recv` future that has not yet observed the close.
-/// 2. HomeView field-drop on shutdown: the same order falls out of struct
-///    field declaration order. `disk_watch_handles` drops, each entry's
-///    handle drops first (channel-close cascade), the forwarder exits
-///    naturally; the AbortHandle drop is a no-op (Tokio's `AbortHandle`
-///    does not abort on drop) but the forwarder is already gone.
+/// 2. HomeView field-drop on shutdown: the same order is guaranteed by
+///    struct field declaration order. `disk_watch.handles` drops, each
+///    entry's handle drops first (channel-close cascade), the forwarder
+///    exits naturally; the AbortHandle drop is a no-op (Tokio's
+///    `AbortHandle` does not abort on drop) but the forwarder is already
+///    gone.
 pub(super) struct DiskWatchEntry {
     handle: crate::file_watch::SubscriptionHandle,
     forwarder: tokio::task::AbortHandle,
-    /// Canonicalized profile dir at install time. Compared against the
-    /// current canonical dir on rewire to detect peer-driven
-    /// delete-and-recreate (same name, new inode); on mismatch the entry
-    /// is treated as needing rewire even when the profile name set is
-    /// unchanged. notify NonRecursive watches do not auto-reattach to a
-    /// recreated directory on Linux inotify (IN_IGNORED) or macOS
-    /// FSEvents (path-based but inconsistent across platforms).
+    /// Canonicalized dir at install time. Compared against the current
+    /// canonical resolution on rewire to detect path-level moves.
+    /// notify NonRecursive watches do not auto-reattach to a recreated
+    /// directory on Linux inotify or macOS FSEvents.
     canonical_dir: std::path::PathBuf,
+    /// Filesystem identity (`(dev, ino, btime)` on Unix; `()`
+    /// elsewhere) captured when the subscription was installed. The
+    /// canonical path string survives a peer `rm -rf X && mkdir X`
+    /// race because the new dir resolves to the same string, and on
+    /// ext4/overlayfs the freed inode number is routinely recycled by
+    /// the immediate recreate; the birth time component is what
+    /// distinguishes the new dir there. On rewire, mismatch against a
+    /// fresh stat forces an entry rebuild even when the canonical path
+    /// is unchanged. Stat failure at install stores the type's
+    /// `Default` (`(0, 0, None)` on Unix; `()` elsewhere) as a
+    /// sentinel; on Unix `(0, 0, _)` cannot collide with a real
+    /// filesystem identity, so the next rewire that successfully stats
+    /// the dir mismatches against the sentinel and forces a rebuild.
+    installed_identity: crate::file_watch::WatchIdentity,
 }
 
 /// Drop the subscription handle FIRST. Closing the source channel
@@ -908,35 +1088,595 @@ fn drop_disk_watch_entry(entry: DiskWatchEntry) {
         handle,
         forwarder,
         canonical_dir: _,
+        installed_identity: _,
     } = entry;
     drop(handle);
     forwarder.abort();
 }
 
+/// Sibling of [`ConfigWatchState`]; groups the per-profile storage-mirror
+/// subscriptions with the shared dirty latch their forwarders set. The
+/// two fields must move together because every install/uninstall of a
+/// subscription is paired with a kick or compensation `store` on the
+/// latch. Per the file-watch service contract, the rewire path reuses
+/// the single `Arc<FileWatchService>` constructed once for this TUI
+/// process and never builds a second one.
+pub(super) struct DiskWatchState {
+    /// Dirty latch (cap-1 fan-in) set with `Release` ordering by every
+    /// profile forwarder and swapped to `false` with `Acquire` ordering
+    /// by the tick loop in `App::run`; idempotent across forwarders so
+    /// multiple events between two reloads collapse into one
+    /// `reload_storage_only`.
+    pub(super) dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per-profile subscription pairs keyed by profile name. Drop a
+    /// value through [`drop_disk_watch_entry`] to honor the
+    /// drop-then-abort teardown protocol; field-drop on `HomeView`
+    /// shutdown falls back to the same order via declaration order.
+    pub(super) handles: HashMap<String, DiskWatchEntry>,
+}
+
+/// Sibling of [`DiskWatchState`]; groups the per-key config-file
+/// subscriptions with the shared dirty latch their forwarders set. The
+/// typed key keeps the global `<app_dir>/config.toml` entry from
+/// colliding with any literal profile name. The Arc-reuse rule is the
+/// same as [`DiskWatchState`]: the rewire path reuses the single
+/// `Arc<FileWatchService>` constructed once for this TUI process.
+pub(super) struct ConfigWatchState {
+    /// Dirty latch (cap-1 fan-in) set with `Release` ordering by every
+    /// config forwarder (global + per-profile) and swapped to `false`
+    /// with `Acquire` ordering by the tick loop in `App::run`;
+    /// idempotent across forwarders so multiple events between two
+    /// reloads collapse into one `refresh_from_config`.
+    pub(super) dirty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Per-key subscription pairs. Reuses [`DiskWatchEntry`] because
+    /// the drop-then-abort teardown protocol is identical to the
+    /// disk-watch sibling.
+    pub(super) handles: HashMap<ConfigWatchKey, DiskWatchEntry>,
+}
+
+impl DiskWatchState {
+    /// Reconcile per-profile storage-mirror subscriptions
+    /// (`sessions.json` / `groups.json`) against `current` via set-diff:
+    /// drop entries for profiles in `prior - current`, keep entries in
+    /// `prior ∩ current` untouched, install fresh entries for profiles
+    /// in `current - prior`. Same-set rewires are a no-op.
+    ///
+    /// Inode-invalidation case (profile dir deleted and recreated under
+    /// the same name): the caller must drop the stale entry first via
+    /// `drop_disk_watch_entry` before invoking this helper, so the name
+    /// is missing from `prior` and the install path runs.
+    ///
+    /// Service ownership: the rewire path reuses the caller's
+    /// `Arc<FileWatchService>`, the single instance constructed once for
+    /// this TUI process (per the file-watch service design's "one Arc
+    /// per process" rule). It must NEVER construct a second service.
+    /// In-process storage writes propagate through the Local fast path
+    /// in `Storage::update`; cross-process writes propagate through the
+    /// kernel watcher within its debounce window.
+    pub(super) fn rewire(
+        &mut self,
+        file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+        current: &[String],
+        reload_failure: &mut ReloadFailureState,
+    ) {
+        use crate::file_watch::{FileMatcher, WatchSpec};
+        use std::collections::HashSet;
+        use std::time::Duration;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        let prior: HashSet<String> = self.handles.keys().cloned().collect();
+        let target: HashSet<&String> = current.iter().collect();
+
+        // Detect peer-driven delete-and-recreate of any prior profile dir
+        // by comparing each prior entry's stored canonical_dir against the
+        // current canonical resolution. Mismatch forces a rewire of that
+        // entry even when the name set is unchanged, since notify
+        // NonRecursive watches do not auto-reattach across the inode
+        // change on Linux inotify or macOS FSEvents. Resolve via the
+        // non-creating `get_profile_dir_path`: this is a read-only
+        // existence/canonicalization probe, and `get_profile_dir` would
+        // resurrect a profile dir that a peer just deleted, leaving the
+        // removed profile visible in `list_profiles()` forever.
+        let inode_invalidated: HashSet<String> = prior
+            .iter()
+            .filter(|name| {
+                let entry = match self.handles.get(*name) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                let current_canonical = crate::session::get_profile_dir_path(name)
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => {
+                        canonical != entry.canonical_dir
+                            || crate::file_watch::capture_watch_identity(&canonical)
+                                .map(|id| id != entry.installed_identity)
+                                .unwrap_or(false)
+                    }
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+
+        if prior == current.iter().cloned().collect()
+            && inode_invalidated.is_empty()
+            && !reload_failure.disk_watcher_init_error_references_missing_profile(current)
+        {
+            return;
+        }
+
+        // Clear the latch ahead of the install loop. `record_disk_watcher_init_failure`
+        // re-latches it on any `subscribe_channel` Err below, so the latch
+        // reflects the outcome of this rewire pass.
+        reload_failure.clear_disk_watcher_init_failure();
+
+        let to_remove: Vec<String> = prior
+            .iter()
+            .filter(|n| !target.contains(*n) || inode_invalidated.contains(*n))
+            .cloned()
+            .collect();
+        let to_add: Vec<String> = current
+            .iter()
+            .filter(|n| !prior.contains(*n) || inode_invalidated.contains(*n))
+            .cloned()
+            .collect();
+
+        for name in &to_remove {
+            if let Some(entry) = self.handles.remove(name) {
+                drop_disk_watch_entry(entry);
+            }
+        }
+
+        for name in &to_add {
+            let dir = match crate::session::get_profile_dir_path(name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "skipping subscribe; profile dir resolution failed"
+                    );
+                    continue;
+                }
+            };
+            if !dir.exists() {
+                tracing::debug!(
+                    target: "tui.file_watch",
+                    profile = %name,
+                    "skipping disk subscribe; profile dir absent (peer delete raced the list_profiles snapshot)"
+                );
+                continue;
+            }
+            let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let sessions_path = dir.join("sessions.json");
+            let groups_path = dir.join("groups.json");
+            let spec = WatchSpec {
+                dir: dir.clone(),
+                matcher: FileMatcher::AnyOf(vec![sessions_path, groups_path]),
+                debounce: Some(Duration::from_millis(75)),
+            };
+            match file_watch.subscribe_channel(spec, 16) {
+                Ok((mut rx, handle)) => {
+                    use tracing::Instrument;
+                    let dirty = self.dirty.clone();
+                    // Forwarder exits via `rx.recv() = None` when its
+                    // SubscriptionHandle is dropped (rewire / HomeView
+                    // teardown). The TUI has no graceful-drain phase, so
+                    // no `CancellationToken` is plumbed through here.
+                    let span = tracing::debug_span!(
+                        "tui.disk_watch.forwarder",
+                        profile = %name
+                    );
+                    let join = crate::task_util::spawn_supervised(
+                        "tui.disk_watch.forwarder",
+                        crate::task_util::PanicPolicy::Log,
+                        async move {
+                            while rx.recv().await.is_some() {
+                                dirty.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        .instrument(span),
+                    );
+                    self.handles.insert(
+                        name.clone(),
+                        DiskWatchEntry {
+                            handle,
+                            forwarder: join.abort_handle(),
+                            canonical_dir: canonical_dir.clone(),
+                            installed_identity: crate::file_watch::capture_watch_identity(
+                                &canonical_dir,
+                            )
+                            .unwrap_or_default(),
+                        },
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "subscribe_channel failed; falling back to 5s heartbeat for this profile"
+                    );
+                    reload_failure.record_disk_watcher_init_failure(name, e.to_string());
+                }
+            }
+        }
+        tracing::debug!(
+            target: "tui.file_watch",
+            added = ?to_add,
+            removed = ?to_remove,
+            "reconciled per-profile disk-watch subscriptions"
+        );
+        // Missed-window compensation, mirroring the config rewire: a
+        // sessions.json/groups.json write into a recreated dir before
+        // this rebuild produced no event, so kick the latch and let the
+        // next tick reload storage from disk.
+        if !inode_invalidated.is_empty() {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl ConfigWatchState {
+    /// Reconcile the per-key config-file subscriptions against the live
+    /// profile set + the always-present global key. The global key
+    /// (`<app_dir>/config.toml`) is subscribed once and kept across
+    /// rewires because the app dir is never deleted mid-session, so the
+    /// kernel watch on it stays valid.
+    ///
+    /// Per-profile entries are fully torn down then re-subscribed on
+    /// each rewire: every existing per-profile entry is dropped first,
+    /// then a fresh subscription is installed for each profile in
+    /// `current`. This handles the "profile dir deleted and recreated
+    /// under the same name" case where the kernel watch is invalidated
+    /// by the unlink even though the profile name has not changed.
+    /// Unlike [`DiskWatchState::rewire`] which uses set-diff to
+    /// preserve stable subscriptions across calls, full teardown is
+    /// cheap here because each profile has a single config-file
+    /// subscription rather than a directory watch with multiple matched
+    /// files, and the per-rewire churn is bounded by profile count.
+    ///
+    /// Drop order on remove is canonical: drop the `SubscriptionHandle`
+    /// FIRST, then abort the forwarder, so the source channel closes
+    /// and the forwarder's `rx.recv()` returns `None` naturally before
+    /// the abort fires as a safeguard.
+    ///
+    /// Service ownership: the rewire path reuses the caller's
+    /// `Arc<FileWatchService>`, the single instance constructed once for
+    /// this TUI process (per the file-watch service design's "one Arc
+    /// per process" rule). It must NEVER construct a second service.
+    /// Cross-process config edits (user `$EDITOR` save, peer
+    /// `aoe profile create/delete`) propagate through the kernel
+    /// watcher; in-process config writes are out of scope here because
+    /// `Storage::update` does not write config files (only sessions /
+    /// groups), so no `notify_local_change` is wired on this path.
+    pub(super) fn rewire(
+        &mut self,
+        file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+        current: &[String],
+        reload_failure: &mut ReloadFailureState,
+    ) {
+        use crate::file_watch::{FileMatcher, WatchSpec};
+        use std::time::Duration;
+
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+
+        // Drop the existing global entry when its stored canonical_dir
+        // does not match the live canonicalized app dir, mirroring the
+        // disk-watch inode-aware rewire. The install-once branch below
+        // picks up the new inode.
+        let global_invalidated = match self.handles.get(&ConfigWatchKey::Global) {
+            Some(entry) => {
+                let current_canonical = crate::session::get_app_dir()
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => {
+                        canonical != entry.canonical_dir
+                            || crate::file_watch::capture_watch_identity(&canonical)
+                                .map(|id| id != entry.installed_identity)
+                                .unwrap_or(false)
+                    }
+                    None => true,
+                }
+            }
+            None => false,
+        };
+        if global_invalidated {
+            if let Some(entry) = self.handles.remove(&ConfigWatchKey::Global) {
+                drop_disk_watch_entry(entry);
+            }
+        }
+        let global_needs_install = !self.handles.contains_key(&ConfigWatchKey::Global);
+
+        let prior_profiles: std::collections::HashSet<String> = self
+            .handles
+            .keys()
+            .filter_map(|key| match key {
+                ConfigWatchKey::Global => None,
+                ConfigWatchKey::Profile(name) => Some(name.clone()),
+            })
+            .collect();
+        let target: std::collections::HashSet<&String> = current.iter().collect();
+
+        // Per-profile inode invalidation: peer-driven `aoe profile delete X
+        // && aoe profile new X` keeps the same name but produces a new
+        // inode, and notify NonRecursive watches do not auto-reattach.
+        // Compare each prior entry's stored canonical_dir against the
+        // current canonical resolution; mismatch forces a rewire even
+        // when the name set is unchanged. Resolution goes through the
+        // non-creating `get_profile_dir_path`; `get_profile_dir` calls
+        // `fs::create_dir_all`, which recreates a profile directory
+        // the user just deleted and re-surfaces it in `list_profiles()`
+        // on the next heartbeat.
+        let inode_invalidated: Vec<String> = prior_profiles
+            .iter()
+            .filter(|name| {
+                let entry = match self.handles.get(&ConfigWatchKey::profile(name)) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                let current_canonical = crate::session::get_profile_dir_path(name)
+                    .ok()
+                    .and_then(|p| std::fs::canonicalize(&p).ok());
+                match current_canonical {
+                    Some(canonical) => {
+                        canonical != entry.canonical_dir
+                            || crate::file_watch::capture_watch_identity(&canonical)
+                                .map(|id| id != entry.installed_identity)
+                                .unwrap_or(false)
+                    }
+                    None => true,
+                }
+            })
+            .cloned()
+            .collect();
+
+        let to_remove: Vec<String> = prior_profiles
+            .iter()
+            .filter(|n| !target.contains(*n) || inode_invalidated.iter().any(|i| i == *n))
+            .cloned()
+            .collect();
+        let to_add: Vec<String> = current
+            .iter()
+            .filter(|n| !prior_profiles.contains(*n) || inode_invalidated.iter().any(|i| i == *n))
+            .cloned()
+            .collect();
+
+        if !global_needs_install
+            && to_remove.is_empty()
+            && to_add.is_empty()
+            && !reload_failure.config_watcher_init_error_references_missing_profile(current)
+        {
+            return;
+        }
+
+        // Clear the latch ahead of the install loop. `record_config_watcher_init_failure`
+        // re-latches it on any `subscribe_channel` Err below, so the latch
+        // reflects the outcome of this rewire pass.
+        reload_failure.clear_config_watcher_init_failure();
+
+        if global_needs_install {
+            match crate::session::get_app_dir() {
+                Ok(app_dir) => {
+                    let canonical_dir =
+                        std::fs::canonicalize(&app_dir).unwrap_or_else(|_| app_dir.clone());
+                    let target = app_dir.join("config.toml");
+                    let spec = WatchSpec {
+                        dir: app_dir,
+                        matcher: FileMatcher::Exact(target),
+                        debounce: Some(Duration::from_millis(100)),
+                    };
+                    match file_watch.subscribe_channel(spec, 4) {
+                        Ok((mut rx, handle)) => {
+                            use tracing::Instrument;
+                            let dirty = std::sync::Arc::clone(&self.dirty);
+                            let span = tracing::debug_span!("tui.config_watch.global.forwarder");
+                            let join = crate::task_util::spawn_supervised(
+                                "tui.config_watch.global.forwarder",
+                                crate::task_util::PanicPolicy::Log,
+                                async move {
+                                    while rx.recv().await.is_some() {
+                                        dirty.store(true, std::sync::atomic::Ordering::Release);
+                                    }
+                                }
+                                .instrument(span),
+                            );
+                            self.handles.insert(
+                                ConfigWatchKey::Global,
+                                DiskWatchEntry {
+                                    handle,
+                                    forwarder: join.abort_handle(),
+                                    canonical_dir: canonical_dir.clone(),
+                                    installed_identity: crate::file_watch::capture_watch_identity(
+                                        &canonical_dir,
+                                    )
+                                    .unwrap_or_default(),
+                                },
+                            );
+                            tracing::debug!(
+                                target: "tui.file_watch",
+                                "global config.toml subscription installed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "tui.file_watch",
+                                error = %e,
+                                "global config subscribe_channel failed; \
+                                 falling back to settings-close + profile-switch reload"
+                            );
+                            reload_failure.record_config_watcher_init_failure(None, e.to_string());
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        error = %e,
+                        "skipping global config subscribe; app dir resolution failed"
+                    );
+                    reload_failure.record_config_watcher_init_failure(
+                        None,
+                        format!("app dir resolution failed: {e}"),
+                    );
+                }
+            }
+        }
+
+        for name in &to_remove {
+            if let Some(entry) = self.handles.remove(&ConfigWatchKey::profile(name)) {
+                drop_disk_watch_entry(entry);
+            }
+        }
+
+        for name in &to_add {
+            let dir = match crate::session::get_profile_dir_path(name) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "skipping config subscribe; profile dir resolution failed"
+                    );
+                    continue;
+                }
+            };
+            if !dir.exists() {
+                tracing::debug!(
+                    target: "tui.file_watch",
+                    profile = %name,
+                    "skipping config subscribe; profile dir absent (peer delete raced the list_profiles snapshot)"
+                );
+                continue;
+            }
+            let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            let target_path = dir.join("config.toml");
+            let spec = WatchSpec {
+                dir: dir.clone(),
+                matcher: FileMatcher::Exact(target_path),
+                debounce: Some(Duration::from_millis(100)),
+            };
+            match file_watch.subscribe_channel(spec, 4) {
+                Ok((mut rx, handle)) => {
+                    use tracing::Instrument;
+                    let dirty = self.dirty.clone();
+                    let span = tracing::debug_span!(
+                        "tui.config_watch.profile.forwarder",
+                        profile = %name
+                    );
+                    let join = crate::task_util::spawn_supervised(
+                        "tui.config_watch.profile.forwarder",
+                        crate::task_util::PanicPolicy::Log,
+                        async move {
+                            while rx.recv().await.is_some() {
+                                dirty.store(true, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        .instrument(span),
+                    );
+                    self.handles.insert(
+                        ConfigWatchKey::profile(name),
+                        DiskWatchEntry {
+                            handle,
+                            forwarder: join.abort_handle(),
+                            canonical_dir: canonical_dir.clone(),
+                            installed_identity: crate::file_watch::capture_watch_identity(
+                                &canonical_dir,
+                            )
+                            .unwrap_or_default(),
+                        },
+                    );
+                    tracing::debug!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        "profile config.toml subscription installed"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "tui.file_watch",
+                        profile = %name,
+                        error = %e,
+                        "config subscribe_channel failed; \
+                         falling back to settings-close + profile-switch reload for this profile"
+                    );
+                    reload_failure.record_config_watcher_init_failure(Some(name), e.to_string());
+                }
+            }
+        }
+        if !to_add.is_empty() || !to_remove.is_empty() {
+            tracing::debug!(
+                target: "tui.file_watch",
+                added = ?to_add,
+                removed = ?to_remove,
+                "rewire_config_subscriptions: per-profile set-diff update"
+            );
+        }
+        // Missed-window compensation: an invalidation-driven rebuild means
+        // the kernel watch was dead for some interval (peer rm+recreate of
+        // the watched dir), and any config write landing in that interval
+        // produced no event. Kick the dirty latch so the next tick
+        // re-reads config from disk rather than trusting the (silent)
+        // fresh watch. Scoped to invalidation rebuilds; plain set-diff
+        // adds/removes have no dead window to compensate.
+        if global_invalidated || !inode_invalidated.is_empty() {
+            self.dirty.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+/// Latched record of a watcher init failure. The disk slot always carries
+/// `Some(profile)`; the config slot carries `None` for the global config
+/// watch and `Some(profile)` per-profile.
+pub(super) struct WatcherInitError {
+    profile: Option<String>,
+    message: String,
+}
+
 /// Per-tick reload failure tracking. Tick-driven reload paths in
-/// `App::run` (heartbeat `reload()`, watcher-driven `reload_storage_only()`)
-/// route results through `handle_tick_reload_storage`, which records
-/// failures here so the tick loop surfaces a single aggregated
+/// `App::run` (heartbeat `reload()`, watcher-driven `reload_storage_only()`,
+/// watcher-driven `refresh_from_config()`) route results through
+/// `handle_tick_reload_storage` / `handle_tick_reload_config`, which
+/// record failures here so the tick loop surfaces a single aggregated
 /// `info_dialog` per failure burst rather than one dialog per tick.
 ///
 /// `dialog_acknowledged` latches once the dialog is shown and clears
-/// only after every source returns to healthy, so the user is
-/// notified once per failure burst, not once per tick.
+/// only after every source returns to healthy, so the user is notified
+/// once per failure burst, not once per tick. The dialog body aggregates
+/// every currently-failing source (storage, config, disk-watcher init,
+/// config-watcher init) into a single message.
 #[derive(Default)]
 pub(super) struct ReloadFailureState {
     storage_failed: bool,
     storage_error: Option<String>,
-    /// Latched description of the most recent watcher-init failure
-    /// (typically `subscribe_channel` returning Err). Surfaced in the
-    /// reload-failure dialog body so the user sees that live propagation
-    /// is degraded for this profile. Cleared on the next successful
-    /// rewire pass for that profile.
-    watcher_init_error: Option<String>,
+    config_failed: bool,
+    config_error: Option<String>,
+    /// Latched record of the most recent disk-watcher init failure
+    /// (typically `subscribe_channel` returning Err on disk rewire).
+    /// Surfaced in the reload-failure dialog body. Cleared on the next
+    /// successful disk rewire pass for the affected profile.
+    disk_watcher_init_error: Option<WatcherInitError>,
+    /// Latched record of the most recent config-watcher init failure
+    /// (typically `subscribe_channel` returning Err on config rewire).
+    /// Independent from `disk_watcher_init_error`: a config init failure
+    /// is not overwritten by a disk rewire and persists until the next
+    /// successful config rewire pass for the affected key.
+    config_watcher_init_error: Option<WatcherInitError>,
     dialog_acknowledged: bool,
 }
 
 impl ReloadFailureState {
-    pub(super) fn record_storage(&mut self, result: &anyhow::Result<()>) {
+    pub(super) fn record_storage(&mut self, result: &anyhow::Result<()>) -> bool {
         match result {
             Ok(()) => {
                 if self.storage_failed {
@@ -945,37 +1685,122 @@ impl ReloadFailureState {
                     if !self.has_any_failure() {
                         self.dialog_acknowledged = false;
                     }
+                    return true;
                 }
+                false
             }
             Err(e) => {
+                // Healthy-to-failed transition re-arms the dialog so a new
+                // source failing during a previously acknowledged burst
+                // surfaces a fresh notification rather than being silently
+                // absorbed by the ack latch.
                 if !self.storage_failed {
                     self.dialog_acknowledged = false;
                 }
                 self.storage_failed = true;
                 self.storage_error = Some(format!("{e:#}"));
+                false
             }
         }
     }
 
-    pub(super) fn record_watcher_init_failure(&mut self, detail: &str) {
-        let was_clear = self.watcher_init_error.is_none();
-        self.watcher_init_error = Some(detail.to_string());
+    pub(super) fn record_config(&mut self, result: &anyhow::Result<()>) -> bool {
+        match result {
+            Ok(()) => {
+                if self.config_failed {
+                    self.config_failed = false;
+                    self.config_error = None;
+                    if !self.has_any_failure() {
+                        self.dialog_acknowledged = false;
+                    }
+                    return true;
+                }
+                false
+            }
+            Err(e) => {
+                if !self.config_failed {
+                    self.dialog_acknowledged = false;
+                }
+                self.config_failed = true;
+                self.config_error = Some(format!("{e:#}"));
+                false
+            }
+        }
+    }
+
+    pub(super) fn record_disk_watcher_init_failure(
+        &mut self,
+        profile: &str,
+        message: impl Into<String>,
+    ) {
+        let was_clear = self.disk_watcher_init_error.is_none();
+        self.disk_watcher_init_error = Some(WatcherInitError {
+            profile: Some(profile.to_owned()),
+            message: message.into(),
+        });
         if was_clear {
             self.dialog_acknowledged = false;
         }
     }
 
-    pub(super) fn clear_watcher_init_failure(&mut self) {
-        if self.watcher_init_error.is_some() {
-            self.watcher_init_error = None;
+    pub(super) fn clear_disk_watcher_init_failure(&mut self) {
+        if self.disk_watcher_init_error.is_some() {
+            self.disk_watcher_init_error = None;
             if !self.has_any_failure() {
                 self.dialog_acknowledged = false;
             }
         }
     }
 
+    pub(super) fn record_config_watcher_init_failure(
+        &mut self,
+        profile: Option<&str>,
+        message: impl Into<String>,
+    ) {
+        let was_clear = self.config_watcher_init_error.is_none();
+        self.config_watcher_init_error = Some(WatcherInitError {
+            profile: profile.map(str::to_owned),
+            message: message.into(),
+        });
+        if was_clear {
+            self.dialog_acknowledged = false;
+        }
+    }
+
+    pub(super) fn clear_config_watcher_init_failure(&mut self) {
+        if self.config_watcher_init_error.is_some() {
+            self.config_watcher_init_error = None;
+            if !self.has_any_failure() {
+                self.dialog_acknowledged = false;
+            }
+        }
+    }
+
+    pub(super) fn disk_watcher_init_error_references_missing_profile(
+        &self,
+        current: &[String],
+    ) -> bool {
+        self.disk_watcher_init_error
+            .as_ref()
+            .and_then(|e| e.profile.as_deref())
+            .is_some_and(|name| !current.iter().any(|p| p == name))
+    }
+
+    pub(super) fn config_watcher_init_error_references_missing_profile(
+        &self,
+        current: &[String],
+    ) -> bool {
+        self.config_watcher_init_error
+            .as_ref()
+            .and_then(|e| e.profile.as_deref())
+            .is_some_and(|name| !current.iter().any(|p| p == name))
+    }
+
     pub(super) fn has_any_failure(&self) -> bool {
-        self.storage_failed || self.watcher_init_error.is_some()
+        self.storage_failed
+            || self.config_failed
+            || self.disk_watcher_init_error.is_some()
+            || self.config_watcher_init_error.is_some()
     }
 
     pub(super) fn has_unacknowledged_failure(&self) -> bool {
@@ -987,11 +1812,25 @@ impl ReloadFailureState {
         if let Some(e) = &self.storage_error {
             lines.push(format!("- Storage: {e}"));
         }
-        if let Some(e) = &self.watcher_init_error {
-            lines.push(format!("- Watcher init: {e}"));
+        if let Some(e) = &self.config_error {
+            lines.push(format!("- Config: {e}"));
+        }
+        if let Some(e) = &self.disk_watcher_init_error {
+            let detail = match &e.profile {
+                Some(name) => format!("{name}: {}", e.message),
+                None => e.message.clone(),
+            };
+            lines.push(format!("- Disk watcher init: {detail}"));
+        }
+        if let Some(e) = &self.config_watcher_init_error {
+            let detail = match &e.profile {
+                Some(name) => format!("profile {name} config: {}", e.message),
+                None => format!("global config: {}", e.message),
+            };
+            lines.push(format!("- Config watcher init: {detail}"));
         }
         lines.push(String::new());
-        lines.push("Previous in-memory state preserved; will retry on next tick.".to_string());
+        lines.push("In-memory state preserved; sources retry automatically.".to_string());
         lines.join("\n")
     }
 
@@ -1058,6 +1897,7 @@ impl HomeView {
         let idle_decay_window =
             crate::tui::styles::idle_decay_window(resolved.theme.idle_decay_minutes);
         let show_branch_in_tui = resolved.worktree.show_branch_in_tui;
+        crate::session::set_unread_enabled(resolved.session.unread_indicator);
         let user_config = load_config().ok().flatten();
         let sort_order = user_config
             .as_ref()
@@ -1079,9 +1919,21 @@ impl HomeView {
             .as_ref()
             .and_then(|c| c.app_state.group_by)
             .unwrap_or(default_group_by);
+        let tips_unseen = user_config.as_ref().map_or_else(
+            || tips_unseen_count(&crate::session::Config::default()),
+            tips_unseen_count,
+        );
         let view_mode = ViewMode::default();
 
-        let disk_dirty = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let disk_watch = DiskWatchState {
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handles: HashMap::new(),
+        };
+
+        let config_watch = ConfigWatchState {
+            dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handles: HashMap::new(),
+        };
 
         let mut view = Self {
             storages,
@@ -1102,7 +1954,16 @@ impl HomeView {
             group_by,
             row_tag_mode: resolved.session.row_tag,
             profile_default_attach_mode: resolved.session.default_attach_mode,
-            project_group_collapsed: HashMap::new(),
+            project_group_collapsed: user_config
+                .as_ref()
+                .map(|c| {
+                    c.app_state
+                        .project_group_collapsed
+                        .iter()
+                        .map(|path| (path.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default(),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -1134,11 +1995,17 @@ impl HomeView {
             sort_picker_dialog: None,
             project_session_picker_dialog: None,
             projects_dialog: None,
+            plugin_manager_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
             update_confirm_dialog: None,
             telemetry_consent_dialog: None,
+            tips_dialog: None,
+            tips_unseen,
+            pending_tip_pop: None,
+            tips_badge_rect: None,
+            tips_badge_hovered: false,
             send_message_dialog: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
@@ -1150,7 +2017,14 @@ impl HomeView {
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,
-            sidebar_collapsed: false,
+            sidebar_collapsed: user_config
+                .as_ref()
+                .and_then(|c| c.app_state.home_sidebar_collapsed)
+                .unwrap_or(false),
+            collapse_button_area: Rect::default(),
+            expand_strip_area: Rect::default(),
+            footer_buttons: Vec::new(),
+            footer_hover: None,
             preview_pane_synced: None,
             pending_paste: None,
             pending_attach_after_warning: None,
@@ -1169,6 +2043,8 @@ impl HomeView {
             summary_service: crate::session::summary::SummaryService::new(),
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
+            restart_poller: RestartPoller::new(),
+            restart_in_flight: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
@@ -1190,6 +2066,9 @@ impl HomeView {
             list_inner_area: Rect::default(),
             mouse_pos: None,
             last_click: None,
+            last_preview_click: None,
+            unread_dwell: None,
+            manual_unread_hold: None,
             terminal_modes: HashMap::new(),
             default_terminal_mode,
             sound_config,
@@ -1210,6 +2089,7 @@ impl HomeView {
             divider_col: None,
             main_area_width: 0,
             drag_state: None,
+            mouse_forward_btn: None,
             preview_drag_pos: None,
             preview_autoscroll_at: None,
             preview_selection: None,
@@ -1223,6 +2103,7 @@ impl HomeView {
                 .as_ref()
                 .and_then(|c| c.app_state.archived_section_collapsed)
                 .unwrap_or(true),
+            trashed_section_collapsed: true,
             recovery_rx: None,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
@@ -1234,9 +2115,12 @@ impl HomeView {
             tool_hotkey_cache: Vec::new(),
             tool_picker_dialog: None,
             file_watch,
-            disk_dirty,
-            disk_watch_handles: HashMap::new(),
+            disk_watch,
+            config_watch,
+            watcher_config_refresh_count: std::sync::atomic::AtomicU64::new(0),
             reload_failure_state: ReloadFailureState::default(),
+            // App::new loads the boot theme; no startup stash from HomeView.
+            pending_watcher_theme: None,
         };
 
         view.tool_hotkey_cache = input::build_tool_hotkey_cache(&view.tool_configs);
@@ -1271,9 +2155,8 @@ impl HomeView {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in &view.instances {
-                let tmux_name = match inst.tmux_session() {
-                    Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
-                    _ => continue,
+                let Some(tmux_name) = inst.tmux_env_session_name() else {
+                    continue;
                 };
 
                 set_batch.push((
@@ -1345,17 +2228,41 @@ impl HomeView {
         view.flat_items = view.build_flat_items();
         view.update_selected();
         let _ = view.backfill_tool_sessions();
-        let initial_profiles: Vec<String> = view.storages.keys().cloned().collect();
-        view.rewire_disk_subscriptions(&initial_profiles)?;
+        // Disk subscriptions stay scoped to the loaded storages: in
+        // single-profile mode (`aoe --profile X`) the user opted into
+        // exactly that profile's instance state, so we don't watch
+        // sessions.json/groups.json for unrelated profiles.
+        let initial_disk_profiles: Vec<String> = view.storages.keys().cloned().collect();
+        view.rewire_disk_subscriptions(&initial_disk_profiles);
+        // Config subscriptions are intentionally asymmetric: even in
+        // single-profile mode, peer edits to ANY profile's config.toml
+        // (or the global config) must be observable so the picker UI
+        // and status-hook config cache reflect external changes (e.g.
+        // a peer process creating a new profile while the user runs in
+        // filtered mode). The reload helper rewires the same way on
+        // every tick once running, so this is the startup-side
+        // counterpart that closes the boot-time window.
+        let initial_config_profiles: Vec<String> = match crate::session::list_profiles() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    target: "tui.file_watch",
+                    error = %e,
+                    "list_profiles failed at startup; falling back to loaded storages for config wiring"
+                );
+                initial_disk_profiles.clone()
+            }
+        };
+        view.rewire_config_subscriptions(&initial_config_profiles);
         Ok(view)
     }
 
     /// Full reload: status-hook config-cache refresh + storage. Used by
     /// the 5s heartbeat tick and by event-driven sites (attach-return,
     /// save+reload pairs, profile switch). Watcher-driven ticks call
-    /// `reload_storage_only` because the watcher only fires on
-    /// `sessions.json` / `groups.json`; status-hook config is not
-    /// watched.
+    /// `reload_storage_only` because the disk watcher only fires on
+    /// `sessions.json` / `groups.json`; the config watcher drives
+    /// `refresh_from_config` independently.
     pub fn reload(&mut self) -> anyhow::Result<()> {
         self.refresh_status_hook_config_cache();
         self.reload_storage_only()
@@ -1370,8 +2277,39 @@ impl HomeView {
 
         let mut all_instances = Vec::new();
 
+        let current_profiles = match list_profiles() {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                tracing::warn!(
+                    target: "tui.file_watch",
+                    error = %error,
+                    "list_profiles failed during reload_storage_only; reusing loaded storages for watcher rewires"
+                );
+                self.storages.keys().cloned().collect()
+            }
+        };
+
+        // Asymmetric rewire mirrors `HomeView::new` startup wiring. Config
+        // rewire covers the full `list_profiles()` set so peer config edits
+        // surface to the picker UI and status-hook cache regardless of mode
+        // (e.g. a peer process creating a new profile while the user runs
+        // `aoe --profile X`). Disk rewire is scoped: unified mode tracks
+        // every profile, single-profile mode stays bounded to
+        // `self.storages.keys()` (the active profile, plus any profile
+        // loaded via `move_to_profile`). Helpers are set-diff idempotent,
+        // so the unconditional call is a no-op on a stable profile set.
+        self.rewire_config_subscriptions(&current_profiles);
+        if self.active_profile.is_some() {
+            let active_only: Vec<String> = self.storages.keys().cloned().collect();
+            self.rewire_disk_subscriptions(&active_only);
+        } else {
+            self.rewire_disk_subscriptions(&current_profiles);
+        }
+
+        // Storage rebuild: unified mode only. Single-profile mode keeps the
+        // explicit scope set at startup; only the active profile is loaded
+        // into memory.
         if self.active_profile.is_none() {
-            let current_profiles = list_profiles()?;
             for name in &current_profiles {
                 if !self.storages.contains_key(name) {
                     self.storages
@@ -1379,7 +2317,6 @@ impl HomeView {
                 }
             }
             self.storages.retain(|k, _| current_profiles.contains(k));
-            self.rewire_disk_subscriptions(&current_profiles)?;
         }
 
         for (profile_name, storage) in &self.storages {
@@ -1499,164 +2436,148 @@ impl HomeView {
         Ok(())
     }
 
-    /// Reconcile per-profile file-watch subscriptions against `current`
-    /// via set-diff: drop entries for profiles in `prior - current`,
-    /// keep entries in `prior ∩ current` untouched, install fresh
-    /// entries for profiles in `current - prior`. Same-set rewires are
-    /// a no-op.
-    ///
-    /// Inode-invalidation case (profile dir deleted and recreated under
-    /// the same name): the caller must drop the stale entry first via
-    /// `drop_disk_watch_entry` before invoking this helper, so the name
-    /// is missing from `prior` and the install path runs.
-    pub(super) fn rewire_disk_subscriptions(&mut self, current: &[String]) -> anyhow::Result<()> {
-        use crate::file_watch::{FileMatcher, WatchSpec};
-        use std::collections::HashSet;
-        use std::time::Duration;
+    /// Forwards to [`DiskWatchState::rewire`], lending it the
+    /// `file_watch` Arc and `reload_failure_state` owned by `HomeView`.
+    pub(super) fn rewire_disk_subscriptions(&mut self, current: &[String]) {
+        self.disk_watch
+            .rewire(&self.file_watch, current, &mut self.reload_failure_state);
+    }
 
-        if tokio::runtime::Handle::try_current().is_err() {
-            return Ok(());
-        }
+    /// Forwards to [`ConfigWatchState::rewire`], lending it the
+    /// `file_watch` Arc and `reload_failure_state` owned by `HomeView`.
+    pub(super) fn rewire_config_subscriptions(&mut self, current: &[String]) {
+        self.config_watch
+            .rewire(&self.file_watch, current, &mut self.reload_failure_state);
+    }
 
-        let prior: HashSet<String> = self.disk_watch_handles.keys().cloned().collect();
-        let target: HashSet<&String> = current.iter().collect();
-
-        // Detect peer-driven delete-and-recreate of any prior profile dir
-        // by comparing each prior entry's stored canonical_dir against the
-        // current canonical resolution. Mismatch forces a rewire of that
-        // entry even when the name set is unchanged, since notify
-        // NonRecursive watches do not auto-reattach across the inode
-        // change on Linux inotify or macOS FSEvents. Resolve via the
-        // non-creating `get_profile_dir_path`: this is a read-only
-        // existence/canonicalization probe, and `get_profile_dir` would
-        // resurrect a profile dir that a peer just deleted, leaving the
-        // removed profile visible in `list_profiles()` forever.
-        let inode_invalidated: HashSet<String> = prior
-            .iter()
-            .filter(|name| {
-                let entry = match self.disk_watch_handles.get(*name) {
-                    Some(e) => e,
-                    None => return false,
+    /// Rewire disk + config subscriptions after a successful profile
+    /// delete. Surfaces a `Watcher Warning` dialog when
+    /// `list_profiles()` cannot enumerate profiles, since the dialog
+    /// is the only user-facing signal the delete path has; the next
+    /// successful reload repairs watcher state.
+    pub(super) fn rewire_after_profile_delete(&mut self, profile_name: &str) {
+        match crate::session::list_profiles() {
+            Ok(profiles) => {
+                let disk_targets: Vec<String> = if self.active_profile.is_some() {
+                    self.storages.keys().cloned().collect()
+                } else {
+                    profiles.clone()
                 };
-                let current_canonical = crate::session::get_profile_dir_path(name)
-                    .ok()
-                    .and_then(|p| std::fs::canonicalize(&p).ok());
-                match current_canonical {
-                    Some(canonical) => canonical != entry.canonical_dir,
-                    None => true,
-                }
-            })
-            .cloned()
-            .collect();
-
-        if prior == current.iter().cloned().collect() && inode_invalidated.is_empty() {
-            return Ok(());
-        }
-
-        // Clear the latch ahead of the install loop. `record_watcher_init_failure`
-        // re-latches it on any `subscribe_channel` Err below, so the latch
-        // reflects the outcome of this rewire pass.
-        self.reload_failure_state.clear_watcher_init_failure();
-
-        let to_remove: Vec<String> = prior
-            .iter()
-            .filter(|n| !target.contains(*n) || inode_invalidated.contains(*n))
-            .cloned()
-            .collect();
-        let to_add: Vec<String> = current
-            .iter()
-            .filter(|n| !prior.contains(*n) || inode_invalidated.contains(*n))
-            .cloned()
-            .collect();
-
-        for name in &to_remove {
-            if let Some(entry) = self.disk_watch_handles.remove(name) {
-                drop_disk_watch_entry(entry);
+                self.rewire_disk_subscriptions(&disk_targets);
+                self.rewire_config_subscriptions(&profiles);
             }
-        }
-
-        for name in &to_add {
-            let dir = match crate::session::get_profile_dir(name) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tui.file_watch",
-                        profile = %name,
-                        error = %e,
-                        "skipping subscribe; profile dir resolution failed"
-                    );
-                    continue;
-                }
-            };
-            let canonical_dir = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
-            let sessions_path = dir.join("sessions.json");
-            let groups_path = dir.join("groups.json");
-            let spec = WatchSpec {
-                dir: dir.clone(),
-                matcher: FileMatcher::AnyOf(vec![sessions_path, groups_path]),
-                debounce: Some(Duration::from_millis(75)),
-            };
-            match self.file_watch.subscribe_channel(spec, 16) {
-                Ok((mut rx, handle)) => {
-                    use tracing::Instrument;
-                    let dirty = self.disk_dirty.clone();
-                    // Forwarder exits via `rx.recv() = None` when its
-                    // SubscriptionHandle is dropped (rewire / HomeView
-                    // teardown). The TUI has no graceful-drain phase, so
-                    // no `CancellationToken` is plumbed through here.
-                    let span = tracing::debug_span!(
-                        "tui.disk_watch.forwarder",
-                        profile = %name
-                    );
-                    let join = crate::task_util::spawn_supervised(
-                        "tui.disk_watch.forwarder",
-                        crate::task_util::PanicPolicy::Log,
-                        async move {
-                            while rx.recv().await.is_some() {
-                                dirty.store(true, std::sync::atomic::Ordering::Release);
-                            }
-                        }
-                        .instrument(span),
-                    );
-                    self.disk_watch_handles.insert(
-                        name.clone(),
-                        DiskWatchEntry {
-                            handle,
-                            forwarder: join.abort_handle(),
-                            canonical_dir,
-                        },
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "tui.file_watch",
-                        profile = %name,
-                        error = %e,
-                        "subscribe_channel failed; falling back to 5s heartbeat for this profile"
-                    );
-                    self.reload_failure_state
-                        .record_watcher_init_failure(&format!("{}: {}", name, e));
+            Err(e) => {
+                tracing::warn!(
+                    target: "tui.file_watch",
+                    profile = %profile_name,
+                    op = "delete_profile",
+                    error = %e,
+                    "list_profiles failed during rewire after profile delete; watcher state will repair on next reload"
+                );
+                if self.info_dialog.is_none() {
+                    self.info_dialog = Some(InfoDialog::new(
+                        WATCHER_WARNING_TITLE,
+                        &format!(
+                            "Profile '{}' was deleted but the watcher rewire could not enumerate profiles: {}\n\nThe next successful reload will repair watcher state.",
+                            profile_name, e
+                        ),
+                    ));
                 }
             }
         }
-        tracing::debug!(
-            target: "tui.file_watch",
-            added = ?to_add,
-            removed = ?to_remove,
-            "reconciled per-profile disk-watch subscriptions"
-        );
-        Ok(())
+    }
+
+    /// Open or refresh the `Reload Failed` dialog from the current
+    /// `reload_failure_state`. Returns `true` when the dialog was
+    /// opened or its body refreshed in place so the caller can
+    /// request a redraw.
+    ///
+    /// Three update paths converge here:
+    /// * New burst presentation: `has_unacknowledged_failure()` is
+    ///   true. The dialog opens (or re-opens) and the ack latch is
+    ///   consumed.
+    /// * Body refresh: when a `Reload Failed` dialog is on screen
+    ///   and the ack latch is acknowledged, the body is rebuilt if
+    ///   the failing-source set has shifted (partial recovery that
+    ///   leaves at least one source still failing, or a new source
+    ///   recorded for the same acknowledged burst). The ack latch
+    ///   stays in place; the user is not re-notified for the same
+    ///   ongoing burst.
+    /// * No-op: nothing failing, body unchanged, or an unrelated
+    ///   dialog (a `Watcher Warning` from `rewire_after_profile_delete`,
+    ///   or a profile create/delete `Error`) occupies the slot. In
+    ///   the foreign-dialog case the ack latch stays armed so the
+    ///   next tick can present once the foreign dialog is dismissed.
+    pub(super) fn try_present_reload_failure_dialog(&mut self) -> bool {
+        if !self.reload_failure_state.has_any_failure() {
+            return false;
+        }
+        let title = RELOAD_FAILED_TITLE;
+        let occupied_by_other = self
+            .info_dialog
+            .as_ref()
+            .is_some_and(|d| d.title() != title);
+        if occupied_by_other {
+            return false;
+        }
+
+        let needs_ack = self.reload_failure_state.has_unacknowledged_failure();
+        let dialog_open = self
+            .info_dialog
+            .as_ref()
+            .is_some_and(|d| d.title() == title);
+
+        if !needs_ack && !dialog_open {
+            return false;
+        }
+
+        let body = self.reload_failure_state.build_dialog_body();
+        let body_matches = self
+            .info_dialog
+            .as_ref()
+            .is_some_and(|d| d.message() == body);
+        if !needs_ack && body_matches {
+            return false;
+        }
+
+        self.info_dialog = Some(InfoDialog::sized_to_fit(title, &body));
+        if needs_ack {
+            self.reload_failure_state.acknowledge_dialog();
+        }
+        true
+    }
+
+    /// Recovery-edge cleanup: clear a stale `Reload Failed` dialog
+    /// when every reload source returns to healthy. Returns `true`
+    /// when the dialog was cleared so the caller can request a redraw.
+    /// The `Watcher Warning` dialog raised by
+    /// `rewire_after_profile_delete` is intentionally outside
+    /// `reload_failure_state` and is left for the user to dismiss.
+    pub(super) fn try_clear_recovered_reload_dialog(&mut self) -> bool {
+        if !self.reload_failure_state.has_any_failure()
+            && self
+                .info_dialog
+                .as_ref()
+                .is_some_and(|d| d.title() == RELOAD_FAILED_TITLE)
+        {
+            self.info_dialog = None;
+            true
+        } else {
+            false
+        }
     }
 
     /// Snapshot of `self.instances` eligible for status polling.
-    /// In-flight recovery candidates are excluded; their post-cascade
-    /// `Instance` arrives via `apply_recovery_updates` and skipping the
-    /// parallel poll prevents racing transitions during the suppression
-    /// window.
+    /// In-flight recovery and restart candidates are excluded; their
+    /// post-cascade `Instance` arrives via `apply_recovery_updates` /
+    /// `apply_restart_results` and skipping the parallel poll prevents racing
+    /// transitions during the suppression window.
     pub(super) fn pollable_instances(&self) -> Vec<Instance> {
         self.instances
             .iter()
-            .filter(|i| !self.recovery_in_flight.contains(&i.id))
+            .filter(|i| {
+                !self.recovery_in_flight.contains(&i.id) && !self.restart_in_flight.contains(&i.id)
+            })
             .cloned()
             .collect()
     }
@@ -2015,6 +2936,31 @@ impl HomeView {
                             &inst, old, new_status, play_sound, run_hooks,
                         );
                     }
+                    // Auto-mark unread when a turn finishes (Running ->
+                    // Idle), unless the user is currently viewing this
+                    // session in live-send. This runs in both the with-
+                    // and without-hooks apply paths, so a *different*
+                    // session finishing while the user is attached
+                    // elsewhere still gets marked. The attached session
+                    // itself is cleared on attach-return, so a turn that
+                    // finishes during an attach nets to read.
+                    if crate::session::unread_enabled()
+                        && old == Status::Running
+                        && new_status == Status::Idle
+                    {
+                        let is_live_target = self
+                            .live_send
+                            .as_ref()
+                            .is_some_and(|s| s.session_id == update.id);
+                        // Skip the disk write when already unread (the mark
+                        // is a no-op) so a re-finishing session doesn't churn
+                        // the flock once per turn.
+                        let already_unread =
+                            self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                        if !is_live_target && !already_unread {
+                            let _ = self.apply_user_action(&update.id, |inst| inst.mark_unread());
+                        }
+                    }
                 }
             }
         } else if new_last_accessed.is_some() {
@@ -2097,11 +3043,25 @@ impl HomeView {
 
         if let Some(result) = self.deletion_poller.try_recv_result() {
             if result.success {
+                // Captured before the remove (the instance is still in
+                // `self.instances`); recorded only after the deletion is
+                // durably saved, so a failed save leaves no tombstone (#2141).
+                let recent_entry = self
+                    .instances
+                    .iter()
+                    .find(|i| i.id == result.session_id)
+                    .and_then(crate::session::recent_project_entry_for);
                 self.remove_instance(&result.session_id);
                 self.rebuild_group_trees();
 
                 if let Err(e) = self.save() {
                     tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
+                } else if let Some(entry) = recent_entry {
+                    // Best-effort; keeps the project in the wizard Recent tab.
+                    if let Err(e) = crate::session::record_recent_project(entry) {
+                        tracing::warn!(target: "tui.home",
+                            "recording recent project after delete failed: {e}");
+                    }
                 }
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
@@ -2151,166 +3111,19 @@ impl HomeView {
     /// Tmux env may also be republished when this returns `false`
     /// (filtered or Failed paths republish the memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
-        let mut updates: Vec<(String, String, Option<String>)> = Vec::new();
-        let mut filtered_ids: HashSet<String> = HashSet::new();
-
-        for inst in &self.instances {
-            if let Some((_id, session_id)) = inst
-                .session_id_poller
-                .as_ref()
-                .and_then(|p| p.lock().ok())
-                .and_then(|p| p.try_recv_session_update())
-            {
-                let Some(session_id) = crate::session::capture::validated_session_id(session_id)
-                else {
-                    // `on_change` already published this raw sid to env;
-                    // republish the memory mirror to overwrite it.
-                    filtered_ids.insert(inst.id.clone());
-                    continue;
-                };
-                // Defense-in-depth against the resume-fallback cascade: a sid
-                // the cascade just cleared can still live on disk for several
-                // minutes (opencode db, vibe meta.json, codex/gemini/pi/hermes
-                // state). The poller closures filter via `compose_exclusion`,
-                // but if a closure factory ever forgets to thread the per-
-                // instance excludes, this guard prevents the cleared sid from
-                // being re-imported into memory and disk.
-                if inst.retroactive_capture_excludes.contains(&session_id) {
-                    tracing::debug!(
-                        target: "tui.home",
-                        "Ignoring poller-reported sid {} for {}: in retroactive_capture_excludes",
-                        session_id,
-                        inst.id,
-                    );
-                    filtered_ids.insert(inst.id.clone());
-                    continue;
-                }
-                if inst.agent_session_id.as_deref() != Some(session_id.as_str()) {
-                    let expected_prior = inst.agent_session_id.clone();
-                    updates.push((inst.id.clone(), session_id, expected_prior));
-                }
-                continue;
-            }
-        }
-
-        if updates.is_empty() && filtered_ids.is_empty() {
+        let outcome = crate::session::sync::drain_and_persist_session_ids(
+            &mut self.instances,
+            &self.file_watch,
+        );
+        if !outcome.touched() {
             return false;
         }
-
-        let mut to_apply: Vec<(String, String)> = Vec::new();
-        let mut to_rollback: Vec<(String, Option<String>)> = Vec::new();
-
-        for (id, session_id, expected_prior) in &updates {
-            let Some(profile) = self.instance_map.get(id).map(|i| i.source_profile.clone()) else {
-                continue;
-            };
-            match crate::session::persist_session_to_storage(
-                &profile,
-                id,
-                session_id,
-                expected_prior.as_deref(),
-                &self.file_watch,
-            ) {
-                crate::session::SidWrite::Applied => {
-                    to_apply.push((id.clone(), session_id.clone()));
-                }
-                crate::session::SidWrite::Skipped => {
-                    let mut reloaded = false;
-                    if let Ok(storage) =
-                        crate::session::Storage::new(&profile, self.file_watch.clone())
-                    {
-                        if let Ok(disk_insts) = storage.load() {
-                            if let Some(disk_inst) = disk_insts.iter().find(|i| i.id == *id) {
-                                to_rollback.push((id.clone(), disk_inst.agent_session_id.clone()));
-                                reloaded = true;
-                            }
-                        }
-                    }
-                    if !reloaded {
-                        // Memory is known stale (Skipped CAS proved
-                        // memory != disk) and we cannot read disk.
-                        // Leave env at the poller's last write; the next
-                        // poller event reconciles.
-                        tracing::warn!(target: "tui.home",
-                            instance = %id,
-                            "Skipped reload failed; deferring env reconcile");
-                    }
-                }
-                crate::session::SidWrite::Failed => {
-                    // `on_change` published an unvalidated sid; republish memory.
-                    filtered_ids.insert(id.clone());
-                }
+        for id in outcome.applied.iter().chain(outcome.rolled_back.iter()) {
+            if let Some(inst) = self.instances.iter().find(|i| i.id == *id).cloned() {
+                self.instance_map.insert(id.clone(), inst);
             }
         }
-
-        for (id, session_id) in &to_apply {
-            self.mutate_instance(id, |inst| {
-                inst.agent_session_id = Some(session_id.clone());
-            });
-        }
-        for (id, disk_sid) in &to_rollback {
-            let disk_sid = disk_sid.clone();
-            self.mutate_instance(id, |inst| {
-                inst.agent_session_id = disk_sid.clone();
-            });
-        }
-
-        let touched_ids: Vec<&str> = to_apply
-            .iter()
-            .map(|(id, _)| id.as_str())
-            .chain(to_rollback.iter().map(|(id, _)| id.as_str()))
-            .chain(filtered_ids.iter().map(|s| s.as_str()))
-            .collect();
-        let mut set_batch: Vec<(String, String, String)> = Vec::new();
-        let mut unset_batch: Vec<(String, String)> = Vec::new();
-        for id in &touched_ids {
-            let Some(inst) = self.instance_map.get(*id) else {
-                continue;
-            };
-            // `s.exists()` reads a 2s-TTL cache; tests bypassing
-            // `Session::create` must call `refresh_session_cache()`.
-            let tmux_name = match inst.tmux_session() {
-                Ok(s) if s.exists() && !s.is_pane_dead() => s.name().to_string(),
-                Ok(_) => continue,
-                Err(e) => {
-                    tracing::warn!(target: "tui.home",
-                        instance = %id,
-                        "Skipping tmux env publish; tmux_session() error: {}", e);
-                    continue;
-                }
-            };
-            match &inst.agent_session_id {
-                Some(sid) => set_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    sid.clone(),
-                )),
-                None => unset_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                )),
-            }
-        }
-        if !set_batch.is_empty() {
-            let refs: Vec<(&str, &str, &str)> = set_batch
-                .iter()
-                .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
-                .collect();
-            if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
-                tracing::warn!(target: "tui.home", "Post-CAS env publish failed: {}", e);
-            }
-        }
-        if !unset_batch.is_empty() {
-            let refs: Vec<(&str, &str)> = unset_batch
-                .iter()
-                .map(|(s, k)| (s.as_str(), k.as_str()))
-                .collect();
-            if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-                tracing::warn!(target: "tui.home", "Post-CAS env unset failed: {}", e);
-            }
-        }
-
-        !to_apply.is_empty() || !to_rollback.is_empty()
+        !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
@@ -2344,13 +3157,13 @@ impl HomeView {
                                 "resumed",
                             );
                         }
-                        Ok(crate::session::StartOutcome::Restarted { stale_sid }) => {
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
                             tracing::warn!(
                                 target: "session.startup_recovery",
                                 id = %instance_id,
                                 %title,
-                                %stale_sid,
-                                "restarted fresh after resume failure",
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
                             );
                         }
                         Ok(crate::session::StartOutcome::Fresh) => {}
@@ -2391,56 +3204,163 @@ impl HomeView {
             self.recovery_in_flight.clear();
         }
         if touched {
-            self.instance_map = self
-                .instances
-                .iter()
-                .map(|i| (i.id.clone(), i.clone()))
-                .collect();
-            // Preserve the selection across the rebuild. Without this, a
-            // recovery completion that reorders rows under
-            // `SortOrder::LastActivity` (the recovered session's
-            // `last_start_time` shifted) would silently latch the
-            // selection onto a neighbour because `update_selected()`
-            // resolves through `flat_items[cursor]`. Mirrors the
-            // canonical sequence in `reload()`.
-            let prev_selected_session = self.selected_session.clone();
-            let prev_selected_group = self.selected_group.clone();
+            self.refresh_rows_preserving_selection();
+        }
+        touched
+    }
 
-            self.flat_items = self.build_flat_items();
+    /// Rebuild `instance_map` + `flat_items` after a background worker replaced
+    /// an `Instance` snapshot, preserving the current selection. Without the
+    /// selection restore, a completion that reorders rows (e.g. a shifted
+    /// `last_start_time` under `SortOrder::LastActivity`) would silently latch
+    /// the cursor onto a neighbour, since `update_selected()` resolves through
+    /// `flat_items[cursor]`. Mirrors the canonical sequence in `reload()`.
+    /// Shared by `apply_recovery_updates` and `apply_restart_results`.
+    fn refresh_rows_preserving_selection(&mut self) {
+        self.instance_map = self
+            .instances
+            .iter()
+            .map(|i| (i.id.clone(), i.clone()))
+            .collect();
+        let prev_selected_session = self.selected_session.clone();
+        let prev_selected_group = self.selected_group.clone();
 
-            let mut restored = false;
-            if let Some(ref sid) = prev_selected_session {
-                for (idx, item) in self.flat_items.iter().enumerate() {
-                    if let Item::Session { id, .. } = item {
-                        if id == sid {
-                            self.cursor = idx;
-                            restored = true;
-                            break;
-                        }
-                    }
-                }
-            } else if let Some(ref gpath) = prev_selected_group {
-                for (idx, item) in self.flat_items.iter().enumerate() {
-                    if let Item::Group { path, .. } = item {
-                        if path == gpath {
-                            self.cursor = idx;
-                            restored = true;
-                            break;
-                        }
+        self.flat_items = self.build_flat_items();
+
+        let mut restored = false;
+        if let Some(ref sid) = prev_selected_session {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Session { id, .. } = item {
+                    if id == sid {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
                     }
                 }
             }
-            if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
-                self.cursor = self.flat_items.len() - 1;
+        } else if let Some(ref gpath) = prev_selected_group {
+            for (idx, item) in self.flat_items.iter().enumerate() {
+                if let Item::Group { path, .. } = item {
+                    if path == gpath {
+                        self.cursor = idx;
+                        restored = true;
+                        break;
+                    }
+                }
             }
+        }
+        if !restored && self.cursor >= self.flat_items.len() && !self.flat_items.is_empty() {
+            self.cursor = self.flat_items.len() - 1;
+        }
 
-            if self.search_active && !self.search_query.value().is_empty() {
-                self.update_search();
-            } else if !self.search_matches.is_empty() {
-                self.refresh_search_matches();
+        if self.search_active && !self.search_query.value().is_empty() {
+            self.update_search();
+        } else if !self.search_matches.is_empty() {
+            self.refresh_search_matches();
+        }
+
+        self.update_selected();
+    }
+
+    /// Apply results from the restart poller. Writes the post-cascade `Instance`
+    /// snapshot back into memory (so `restart_with_size`'s mutations and the
+    /// `#[serde(skip)]` `last_start_time` survive), clears the in-flight marker,
+    /// and persists. A failed cascade or preserved resume-probe failure surfaces
+    /// as a "Restart Failed" dialog (the user explicitly initiated the restart).
+    /// Returns true if any instance changed.
+    pub fn apply_restart_results(&mut self) -> bool {
+        use crate::session::Status;
+        use std::sync::mpsc::TryRecvError;
+
+        let mut touched = false;
+        loop {
+            match self.restart_poller.try_recv_result() {
+                Ok(result) => {
+                    let crate::session::restart::RestartResult {
+                        session_id,
+                        before,
+                        mut instance,
+                        outcome,
+                    } = result;
+
+                    self.restart_in_flight.remove(&session_id);
+
+                    match outcome {
+                        Ok(crate::session::StartOutcome::ResumeFailed { sid }) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                %sid,
+                                "resume failed; sid preserved for explicit retry",
+                            );
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!(
+                                    "Resume failed for sid {sid}; preserved for explicit retry"
+                                ),
+                            ));
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "session.restart",
+                                id = %session_id,
+                                error = %e,
+                                "restart cascade failed",
+                            );
+                            instance.status = Status::Error;
+                            instance.last_error = Some(e.clone());
+                            // Surface it: a cascade failure now arrives async, so
+                            // the input handler's "Restart Failed" dialog can no
+                            // longer catch it (restart_selected_session returned
+                            // Ok once the work was enqueued).
+                            self.info_dialog = Some(InfoDialog::new(
+                                "Restart Failed",
+                                &format!("Could not restart session: {e}"),
+                            ));
+                        }
+                    }
+
+                    if let Some(slot) = self.instances.iter_mut().find(|i| i.id == session_id) {
+                        slot.merge_post_restart_with_baseline(&before, &instance);
+                        slot.last_error = if instance.status == Status::Error {
+                            instance.last_error.clone()
+                        } else {
+                            None
+                        };
+                        slot.last_error_check = instance.last_error_check;
+                        slot.last_start_time = instance.last_start_time;
+                        slot.retroactive_capture_excludes =
+                            instance.retroactive_capture_excludes.clone();
+                        touched = true;
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // The single worker thread is gone (a panic in
+                    // perform_restart dropped result_tx). Clear the in-flight set
+                    // defensively so the stuck rows fall back to the StatusPoller
+                    // (which marks them Error) instead of being filtered out of
+                    // polling forever by `pollable_instances`. Mirrors the
+                    // Disconnected handling in `apply_recovery_updates`.
+                    if !self.restart_in_flight.is_empty() {
+                        tracing::error!(
+                            target: "session.restart",
+                            "restart poller worker gone; clearing in-flight set",
+                        );
+                        self.restart_in_flight.clear();
+                        touched = true;
+                    }
+                    break;
+                }
             }
+        }
 
-            self.update_selected();
+        if touched {
+            self.refresh_rows_preserving_selection();
+            if let Err(e) = self.save() {
+                tracing::error!(target: "tui.home", "Failed to save after restart: {}", e);
+            }
         }
         touched
     }
@@ -2634,12 +3554,29 @@ impl HomeView {
                 .filter(|i| i.source_profile == data.profile)
                 .map(|i| i.title.as_str())
                 .collect();
-            data.title = crate::session::builder::resolve_title(
+            let existing_branches: Vec<&str> = self
+                .instances()
+                .iter()
+                .filter(|i| i.source_profile == data.profile)
+                .filter_map(|i| i.worktree_info.as_ref().map(|w| w.branch.as_str()))
+                .collect();
+            let taken_branches = crate::session::builder::collect_taken_branches_for_derived_dedupe(
+                &existing_branches,
+                &data.path,
+                &data.extra_repo_paths,
+                data.worktree_enabled,
+                data.create_new_branch,
+                data.scratch,
+            );
+            if let Ok(title) = crate::session::builder::resolve_title(
                 &data.title,
                 data.worktree_branch.as_deref(),
                 data.worktree_enabled,
                 &existing_titles,
-            );
+                &taken_branches,
+            ) {
+                data.title = title;
+            }
         }
         let stub_title = data.title.clone();
         let mut stub = Instance::new(&stub_title, &data.path);
@@ -2830,6 +3767,23 @@ impl HomeView {
                 if let Err(e) = self.reload() {
                     tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
                 }
+                // The creation poller may have minted `before_start_env` while
+                // bringing the container up. It is `#[serde(skip)]`, so the
+                // reload above dropped it; carry it back onto the live instance
+                // (mirroring the CLI's `merge_post_start` and the structured-view
+                // stamp-back) so the agent launch reuses it instead of re-minting.
+                let minted = instance
+                    .sandbox_info
+                    .as_mut()
+                    .map(|sb| std::mem::take(&mut sb.before_start_env))
+                    .unwrap_or_default();
+                if !minted.is_empty() {
+                    self.mutate_instance(&session_id, |inst| {
+                        if let Some(sb) = inst.sandbox_info.as_mut() {
+                            sb.before_start_env = minted.clone();
+                        }
+                    });
+                }
                 // reload()'s restore-previous-selection fallback lands
                 // the cursor on whichever flat_items index is closest
                 // to the now-removed stub, which in project-grouped
@@ -3018,6 +3972,13 @@ impl HomeView {
             }
         }
 
+        // Poll the plugin manager's in-flight discovery / update-check task.
+        if let Some(dialog) = &mut self.plugin_manager_dialog {
+            if dialog.tick() {
+                changed = true;
+            }
+        }
+
         // Drain hook progress into the creating buffer when no dialog is open
         if self.new_dialog.is_none() {
             if let Some(ref stub_id) = self.creating_stub_id {
@@ -3111,11 +4072,13 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -3150,11 +4113,13 @@ impl HomeView {
             || self.profile_picker_dialog.is_some()
             || self.project_session_picker_dialog.is_some()
             || self.projects_dialog.is_some()
+            || self.plugin_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
             || self.update_confirm_dialog.is_some()
             || self.telemetry_consent_dialog.is_some()
+            || self.tips_dialog.is_some()
             || serve_open
             || self.settings_view.is_some()
             || self.diff_view.is_some()
@@ -3202,33 +4167,101 @@ impl HomeView {
         self.save_list_width();
     }
 
-    /// Hide or reveal the session list so the preview pane can use the
-    /// full terminal width. Only meaningful while live mode is active
-    /// (the render path ignores the flag otherwise and `exit_live_send_*`
-    /// resets it), so this is deliberately ephemeral rather than persisted
-    /// to config. The next render reflows the preview, and the live-send
-    /// resize loop pushes the new geometry to the agent's pane.
+    /// Collapse the session list to a narrow click-to-expand strip, or
+    /// re-expand it. The next render reflows the preview into the freed
+    /// width; in live mode the resize loop pushes the new geometry to the
+    /// agent's pane. Persisted so the choice survives restarts.
     pub fn toggle_sidebar_collapsed(&mut self) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.save_sidebar_collapsed();
+    }
+
+    /// Load the persisted config, apply `mutate` to its `app_state`, and write
+    /// it back. Both the load and save failure paths are logged, so a
+    /// UI-preference write never fails silently in one persister while being
+    /// reported in another. Centralizes the load/mutate/save boilerplate the
+    /// home view's preference persisters would otherwise each repeat.
+    fn persist_app_state(
+        what: &str,
+        mutate: impl FnOnce(&mut crate::session::config::AppStateConfig),
+    ) {
+        match load_config() {
+            Ok(config) => {
+                let mut config = config.unwrap_or_default();
+                mutate(&mut config.app_state);
+                if let Err(e) = save_config(&config) {
+                    tracing::warn!(target: "tui.home", "Failed to save config ({what}): {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "tui.home", "Failed to load config for {what} save: {e}");
+            }
+        }
+    }
+
+    fn save_sidebar_collapsed(&self) {
+        let collapsed = self.sidebar_collapsed;
+        Self::persist_app_state("sidebar collapsed", |s| {
+            s.home_sidebar_collapsed = Some(collapsed)
+        });
     }
 
     fn save_list_width(&self) {
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.home_list_width = Some(self.list_width);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+        let width = self.list_width;
+        Self::persist_app_state("list width", |s| s.home_list_width = Some(width));
+    }
+
+    /// Folder paths that currently map to a real project-mode folder: the
+    /// project group of every live session (across all profiles, so switching
+    /// the active profile never prunes another profile's collapse state),
+    /// registered empty projects, and the per-project archived sub-folders.
+    /// Used to drop collapse entries for projects that no longer exist.
+    fn known_project_group_paths(&self) -> std::collections::HashSet<String> {
+        let mut paths = std::collections::HashSet::new();
+        for inst in &self.instances {
+            let group = project_group_name(inst);
+            if group.is_empty() {
+                continue;
+            }
+            if inst.is_archived() {
+                paths.insert(crate::session::archived_project_sub_path(&group));
+            } else {
+                paths.insert(group);
             }
         }
+        for project in &self.registered_projects {
+            // Only pinned registered projects surface as empty folder headers,
+            // keyed by repo label (mirroring `unpopulated_projects`).
+            if project.pinned {
+                paths.insert(crate::session::projects::repo_label(&project.path));
+            }
+        }
+        paths
+    }
+
+    /// Persist the set of collapsed project-mode folders. Stored sorted for a
+    /// stable on-disk order; only collapsed paths are written, so re-expanding a
+    /// folder drops it from the list. Paths for projects that no longer exist
+    /// are pruned here so the persisted set can't grow without bound as projects
+    /// come and go.
+    fn save_project_group_collapsed(&self) {
+        let known = self.known_project_group_paths();
+        let mut collapsed: Vec<String> = self
+            .project_group_collapsed
+            .iter()
+            .filter(|(path, &c)| c && known.contains(path.as_str()))
+            .map(|(path, _)| path.clone())
+            .collect();
+        collapsed.sort();
+        Self::persist_app_state("project group collapsed", |s| {
+            s.project_group_collapsed = collapsed
+        });
     }
 
     pub fn toggle_preview_info(&mut self) {
         self.show_preview_info = !self.show_preview_info;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.show_preview_info = Some(self.show_preview_info);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let show = self.show_preview_info;
+        Self::persist_app_state("preview info", |s| s.show_preview_info = Some(show));
     }
 
     /// Forget the last non-live preview resize so the next render re-asserts the
@@ -3240,30 +4273,42 @@ impl HomeView {
     }
 
     /// Expand the synthetic Archived section if it is collapsed, persisting
-    /// the change. Used when archiving a session in the non-Attention sort so
-    /// the freshly archived row is visible and can stay selected under the
-    /// cursor. No-op (and no save) when the section is already open.
+    /// the change. Used when archiving a whole group, where the rows the
+    /// user was looking at all sink at once and revealing the section shows
+    /// where they went. Single-row archive does NOT reveal: the cursor
+    /// advances to the next active session instead and the section header's
+    /// count is the feedback. No-op (and no save) when already open.
     pub(super) fn reveal_archived_section(&mut self) {
         if !self.archived_section_collapsed {
             return;
         }
         self.archived_section_collapsed = false;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.archived_section_collapsed = Some(false);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
+        Self::persist_app_state("archived section", |s| {
+            s.archived_section_collapsed = Some(false)
+        });
+    }
+
+    /// Expand the synthetic Trash section if collapsed. Used when trashing a
+    /// session so the user sees where the row went. No-op when already open.
+    pub(super) fn reveal_trashed_section(&mut self) {
+        self.trashed_section_collapsed = false;
+    }
+
+    pub fn toggle_trashed_section(&mut self) {
+        self.trashed_section_collapsed = !self.trashed_section_collapsed;
+        self.flat_items = self.build_flat_items();
+        if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
+            self.cursor = self.flat_items.len() - 1;
         }
+        self.update_selected();
     }
 
     pub fn toggle_archived_section(&mut self) {
         self.archived_section_collapsed = !self.archived_section_collapsed;
-        if let Ok(mut config) = load_config().map(|c| c.unwrap_or_default()) {
-            config.app_state.archived_section_collapsed = Some(self.archived_section_collapsed);
-            if let Err(e) = save_config(&config) {
-                tracing::warn!(target: "tui.home", "Failed to save config: {e}");
-            }
-        }
+        let collapsed = self.archived_section_collapsed;
+        Self::persist_app_state("archived section", |s| {
+            s.archived_section_collapsed = Some(collapsed)
+        });
         self.flat_items = self.build_flat_items();
         // Defensive cursor clamp + selection refresh. Today the only
         // call site routes through `toggle_group_collapsed` after the
@@ -3379,6 +4424,7 @@ impl HomeView {
             };
             let mut items = flatten_sessions_by_attention(&filtered);
             append_archived_section(&mut items, &filtered, self.archived_section_collapsed);
+            append_trash_section(&mut items, &filtered, self.trashed_section_collapsed);
             return items;
         }
 
@@ -3407,6 +4453,8 @@ impl HomeView {
         // Pin the synthetic Archived section to the bottom of the active view
         // regardless of sort order.
         append_archived_section(&mut items, &archive_pool, self.archived_section_collapsed);
+        // Trash sits below Archived, also pinned to the bottom.
+        append_trash_section(&mut items, &archive_pool, self.trashed_section_collapsed);
         items
     }
 
@@ -3441,7 +4489,7 @@ impl HomeView {
         // automatic"), leaving the user no way to clear it.
         let tree_seed: Vec<Instance> = grouped
             .iter()
-            .filter(|i| !i.is_archived())
+            .filter(|i| !i.is_archived() && !i.is_trashed())
             .cloned()
             .collect();
 
@@ -3478,6 +4526,9 @@ impl HomeView {
             &self.project_group_collapsed,
             self.sort_order,
         );
+        // Trash is a flat shelf even in project mode (recovery list, not a
+        // workspace), pinned below the Archived section.
+        append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
         items
     }
 
@@ -3500,14 +4551,32 @@ impl HomeView {
                 );
             }
             self.storages.retain(|name, _| name == &profile);
-            self.rewire_disk_subscriptions(std::slice::from_ref(&profile))?;
+            self.rewire_disk_subscriptions(std::slice::from_ref(&profile));
         }
+        // Reconcile config-watch subscriptions explicitly so this contract
+        // is local to switch_profile rather than implicit through
+        // reload_storage_only's transitive call. Idempotent set-diff: the
+        // global subscription is install-once and per-profile entries
+        // converge to the on-disk profile set; redundant invocations are
+        // no-ops.
+        let config_targets = match crate::session::list_profiles() {
+            Ok(profiles) => profiles,
+            Err(e) => {
+                tracing::warn!(
+                    target: "tui.file_watch",
+                    error = %e,
+                    "list_profiles failed during switch_profile; reusing loaded storages for config rewire"
+                );
+                self.storages.keys().cloned().collect()
+            }
+        };
+        self.rewire_config_subscriptions(&config_targets);
         // Clear selection before reload so stale session/group refs don't linger
         self.selected_session = None;
         self.selected_group = None;
         self.selected_group_profile = None;
         self.reload()?;
-        self.refresh_from_config();
+        self.refresh_from_config(ConfigRefreshOrigin::Interactive);
         // Invalidate preview caches since the visible sessions changed
         self.preview_cache = PreviewCache::default();
         self.terminal_preview_cache = PreviewCache::default();
@@ -3638,10 +4707,7 @@ impl HomeView {
     /// the keystrokes. Errors are surfaced via `info_dialog` so the caller
     /// (`execute_action`) only has to clear its transient status.
     ///
-    /// Returns `Some(stale_sid)` when the resume-fallback cascade fired
-    /// during the implicit respawn so the caller can toast the user about
-    /// the lost history; `None` otherwise.
-    pub fn execute_send_message(&mut self, session_id: &str, message: &str) -> Option<String> {
+    pub fn execute_send_message(&mut self, session_id: &str, message: &str) {
         let target = std::mem::replace(
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
@@ -3654,25 +4720,26 @@ impl HomeView {
         // live-send does (see `ensure_pane_ready_with_size`): otherwise it
         // boots at tmux's 80x24 default and runs narrow until something
         // resizes it.
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(size).map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
-                    Ok(_) => None,
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Send Failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return;
+                    }
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Send Failed",
                             &format!("Cannot prepare session: {}", err),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -3682,9 +4749,8 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -3692,12 +4758,17 @@ impl HomeView {
                         "Send Failed",
                         &format!("Cannot prepare container terminal: {}", e),
                     ));
-                    return None;
+                    return;
                 }
-                None
             }
         };
-        let inst = self.get_instance(session_id)?;
+        let Some(inst) = self.get_instance(session_id) else {
+            self.info_dialog = Some(InfoDialog::new(
+                "Send Failed",
+                "Session disappeared before the message could be sent.",
+            ));
+            return;
+        };
         let tmux_session = match target {
             live_send::LiveSendTarget::Agent => {
                 match crate::tmux::Session::new(&inst.id, &inst.title) {
@@ -3707,7 +4778,7 @@ impl HomeView {
                             "Send Failed",
                             &format!("Failed to resolve session: {}", e),
                         ));
-                        return None;
+                        return;
                     }
                 }
             }
@@ -3730,7 +4801,7 @@ impl HomeView {
                 "Send Failed",
                 &format!("Failed to send message: {}", e),
             ));
-            return None;
+            return;
         }
         self.stamp_last_accessed(session_id);
         if let Err(e) = self.save() {
@@ -3740,7 +4811,6 @@ impl HomeView {
             self.select_top_attention(None);
             self.selected_session = None;
         }
-        stale_sid
     }
 
     /// Size to boot a cold/dead agent pane at on live-send entry: the visible
@@ -3779,11 +4849,9 @@ impl HomeView {
     /// the post-toast frame, and the agent's first capture rendered
     /// shifted up.
     ///
-    /// Returns `Ok(Some(stale_sid))` when the resume-fallback cascade
-    /// fired during respawn, `Ok(None)` on a clean ready, and `Err(())`
-    /// if the pane could not be readied (`info_dialog` is set with the
-    /// underlying error so the caller only has to clear its toast).
-    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<Option<String>, ()> {
+    /// Returns `Err(())` if the pane could not be readied (`info_dialog` is
+    /// set with the underlying error so the caller only has to clear its toast).
+    pub fn prepare_live_send(&mut self, session_id: &str) -> Result<(), ()> {
         let target = self.pending_live_send_target;
         self.pending_live_send_target = live_send::LiveSendTarget::Agent;
         let size = crate::terminal::get_size();
@@ -3800,20 +4868,21 @@ impl HomeView {
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
         let agent_boot_size = self.live_send_boot_size();
-        let stale_sid = match target {
+        match target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
                     inst.ensure_pane_ready_with_size(agent_boot_size)
                         .map_err(Into::into)
                 });
                 match outcome {
-                    Ok(Some(EnsureReadyOutcome::Respawned {
-                        stale_sid: Some(sid),
-                    }))
-                    | Ok(Some(EnsureReadyOutcome::Started {
-                        stale_sid: Some(sid),
-                    })) => Some(sid),
-                    Ok(_) => None,
+                    Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Live send failed",
+                            &format!("Resume failed for sid {sid}; preserved for explicit retry"),
+                        ));
+                        return Err(());
+                    }
+                    Ok(_) => {}
                     Err(err) => {
                         self.info_dialog = Some(InfoDialog::new(
                             "Live send failed",
@@ -3831,7 +4900,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
             live_send::LiveSendTarget::ContainerTerminal => {
                 if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
@@ -3841,7 +4909,6 @@ impl HomeView {
                     ));
                     return Err(());
                 }
-                None
             }
         };
         let inst = match self.get_instance(session_id) {
@@ -3950,6 +5017,9 @@ impl HomeView {
             exit_chords,
             leader,
         });
+        // Entering live-send means the user is now viewing this session, so
+        // clear any unread marker.
+        self.clear_unread_on_view(&inst.id);
         // Ensure the long-lived preview capture worker exists so we can hand
         // its waker to the send worker below. The worker isn't otherwise
         // spawned here (it follows the displayed pane for every view, not
@@ -3988,7 +5058,7 @@ impl HomeView {
         // preview dedup so exiting re-asserts the preview geometry cleanly.
         self.preview_pane_synced = None;
         self.stamp_last_accessed(session_id);
-        Ok(stale_sid)
+        Ok(())
     }
 
     /// Synchronously resize the live-send pane to match `self.preview_pane_area`,
@@ -4255,6 +5325,16 @@ impl HomeView {
     /// rows from peer-deleted ones (which look identical at the disk
     /// layer: missing from sessions.json).
     pub(super) fn add_instance(&mut self, instance: Instance) {
+        // Count only finalized session inserts for the opt-in create-trend
+        // counter (#1897). `add_instance` is also the funnel for `Creating`
+        // placeholder stubs in the async creation flow (removed and replaced by
+        // the real row on success), so counting every call would double-count a
+        // successful background create and count a cancelled one that never
+        // finalized. A real create is never `Creating`. Mirrors the serve side's
+        // single increment in `create_session`; no-op when not opted in.
+        if instance.status != crate::session::Status::Creating {
+            super::app::record_session_create();
+        }
         self.pending_added
             .entry(instance.source_profile.clone())
             .or_default()
@@ -4425,6 +5505,80 @@ impl HomeView {
         }
     }
 
+    /// Clear the unread marker because the user engaged with the session
+    /// (Tab into live-send, Enter to attach, or dwell on it in the list).
+    /// Runs regardless of the feature flag so a stale marker can't survive a
+    /// disable/re-enable and reappear later; only writes when the session is
+    /// actually unread, so an already-read session doesn't churn the storage
+    /// flock.
+    pub(crate) fn clear_unread_on_view(&mut self, id: &str) {
+        // Engaging with the row ends its manual-flag visit, so drop any hold;
+        // otherwise a stale hold could later suppress an auto mark on this row.
+        if self.manual_unread_hold.as_deref() == Some(id) {
+            self.manual_unread_hold = None;
+        }
+        let is_unread = self.get_instance(id).is_some_and(|i| i.is_unread());
+        if is_unread {
+            let _ = self.apply_user_action(id, |i| i.mark_read());
+        }
+    }
+
+    /// Dwell-to-read: clear the selected session's unread marker once it has
+    /// stayed selected, with the list in the foreground, for `UNREAD_DWELL`.
+    /// This is what separates "scrolled past it" from "stopped to read it."
+    /// Driven from the app tick loop; returns true when it cleared a marker
+    /// (so the caller can request a redraw).
+    ///
+    /// The clock is suspended (and reset) whenever the feature is off, a
+    /// dialog or live-send is up (the list isn't being read then), or nothing
+    /// is selected, and it restarts whenever the selection moves to a
+    /// different row. A row the user just flagged unread by hand is held until
+    /// the cursor leaves it (`manual_unread_hold`), so flagging it and sitting
+    /// there doesn't instantly undo the mark; once you leave and come back, it
+    /// clears on dwell like any other unread row.
+    pub fn tick_unread_dwell(&mut self, now: std::time::Instant) -> bool {
+        if !crate::session::unread_enabled() || self.has_dialog() {
+            self.unread_dwell = None;
+            return false;
+        }
+        let Some(id) = self.selected_session.clone() else {
+            self.unread_dwell = None;
+            return false;
+        };
+        // The manual hold only protects the row while it stays selected; the
+        // moment the cursor moves elsewhere, release it so a later return reads
+        // normally.
+        if self
+            .manual_unread_hold
+            .as_deref()
+            .is_some_and(|held| held != id)
+        {
+            self.manual_unread_hold = None;
+        }
+        let started = match &self.unread_dwell {
+            Some((prev, started)) if *prev == id => *started,
+            // First tick on this row (or selection moved): start the clock.
+            _ => {
+                self.unread_dwell = Some((id, now));
+                return false;
+            }
+        };
+        if now.duration_since(started) < UNREAD_DWELL {
+            return false;
+        }
+        // A row the user just flagged by hand is held for this visit, so the
+        // dwell doesn't undo the mark while they sit on it. The clock stays
+        // parked on this row either way so we don't re-evaluate every tick.
+        if self.manual_unread_hold.as_deref() == Some(id.as_str()) {
+            return false;
+        }
+        if self.get_instance(&id).is_some_and(|i| i.is_unread()) {
+            self.clear_unread_on_view(&id);
+            return true;
+        }
+        false
+    }
+
     /// Bulk `apply_user_action`: one `Storage::update` per affected
     /// profile (single flock cycle), grouping ids by `source_profile`.
     pub(super) fn bulk_apply_user_action<F>(
@@ -4514,15 +5668,12 @@ impl HomeView {
     /// when `f` returns `Err`.
     ///
     /// Required for callers of `Instance::restart_with_size_opts` /
-    /// `ensure_pane_ready`, because the resume-fallback cascade mutates
-    /// `agent_session_id` and `retroactive_capture_excludes` BEFORE
-    /// returning `Err` on Tier-2 failure. The default `try_mutate_instance`
-    /// drops the mutated clone on `Err`, leaving the live entry with the
-    /// stale sid in memory while disk has been cleared. Subsequent restarts
-    /// then loop indefinitely on the same bad sid (the TUI's `reload()`
-    /// merge prefers in-memory, so even the 5s disk refresh does not
-    /// recover). This helper preserves the cascade's partial mutations so
-    /// the live state stays consistent with disk.
+    /// `ensure_pane_ready`, because the resume path can mutate
+    /// `agent_session_id`, `resume_probe_failed_sid`, and
+    /// `retroactive_capture_excludes` before returning `Err`. The default
+    /// `try_mutate_instance` drops the mutated clone on `Err`, leaving live
+    /// state inconsistent with disk until a later reload. This helper keeps
+    /// the live state consistent with the attempted restart.
     pub(super) fn try_mutate_instance_writeback_on_err<T>(
         &mut self,
         id: &str,
@@ -4720,22 +5871,25 @@ impl HomeView {
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
-    /// Whether the project-view header `label` is backed by a registered
-    /// (pinned) project. A header with live sessions is pinned iff its own repo
-    /// path is in the registry, so two repos sharing a basename are judged
-    /// independently. An empty header exists only because a registered project
-    /// carries that basename, so it is pinned by construction (matched by
-    /// label). Used for the pin indicator and the pin toggle.
+    /// Whether the project-view header `label` is backed by a registered AND
+    /// pinned project. A registry entry is the "saved project"; the `pinned`
+    /// flag is the separate decision to keep its header visible (#2208), so a
+    /// saved-but-unpinned repo reads as not pinned (no glyph; the toggle pins
+    /// it). A header with live sessions is pinned iff its own repo path is a
+    /// pinned entry, so two repos sharing a basename are judged independently.
+    /// An empty header exists only because a pinned project carries that
+    /// basename, so the label match still requires the flag. Used for the pin
+    /// indicator and the pin toggle.
     pub(super) fn is_project_label_pinned(&self, label: &str) -> bool {
         match self.project_header_repo_path(label) {
             Some(path) => self
                 .registered_projects
                 .iter()
-                .any(|p| crate::session::projects::canonical_key(&p.path) == path),
+                .any(|p| p.pinned && crate::session::projects::canonical_key(&p.path) == path),
             None => self
                 .registered_projects
                 .iter()
-                .any(|p| crate::session::projects::repo_label(&p.path) == label),
+                .any(|p| p.pinned && crate::session::projects::repo_label(&p.path) == label),
         }
     }
 
@@ -4749,7 +5903,9 @@ impl HomeView {
         }
         match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, name, .. })
-                if !crate::session::is_within_archived_section(path) && name != "scratch" =>
+                if !crate::session::is_within_archived_section(path)
+                    && !crate::session::is_within_trash_section(path)
+                    && name != "scratch" =>
             {
                 Some(name.clone())
             }
@@ -4906,11 +6062,58 @@ impl HomeView {
         }
     }
 
-    /// Refresh all config-dependent state from the current profile's config.
-    /// Call this after settings are saved to pick up any changes.
-    pub fn refresh_from_config(&mut self) {
+    /// Refresh config-derived state for the active profile (Interactive
+    /// path). Uses the lenient `resolve_config_or_warn` so transient
+    /// parse errors fall back to defaults; user-initiated callers
+    /// tolerate that because the next save will fix it. The watcher
+    /// path uses `try_refresh_from_config_watcher` instead, which
+    /// preserves previous in-memory state on parse failure rather than
+    /// silently applying defaults.
+    pub(super) fn refresh_from_config(&mut self, origin: ConfigRefreshOrigin) {
         let profile = self.config_profile();
         let config = resolve_config_or_warn(&profile);
+        self.apply_config_to_state(config, origin);
+    }
+
+    /// Watcher-path counterpart of `refresh_from_config`. Returns Err on
+    /// TOML parse failure for the active profile so the tick loop can
+    /// preserve the previous in-memory active config rather than silently
+    /// flipping safety-affecting settings (e.g. `confirm_before_quit`)
+    /// to defaults. The Err is consumed by `handle_tick_reload_config` in
+    /// `App::run` and surfaced in the aggregated reload-failure dialog.
+    ///
+    /// Peer profile coverage: `apply_config_to_state` calls
+    /// `refresh_status_hook_config_cache` which loads status_hook
+    /// configs for every storage'd profile, so a peer-process edit to
+    /// any `<profile>/config.toml` updates the visible status-hook
+    /// state even in unified mode. Peer-profile status_hooks load
+    /// through the lenient `resolve_config_or_warn` and fall back to
+    /// `Default::default()` on parse error; the strict-resolve
+    /// guarantee applies to the active profile only.
+    ///
+    /// Error attribution: `resolve_config` loads the global
+    /// `<app_dir>/config.toml` first then merges per-profile overrides,
+    /// so a Reload Failed dialog body rendered from this path can name
+    /// a global parse error even when the watcher fired for a
+    /// per-profile edit. `toml::de::Error` renders line and column
+    /// without the source file path.
+    pub(super) fn try_refresh_from_config_watcher(&mut self) -> anyhow::Result<()> {
+        let new_count = self
+            .watcher_config_refresh_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.maybe_export_watcher_refresh_count(new_count);
+        let profile = self.config_profile();
+        let config = crate::session::resolve_config(&profile)?;
+        self.apply_config_to_state(config, ConfigRefreshOrigin::Watcher);
+        Ok(())
+    }
+
+    fn apply_config_to_state(
+        &mut self,
+        config: crate::session::Config,
+        origin: ConfigRefreshOrigin,
+    ) {
         self.default_terminal_mode = match config.sandbox.default_terminal_mode {
             DefaultTerminalMode::Host => TerminalMode::Host,
             DefaultTerminalMode::Container => TerminalMode::Container,
@@ -4925,14 +6128,79 @@ impl HomeView {
         self.idle_decay_window =
             crate::tui::styles::idle_decay_window(config.theme.idle_decay_minutes);
         self.show_branch_in_tui = config.worktree.show_branch_in_tui;
+        crate::session::set_unread_enabled(config.session.unread_indicator);
+        self.tips_unseen = tips_unseen_count(&config);
         self.tool_configs = config.tools;
         self.tool_hotkey_cache = input::build_tool_hotkey_cache(&self.tool_configs);
         let hotkey_warnings = input::validate_tool_hotkeys(&self.tool_configs);
-        if !hotkey_warnings.is_empty() && self.info_dialog.is_none() {
+        if matches!(origin, ConfigRefreshOrigin::Interactive)
+            && !hotkey_warnings.is_empty()
+            && self.info_dialog.is_none()
+        {
             self.info_dialog = Some(InfoDialog::new(
                 "Tool hotkey config errors",
                 &hotkey_warnings.join("\n"),
             ));
+        }
+        // Watcher path: stash for tick-loop dispatch (App owns theme state).
+        // Reads via `resolve_theme_name` (global-only by contract), not
+        // `config.theme.name` which would carry a stale per-profile override.
+        // Guard is load-bearing: Interactive already returns
+        // `Action::SetTheme` directly from input handlers, so stashing
+        // unconditionally would double-dispatch on every settings save.
+        // Note: `resolve_theme_name` swallows read errors via `load_or_warn`
+        // and falls back to "zinc"; a peer write landing between the
+        // `resolve_config` above and this call momentarily flips the theme
+        // and the next watcher event recovers. Diverges from the
+        // "preserve prior state on Err" contract honored by other fields
+        // here; acceptable since `set_theme` is idempotent and the race
+        // window is microseconds wide.
+        if matches!(origin, ConfigRefreshOrigin::Watcher) {
+            self.pending_watcher_theme = Some(crate::session::config::resolve_theme_name());
+        }
+    }
+
+    /// Drain the theme name stashed by `apply_config_to_state` on the
+    /// Watcher path. The tick loop in `App::run` calls this after
+    /// `try_refresh_from_config_watcher` and dispatches the result to
+    /// `App::set_theme`. Returns `None` outside the watcher path or
+    /// after a previous take in the same tick.
+    pub(super) fn take_pending_watcher_theme(&mut self) -> Option<String> {
+        self.pending_watcher_theme.take()
+    }
+
+    /// Export the watcher-config-refresh counter to a hidden file in
+    /// the app dir when `AOE_E2E_DEBUG=1` is set on the TUI process.
+    /// The file (`<app_dir>/.aoe_e2e_refresh_count`) is polled by the
+    /// e2e harness as a deterministic completion signal for the
+    /// watcher path. Production builds and non-e2e test runs never
+    /// set the env var, so the file is never written. Write failures
+    /// fall through to a `tracing::trace!`; the file is debug-only,
+    /// so a missing write surfaces as a harness poll timeout rather
+    /// than a hard error on the TUI side.
+    fn maybe_export_watcher_refresh_count(&self, count: u64) {
+        if std::env::var("AOE_E2E_DEBUG").as_deref() != Ok("1") {
+            return;
+        }
+        let app_dir = match crate::session::get_app_dir() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::trace!(
+                    target: "tui.e2e_debug",
+                    error = %e,
+                    "AOE_E2E_DEBUG export skipped; app dir resolution failed"
+                );
+                return;
+            }
+        };
+        let path = app_dir.join(".aoe_e2e_refresh_count");
+        if let Err(e) = std::fs::write(&path, count.to_string()) {
+            tracing::trace!(
+                target: "tui.e2e_debug",
+                error = %e,
+                path = %path.display(),
+                "AOE_E2E_DEBUG export failed"
+            );
         }
     }
 

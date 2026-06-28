@@ -266,6 +266,8 @@ fn with_sandbox(mut inst: Instance, enabled: bool) -> Instance {
         container_name: "aoe_secret_container".to_string(),
         extra_env: None,
         custom_instruction: None,
+        before_start_env: Vec::new(),
+        container_workdir: None,
     });
     inst
 }
@@ -708,7 +710,6 @@ fn snapshot_carries_acp_interaction_counts() {
         approvals_allow_always: 0,
         approvals_deny: 1,
         agent_switches: 1,
-        view_toggles: 2,
         plan_mode_seen: true,
         prompts_queued: 1,
     };
@@ -728,10 +729,9 @@ fn snapshot_carries_acp_interaction_counts() {
     assert_eq!(snap.approvals_by_decision.get("deny"), Some(&1));
     assert!(!snap.approvals_by_decision.contains_key("allow_always"));
     assert_eq!(snap.agent_switches, 1);
-    assert_eq!(snap.view_toggles, 2);
     assert!(snap.plan_mode_seen);
     assert_eq!(snap.prompts_queued, 1);
-    // Schema version bumped for the v8 field set.
+    // Confirm the snapshot uses the current schema version.
     assert_eq!(snap.schema, telemetry::SCHEMA_VERSION);
 }
 
@@ -750,7 +750,6 @@ fn acp_interaction_payload_is_counts_and_allowlisted_keys_only() {
         approvals_allow_always: 4,
         approvals_deny: 5,
         agent_switches: 6,
-        view_toggles: 7,
         plan_mode_seen: true,
         prompts_queued: 8,
     };
@@ -777,12 +776,7 @@ fn acp_interaction_payload_is_counts_and_allowlisted_keys_only() {
     let obj = json.as_object().expect("snapshot is a JSON object");
 
     // The structured-interaction fields are all integers or a bool, never strings.
-    for field in [
-        "approvals_resolved",
-        "agent_switches",
-        "view_toggles",
-        "prompts_queued",
-    ] {
+    for field in ["approvals_resolved", "agent_switches", "prompts_queued"] {
         assert!(
             obj.get(field).and_then(serde_json::Value::as_u64).is_some(),
             "`{field}` must serialize as a count"

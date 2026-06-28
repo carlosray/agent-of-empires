@@ -55,10 +55,8 @@ export interface SessionResponse {
    *  `isPinned = pinned_at != null` client-side; no separate boolean is
    *  exposed (the timestamp itself is the source of truth). See #1581. */
   pinned_at?: string | null;
-  /** RFC3339 timestamp at which the session was archived, or null /
-   *  undefined when not archived. Archived workspaces sink into the
-   *  collapsible "Snoozed & archived" footer of their repo group and
-   *  their tmux pane is killed by the archive handler. See #1581. */
+  /** RFC3339 timestamp; null when not archived. Sinks into "Snoozed &
+   *  archived"; archive tears down all tmux. See #1581, #1868. */
   archived_at?: string | null;
   /** RFC3339 timestamp at which an active snooze expires, or null /
    *  undefined when not snoozed. The server gates this on
@@ -66,7 +64,25 @@ export interface SessionResponse {
    *  comes back as null on the wire; the web therefore only needs to
    *  treat any non-null value as an active snooze. See #1581. */
   snoozed_until?: string | null;
+  /** RFC3339 timestamp at which the session was moved to trash, or null /
+   *  undefined when not trashed. Trashed sessions are bucketed into a
+   *  dedicated Trash section with restore and permanent-delete actions; they
+   *  are excluded from the active and archived buckets. See #2489. */
+  trashed_at?: string | null;
+  /** Unread marker mirroring `Instance::unread`: `true` when the session
+   *  needs attention (a finished turn the user hasn't engaged with, or a
+   *  manual flag), false / undefined when read. The sidebar paints an unread
+   *  accent and offers a right-click "Mark as read/unread" toggle, both gated
+   *  on the `session.unread_indicator` setting. The chip is suppressed for the
+   *  session currently open, which also clears the marker. */
+  unread?: boolean;
   has_managed_worktree: boolean;
+  /** True when deleting this session has aoe-managed worktree state to clean
+   *  up, covering single-repo worktrees AND multi-repo workspaces. Only the
+   *  delete dialog's worktree/branch checkboxes read this; worktree-only
+   *  actions (Edit workdir) keep reading `has_managed_worktree`. Always sent
+   *  by the server; optional only so existing test fixtures need not set it. */
+  has_cleanable_worktree?: boolean;
   /** True when renaming this session also moves its worktree directory (the
    *  resolved `session.tie_workdir_to_name` for an aoe-managed worktree). The
    *  sidebar uses this to collapse the standalone "edit workdir name" action
@@ -90,6 +106,18 @@ export interface SessionResponse {
    *  the supervisor holds a live worker. Drives the sidebar `Resuming…`
    *  chip and the per-session banner in the acp view. See #1088. */
   acp_worker_state?: AcpWorkerState;
+  /** Smart-rename indicator for structured view sessions. `pending`: still
+   *  default-named and eligible, will auto-name on the next prompt; `running`:
+   *  a one-shot title call is in flight; `inactive`/absent otherwise. Drives
+   *  the sidebar auto-name chip. See session::smart_rename. */
+  smart_rename?: "inactive" | "pending" | "running";
+  /** True when the session still carries its auto-generated civilization name.
+   *  Gates the sidebar "Auto-name now" action, which only re-runs smart rename
+   *  on a still-default session. More reliable than `smart_rename` for this: a
+   *  timed-out one-shot stays `pending` while an unusable-output one goes
+   *  `inactive`, but both leave the name default and recoverable. Populated by
+   *  the session list; absent on single-session responses. */
+  default_name?: boolean;
   /** True when this session's agent can run in acp: a built-in with
    *  an ACP adapter, or a custom agent whose profile config declares a
    *  valid `agent_acp_cmd`. The terminal view's "switch to acp"
@@ -119,6 +147,13 @@ export interface SessionResponse {
   /** Reason the agent provided when scheduling the wakeup. Only set
    *  when `next_wakeup_at` is also set. */
   next_wakeup_reason?: string;
+  /** True when the acp session has an armed `Monitor` (a background
+   *  watch). Drives a static "monitoring" sidebar badge. Cleared once a
+   *  fresh user prompt lands after the monitor was armed. */
+  monitor_active?: boolean;
+  /** The `description` the agent gave the `Monitor` tool, shown as the
+   *  badge tooltip. Only set when `monitor_active` is true. */
+  monitor_description?: string;
 }
 
 export interface PlanSummary {
@@ -140,6 +175,9 @@ export interface CleanupDefaults {
   delete_worktree: boolean;
   delete_branch: boolean;
   delete_sandbox: boolean;
+  /** Resolved `session.delete_to_trash`: the delete dialog defaults to
+   *  "Move to Trash" when true, permanent delete when false. See #2489. */
+  delete_to_trash: boolean;
 }
 
 
@@ -163,6 +201,13 @@ export interface ResizeMessage {
 
 export interface ActivateMessage {
   type: "activate";
+}
+
+/** Explicit take-over of the cross-surface size lock (banner click).
+ *  Separate from `activate`, which also fires on mount and must not
+ *  steal the size from a live owner on another device. */
+export interface ClaimMessage {
+  type: "claim";
 }
 
 /** Pause the pane's foreground process (SIGSTOP). Sent by mobile web
@@ -205,7 +250,7 @@ export interface TimingPongMessage {
 export interface RichDiffFile {
   path: string;
   old_path: string | null;
-  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted";
+  status: "added" | "modified" | "deleted" | "renamed" | "copied" | "untracked" | "conflicted" | "unchanged";
   additions: number;
   deletions: number;
   /** Workspace repo this file belongs to. Omitted for single-repo
@@ -282,6 +327,12 @@ export interface RepoGroup {
   workspaces: Workspace[];
   status: WorkspaceStatus;
   collapsed: boolean;
+  /** Registry entries (the "pin") for this repo path, keyed by normalized
+   *  path. Empty when the repo is not pinned. More than one entry means the
+   *  same path is registered under multiple scopes (global + profile); the
+   *  group is rendered pinned and unpin removes every entry. A group with
+   *  entries but no workspaces is a pinned-but-empty project. See #2047. */
+  registeredProjects: ProjectInfo[];
 }
 
 /** Workspace: a group of sessions sharing the same project + branch */
@@ -304,11 +355,19 @@ export interface AgentInfo {
   host_only: boolean;
   installed: boolean;
   install_hint: string;
+  /** True when the agent has a one-shot mode (so it can run the smart-rename
+   *  title call). The settings smart-rename agent picker filters on this
+   *  together with `installed`. Always false for custom agents. Optional so
+   *  existing test fixtures need not set it; the backend always sends it. */
+  oneshot_capable?: boolean;
   /** True when the agent can run in acp: a built-in with an ACP
    *  adapter, or a custom agent that declares a valid `agent_acp_cmd`.
    *  The wizard reads this to decide whether a new session runs in
    *  acp or tmux, replacing the hardcoded client-side tool list. */
   acp_capable: boolean;
+  /** True when the agent's ACP adapter binary is actually resolvable on the
+   *  host (not just registered). The import tab gates on this for claude. */
+  acp_installed: boolean;
   /** The ACP command a built-in agent launches in acp (e.g.
    *  `claude-agent-acp`, `opencode`), post `${aoe_data_dir}`
    *  substitution. Can differ from `binary`. Absent for custom agents,
@@ -377,6 +436,10 @@ export interface ProjectInfo {
   scope: "global" | "profile";
   /** Default base branch for new worktree branches against this project's repo. */
   default_base_branch?: string;
+  /** Whether the project is pinned: shown as a sessionless sidebar header. A
+   *  registry entry is the saved project; the pin is the separate decision to
+   *  keep its header visible without sessions. See #2208. */
+  pinned: boolean;
 }
 
 /** Docker status returned by /api/docker/status */
@@ -425,6 +488,20 @@ export interface CreateSessionRequest {
    *  unset, the server returns a `hooks_need_trust` 403; the wizard then
    *  prompts and resubmits with this set to true. */
   trust_hooks?: boolean;
+  /** Import an existing Claude Code session: the on-disk session id to
+   *  resume via `session/load`. Forces the structured view; `path` must be
+   *  the session's original cwd. See #2276. */
+  import_acp_session_id?: string;
+}
+
+/** A discoverable existing Claude Code session on disk, returned by
+ *  `GET /api/claude-sessions` for the import picker. See #2276. */
+export interface ClaudeSessionSummary {
+  session_id: string;
+  cwd: string;
+  title: string | null;
+  last_modified_ms: number;
+  cwd_exists: boolean;
 }
 
 /** Live acp worker lifecycle, mirrored from
@@ -469,7 +546,11 @@ export type SettingsWebWritePolicy =
  *  widget's min/max is advisory; this is the gate the server enforces. */
 export type SettingsValidation =
   | { rule: "none" }
+  | { rule: "bool" }
+  | { rule: "str" }
   | { rule: "range_u64"; min: number; max?: number }
+  | { rule: "range_i64"; min: number; max?: number }
+  | { rule: "one_of"; options: string[] }
   | { rule: "non_empty_string" }
   | { rule: "memory_limit" }
   | { rule: "volume_list" }
@@ -491,4 +572,8 @@ export interface SettingsFieldDescriptor {
   validation: SettingsValidation;
   /** Operational tuning shown under an "Advanced" fold. */
   advanced: boolean;
+  /** Default value shown before anything is stored. Present on plugin
+   *  (`plugin:<id>`) fields, which have no value in the config until saved;
+   *  omitted for core fields (their value always exists in the config). */
+  default?: unknown;
 }

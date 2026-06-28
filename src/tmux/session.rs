@@ -4,6 +4,7 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::{
     refresh_session_cache, session_exists_from_cache,
@@ -22,6 +23,31 @@ pub struct Session {
     name: String,
 }
 
+/// tmux user options holding the cross-process size-owner lock (see
+/// [`Session::claim_size_owner`]). User options ride on the session itself, so
+/// the web daemon and the native TUI read and write the same state.
+const SIZE_OWNER_OPT: &str = "@aoe_size_owner";
+const SIZE_OWNER_HB_OPT: &str = "@aoe_size_owner_hb";
+
+/// How long a size-owner lock survives without a heartbeat before another
+/// client may steal it. Shared by every surface that drives window size (the
+/// web PTY relay, the mobile live view, the native TUI) so they age the lock
+/// the same and a connected owner is never stolen from mid-use.
+pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
+/// How often a connected size owner refreshes its heartbeat. Well under
+/// [`SIZE_OWNER_TTL`] so a live-but-idle owner keeps the lock while connected;
+/// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
+pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
+
+/// Wall-clock millis since the unix epoch. The size-owner heartbeat is compared
+/// across processes, so it must be wall-clock, not a per-process monotonic.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// The active pane's cursor, queried alongside a `capture-pane` so the
 /// live-send preview can paint a real cursor (`capture-pane` returns cell
 /// text only; tmux's own client draws the cursor from these pane fields).
@@ -35,23 +61,108 @@ pub struct PaneCursor {
     /// e.g. an agent that parks it while "working". Don't paint when false.
     pub visible: bool,
     pub pane_height: u16,
+    /// `#{history_size}`: lines currently in the pane's scrollback. The
+    /// web live view sizes its virtual scroll spacer off this; absent in
+    /// older format strings, in which case it parses as 0.
+    pub history_size: u32,
+    /// `#{pane_width}`: the live web view compares this against the
+    /// viewer's requested grid to detect another writer (e.g. the TUI's
+    /// preview sync) resizing the window out from under it. Optional in
+    /// the format line; parses as 0 when absent.
+    pub pane_width: u16,
+    /// `#{alternate_on}`: the pane is on the alternate screen (a
+    /// full-screen / TUI app). The alternate screen has no scrollback, so
+    /// the live preview's capture-window scroll can't reach the app's own
+    /// history; the TUI forwards the wheel to the app instead. Optional in
+    /// the format line; parses as `false` when absent.
+    pub alternate_on: bool,
+    /// `#{mouse_any_flag}`: the foreground app has requested some mouse
+    /// tracking mode (it wants mouse events at all). Optional; parses as
+    /// `false`.
+    pub mouse_tracking: bool,
+    /// `#{mouse_sgr_flag}`: the app is in SGR (1006) mouse encoding, so it
+    /// will parse the `\e[<..M` wheel bytes the TUI forwards as a mouse
+    /// event rather than garbage keystrokes. The wheel is only forwarded
+    /// when BOTH this and `mouse_tracking` are set: `mouse_tracking` alone
+    /// can mean the legacy X10 encoding, which our SGR bytes would corrupt.
+    /// Optional; parses as `false`.
+    pub mouse_sgr: bool,
+    /// Whether `x`/`y` can be trusted to index the captured content. The
+    /// terminal-mode flags above (`alternate_on`, `mouse_tracking`,
+    /// `mouse_sgr`) are always valid, but `capture_pane_with_cursor` probes
+    /// the cursor twice and, if the pane scrolled mid-capture, the row no
+    /// longer maps onto the captured rows. It then publishes the cursor with
+    /// this `false` so the render skips painting it (avoiding the row-drift
+    /// bug), while the wheel forward, which reads only the mode flags, still
+    /// works while an agent streams. `parse` sets it `true`; only the
+    /// cross-probe check downgrades it.
+    pub position_reliable: bool,
 }
 
 impl PaneCursor {
     /// Parse the single space-separated line emitted by the
-    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}` format.
+    /// `#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}
+    /// #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag}
+    /// #{mouse_sgr_flag}` format. The trailing fields are optional so an
+    /// older four-field line still parses (numeric fields as 0, flag
+    /// fields as `false`).
     fn parse(line: &str) -> Option<Self> {
         let mut fields = line.split_whitespace();
         let x = fields.next()?.parse().ok()?;
         let y = fields.next()?.parse().ok()?;
         let flag: u8 = fields.next()?.parse().ok()?;
         let pane_height = fields.next()?.parse().ok()?;
+        let history_size = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let pane_width = fields.next().and_then(|f| f.parse().ok()).unwrap_or(0);
+        let alternate_on = fields.next().map(|f| f != "0").unwrap_or(false);
+        let mouse_tracking = fields.next().map(|f| f != "0").unwrap_or(false);
+        let mouse_sgr = fields.next().map(|f| f != "0").unwrap_or(false);
         Some(Self {
             x,
             y,
             visible: flag != 0,
             pane_height,
+            history_size,
+            pane_width,
+            alternate_on,
+            mouse_tracking,
+            mouse_sgr,
+            // A single probe's own position is self-consistent; the
+            // cross-probe check in `capture_pane_with_cursor` is the only
+            // thing that downgrades this.
+            position_reliable: true,
         })
+    }
+}
+
+/// Reconcile the two cursor probes `capture_pane_with_cursor` takes around the
+/// capture. Only the VERTICAL-mapping inputs must be stable across the
+/// capture: if `history_size` or `pane_height` changed, the screen scrolled or
+/// resized mid-capture and the cursor's row no longer indexes the captured
+/// content (the row-drift bug). A blinking cursor or horizontal jitter from an
+/// animated TUI (claude's spinner) changes `visible`/`x` every frame but never
+/// moves the row, so comparing the whole struct would suppress the cursor on
+/// every frame of an actively repainting agent. Keep the post-capture cursor
+/// (closest to the freshest content); when the mapping moved, flag the
+/// POSITION as unreliable rather than dropping the whole cursor, so the wheel
+/// forward (which reads only the always-valid mode flags) still works while an
+/// agent streams, while the render skips painting on the drifted row. A probe
+/// that didn't parse (pane gone / malformed) carries no trustworthy mode flags
+/// either, so the result is `None`.
+fn merge_cursor_probes(
+    before: Option<PaneCursor>,
+    after: Option<PaneCursor>,
+) -> Option<PaneCursor> {
+    match (before, after) {
+        (Some(b), Some(a)) => {
+            let position_reliable =
+                b.history_size == a.history_size && b.pane_height == a.pane_height;
+            Some(PaneCursor {
+                position_reliable,
+                ..a
+            })
+        }
+        _ => None,
     }
 }
 
@@ -309,15 +420,6 @@ impl Session {
     }
 
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
-        self.capture_pane_with_size(lines, None, None)
-    }
-
-    pub fn capture_pane_with_size(
-        &self,
-        lines: usize,
-        _width: Option<u16>,
-        _height: Option<u16>,
-    ) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());
         }
@@ -347,10 +449,21 @@ impl Session {
     /// Capture the pane like [`capture_pane`](Self::capture_pane), but in the
     /// same `tmux` fork also query the cursor position + visibility, so the
     /// live-send preview can paint a real cursor without paying a second fork
-    /// per capture cycle. The cursor line is emitted first (a single
-    /// `display-message` line) and the capture content follows; we split it
-    /// back off. Returns `None` for the cursor if the pane is gone or the
-    /// header didn't parse, in which case the caller simply paints no cursor.
+    /// per capture cycle. Returns `None` for the cursor if the pane is gone
+    /// or the header didn't parse, in which case the caller simply paints no
+    /// cursor.
+    ///
+    /// The chained commands are NOT atomic: tmux processes pane output
+    /// between them, so while an agent streams (scrolling the pane), the
+    /// cursor/history read before the capture can describe a different
+    /// screen than the captured content. A renderer that maps the cursor
+    /// onto the content via `history + y` then paints the cursor on the
+    /// wrong row, one row per scroll that slipped in (measured at ~100% of
+    /// frames against a pane printing 50 lines/s). The probe therefore runs
+    /// TWICE, before and after the capture, and the cursor is reported only
+    /// when both probes agree; a raced frame paints content with no cursor,
+    /// which beats painting it on the wrong row. At rest the first try
+    /// agrees and the cursor never blinks.
     pub fn capture_pane_with_cursor(&self, lines: usize) -> Result<(String, Option<PaneCursor>)> {
         if !self.exists() {
             return Ok((String::new(), None));
@@ -358,6 +471,8 @@ impl Session {
 
         let target = format!("{}:^.0", self.name);
         let start = format!("-{}", lines);
+        const HEADER_FMT: &str =
+            "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height} #{history_size} #{pane_width} #{alternate_on} #{mouse_any_flag} #{mouse_sgr_flag}";
         let output = Command::new("tmux")
             .args([
                 "display-message",
@@ -365,7 +480,7 @@ impl Session {
                 "-t",
                 &target,
                 "-F",
-                "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}",
+                HEADER_FMT,
                 ";",
                 "capture-pane",
                 "-t",
@@ -374,6 +489,13 @@ impl Session {
                 "-e",
                 "-S",
                 &start,
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                &target,
+                "-F",
+                HEADER_FMT,
             ])
             .output()?;
 
@@ -382,13 +504,58 @@ impl Session {
         }
 
         let raw = String::from_utf8_lossy(&output.stdout);
-        // The cursor line is the first line; everything after the first
-        // newline is the verbatim `capture-pane` output (same bytes the
-        // plain `capture_pane` path returns).
+        // First line: pre-capture cursor header. Last line: post-capture
+        // header. Everything between is the verbatim `capture-pane` output
+        // (same bytes the plain `capture_pane` path returns).
         let mut parts = raw.splitn(2, '\n');
         let cursor_line = parts.next().unwrap_or("");
-        let content = parts.next().unwrap_or("").to_string();
-        Ok((content, PaneCursor::parse(cursor_line)))
+        let rest = parts.next().unwrap_or("");
+        let (content, after_line) = match rest.rfind('\n') {
+            // `rest` ends with the trailing '\n' of the post-header line, so
+            // search for the newline that PRECEDES it to split content from
+            // the post-header.
+            Some(_) => {
+                let trimmed = rest.strip_suffix('\n').unwrap_or(rest);
+                match trimmed.rfind('\n') {
+                    Some(idx) => (&trimmed[..=idx], &trimmed[idx + 1..]),
+                    // Single line: no content, just the post-header.
+                    None => ("", trimmed),
+                }
+            }
+            None => ("", rest),
+        };
+        let before = PaneCursor::parse(cursor_line);
+        let after = PaneCursor::parse(after_line);
+        Ok((content.to_string(), merge_cursor_probes(before, after)))
+    }
+
+    /// Deliver raw bytes to the session's active pane via `tmux send-keys
+    /// -H`, one hex argument per byte, chunked so a large paste cannot
+    /// overflow `execve` ARG_MAX (the same bound the TUI's live-send path
+    /// uses; macOS caps total argv at 256KB and per-byte hex args burn it
+    /// ~13x faster than the payload size). tmux injects the bytes in
+    /// order, so a bracketed paste split across forks reassembles
+    /// transparently on the agent's PTY. This is the web live view's
+    /// input path: raw bytes from the browser (printables, CSI sequences,
+    /// control bytes) all ride the same encoding.
+    pub fn send_raw_bytes(&self, bytes: &[u8]) -> Result<()> {
+        // `^.0` pins the first window's first pane, matching capture_pane:
+        // a bare session name follows the ACTIVE pane, which would let
+        // input land in a different pane than the one being captured.
+        let target = format!("{}:^.0", self.name);
+        for batch in raw_byte_batches(bytes) {
+            let output = Command::new("tmux")
+                .args(["send-keys", "-t", &target, "-H"])
+                .args(&batch)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!(
+                    "tmux send-keys -H exited non-zero for {} bytes",
+                    bytes.len()
+                );
+            }
+        }
+        Ok(())
     }
 
     pub fn get_pane_pid(&self) -> Option<u32> {
@@ -531,6 +698,143 @@ impl Session {
             .output();
     }
 
+    /// Try to become the sole size owner of this session. Returns true if we
+    /// hold the lock afterward.
+    ///
+    /// One tmux window has one size, but three writers resize it (the web PTY
+    /// attach, the mobile capture viewer, and the TUI's preview sync), each
+    /// living in a different process. The lock lives in tmux user options so
+    /// every process sees the same owner and only the owner calls
+    /// [`resize_window`](Self::resize_window); non-owners render best-effort.
+    ///
+    /// Steals the lock when the current holder's heartbeat is older than
+    /// `ttl`, so a crashed or disconnected owner self-heals. The confirm-read
+    /// after the write resolves the race where two processes both observe a
+    /// vacant lock and both write: the last write wins and only its author
+    /// reads its own id back.
+    pub fn claim_size_owner(&self, owner_id: &str, ttl: Duration) -> bool {
+        if !self.exists() {
+            return false;
+        }
+        let now = now_ms();
+        let claimable = match self.size_owner() {
+            None => true,
+            Some((id, _)) if id == owner_id => true,
+            Some((_, hb)) => now.saturating_sub(hb) > ttl.as_millis() as u64,
+        };
+        if !claimable {
+            return false;
+        }
+        self.set_user_option(SIZE_OWNER_OPT, owner_id);
+        self.set_user_option(SIZE_OWNER_HB_OPT, &now.to_string());
+        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+    }
+
+    /// Bump the heartbeat iff we still own the lock. Returns false when
+    /// ownership was lost (another client took over), so the caller can demote
+    /// itself. Cheap enough to call on each capture/render tick.
+    pub fn refresh_size_owner(&self, owner_id: &str) -> bool {
+        match self.size_owner() {
+            Some((id, _)) if id == owner_id => {
+                self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Force ownership to `owner_id`, even over a live holder. Used by the
+    /// explicit "take over" action: a user tap is an intentional steal, not
+    /// the passive flap the heartbeat guards against.
+    pub fn steal_size_owner(&self, owner_id: &str) -> bool {
+        if !self.exists() {
+            return false;
+        }
+        self.set_user_option(SIZE_OWNER_OPT, owner_id);
+        self.set_user_option(SIZE_OWNER_HB_OPT, &now_ms().to_string());
+        matches!(self.size_owner(), Some((id, _)) if id == owner_id)
+    }
+
+    /// Resize the window iff `owner_id` still holds the size-owner lock,
+    /// verifying ownership in the same call. Returns whether we still own it.
+    ///
+    /// This is the only resize entry point loops with a cached "am I owner"
+    /// flag may use: a local flag is stale for up to a heartbeat after another
+    /// client steals the lock, and an unverified resize in that window stomps
+    /// the new owner's grid (the flap this lock exists to kill). Re-reading
+    /// the lock here closes that window; the caller demotes itself on false.
+    pub fn resize_window_if_owner(&self, owner_id: &str, cols: u16, rows: u16) -> bool {
+        match self.size_owner() {
+            Some((id, _)) if id == owner_id => {
+                self.resize_window(cols, rows);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a non-stale size owner currently holds the lock. A passive
+    /// writer (the TUI's detached preview sync) checks this to defer to an
+    /// active owner without claiming the lock itself.
+    pub fn has_active_size_owner(&self) -> bool {
+        match self.size_owner() {
+            Some((_, hb)) => now_ms().saturating_sub(hb) <= SIZE_OWNER_TTL.as_millis() as u64,
+            None => false,
+        }
+    }
+
+    /// Read the current size owner and its last heartbeat (unix millis), if a
+    /// lock is held.
+    pub fn size_owner(&self) -> Option<(String, u64)> {
+        let id = self.show_user_option(SIZE_OWNER_OPT)?;
+        let hb = self
+            .show_user_option(SIZE_OWNER_HB_OPT)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        Some((id, hb))
+    }
+
+    /// Release the lock iff we own it. Restores `window-size latest` once the
+    /// lock is vacant so a later out-of-band `tmux attach` from a real terminal
+    /// sizes the window to itself instead of staying pinned at our grid.
+    pub fn release_size_owner(&self, owner_id: &str) {
+        if let Some((id, _)) = self.size_owner() {
+            if id == owner_id {
+                self.unset_user_option(SIZE_OWNER_OPT);
+                self.unset_user_option(SIZE_OWNER_HB_OPT);
+                self.reset_size_to_latest_client();
+            }
+        }
+    }
+
+    fn show_user_option(&self, opt: &str) -> Option<String> {
+        let out = Command::new("tmux")
+            .args(["show-options", "-v", "-t", &self.name, opt])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if value.is_empty() {
+            None
+        } else {
+            Some(value)
+        }
+    }
+
+    fn set_user_option(&self, opt: &str, value: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-t", &self.name, opt, value])
+            .output();
+    }
+
+    fn unset_user_option(&self, opt: &str) {
+        let _ = Command::new("tmux")
+            .args(["set-option", "-u", "-t", &self.name, opt])
+            .output();
+    }
+
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.
     /// Buffer names are scoped by pid + a per-call counter so concurrent
     /// senders (and retries) cannot clobber each other. `-p` enables
@@ -613,9 +917,27 @@ fn sanitize_session_name(name: &str) -> String {
         .collect()
 }
 
-/// Build the argument list for tmux new-session command.
+/// Max bytes per `send-keys -H` fork. Each byte becomes one two-char
+/// argv entry, so a bound well under ARG_MAX keeps the spawn safe on
+/// every platform (macOS caps argv+envp at 256KB). Matches the TUI
+/// live-send chunking bound.
+const MAX_RAW_BYTES_PER_SEND: usize = 4096;
+
+/// Split a raw byte payload into per-fork hex argument batches for
+/// [`Session::send_raw_bytes`]. Pure so the chunk bound and byte order
+/// are unit-testable without tmux.
+fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
+    bytes
+        .chunks(MAX_RAW_BYTES_PER_SEND)
+        .map(|chunk| chunk.iter().map(|b| format!("{:02x}", b)).collect())
+        .collect()
+}
+
+/// Build the argument list for tmux new-session command. Shared by the
+/// agent session and the paired/container terminal sessions (their
+/// invocations are identical; only the session-name prefix differs).
 /// Extracted for testability.
-fn build_create_args(
+pub(crate) fn build_create_args(
     session_name: &str,
     working_dir: &str,
     command: Option<&str>,
@@ -659,8 +981,51 @@ mod tests {
     }
 
     #[test]
+    fn raw_byte_batches_chunks_and_preserves_order() {
+        let payload: Vec<u8> = (0..=255u8)
+            .cycle()
+            .take(MAX_RAW_BYTES_PER_SEND + 10)
+            .collect();
+        let batches = raw_byte_batches(&payload);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches[0].len(), MAX_RAW_BYTES_PER_SEND);
+        assert_eq!(batches[1].len(), 10);
+        assert_eq!(batches[0][0], "00");
+        assert_eq!(batches[0][255], "ff");
+        // Last byte of the payload survives in order at the tail.
+        let last = payload[payload.len() - 1];
+        assert_eq!(batches[1][9], format!("{:02x}", last));
+    }
+
+    #[test]
+    fn raw_byte_batches_empty_payload_sends_nothing() {
+        assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn raw_byte_batches_large_paste_roundtrips_in_order() {
+        // Regression for the silently-dropped large paste (#1942-era
+        // live-send bug, now shared with the web live view): a ~100 KB
+        // bracketed paste encoded one hex arg per byte overflows execve
+        // ARG_MAX in a single fork. Verify it splits, every batch stays
+        // under the bound, and the bytes reconstruct in order.
+        let payload: Vec<u8> = (0..100_000).map(|i| (i % 256) as u8).collect();
+        let batches = raw_byte_batches(&payload);
+        assert!(batches.len() > 1);
+        for batch in &batches {
+            assert!(batch.len() <= MAX_RAW_BYTES_PER_SEND);
+        }
+        let roundtrip: Vec<u8> = batches
+            .iter()
+            .flatten()
+            .map(|h| u8::from_str_radix(h, 16).unwrap())
+            .collect();
+        assert_eq!(roundtrip, payload);
+    }
+
+    #[test]
     fn pane_cursor_parses_format_line() {
-        let c = PaneCursor::parse("3 2 1 24").expect("parses");
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 1").expect("parses");
         assert_eq!(
             c,
             PaneCursor {
@@ -668,14 +1033,193 @@ mod tests {
                 y: 2,
                 visible: true,
                 pane_height: 24,
+                history_size: 120,
+                pane_width: 74,
+                alternate_on: true,
+                mouse_tracking: true,
+                mouse_sgr: true,
+                position_reliable: true,
             }
         );
+        // Legacy mouse (tracking on, SGR off) parses with mouse_sgr false.
+        let c = PaneCursor::parse("3 2 1 24 120 74 1 1 0").expect("parses");
+        assert!(c.mouse_tracking);
+        assert!(!c.mouse_sgr);
+        // The six-field (pre-alternate/mouse) line still parses, the new
+        // flags defaulting to false.
+        let c = PaneCursor::parse("3 2 1 24 120 74").expect("parses");
+        assert!(!c.alternate_on);
+        assert!(!c.mouse_tracking);
+        assert!(!c.mouse_sgr);
+        // Four-field (pre-history) lines still parse, trailing fields 0.
+        let c = PaneCursor::parse("3 2 0 24").expect("parses");
+        assert!(!c.visible);
+        assert_eq!(c.history_size, 0);
+        assert_eq!(c.pane_width, 0);
+        assert!(!c.alternate_on);
+        assert!(!c.mouse_tracking);
+        assert!(!c.mouse_sgr);
         // cursor_flag 0 => hidden.
         assert!(!PaneCursor::parse("0 0 0 10").unwrap().visible);
         // Garbage / short input yields None rather than a bogus cursor.
         assert!(PaneCursor::parse("").is_none());
         assert!(PaneCursor::parse("1 2 3").is_none());
         assert!(PaneCursor::parse("a b c d").is_none());
+        // A freshly parsed probe trusts its own position.
+        assert!(
+            PaneCursor::parse("3 2 1 24 120 74 1 1 1")
+                .unwrap()
+                .position_reliable
+        );
+    }
+
+    #[test]
+    fn merge_cursor_probes_stable_mapping_keeps_after_and_trusts_position() {
+        // Cursor moved (x/y) but the vertical mapping (history_size,
+        // pane_height) held: the post-capture probe wins and is trusted.
+        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
+        let after = PaneCursor::parse("5 4 1 24 120 80 1 1 1").unwrap();
+        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
+        assert_eq!((merged.x, merged.y), (5, 4));
+        assert!(merged.position_reliable);
+    }
+
+    #[test]
+    fn merge_cursor_probes_drift_keeps_modes_but_drops_position_trust() {
+        // history_size changed mid-capture (the pane scrolled): keep the mode
+        // flags so the wheel forward still works while the agent streams, but
+        // mark the row untrustworthy so the render won't paint on it.
+        let before = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
+        let after = PaneCursor::parse("3 2 1 24 137 80 1 1 1").unwrap();
+        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
+        assert!(!merged.position_reliable);
+        assert!(merged.alternate_on && merged.mouse_tracking && merged.mouse_sgr);
+
+        // pane_height change (resize mid-capture) is the other vertical-drift
+        // trigger and likewise drops position trust.
+        let before = PaneCursor::parse("3 2 1 24 120 80 1 0 0").unwrap();
+        let after = PaneCursor::parse("3 2 1 30 120 80 1 0 0").unwrap();
+        let merged = merge_cursor_probes(Some(before), Some(after)).expect("both probes => Some");
+        assert!(!merged.position_reliable);
+    }
+
+    #[test]
+    fn merge_cursor_probes_none_when_either_probe_missing() {
+        let c = PaneCursor::parse("3 2 1 24 120 80 1 1 1").unwrap();
+        assert!(merge_cursor_probes(None, Some(c)).is_none());
+        assert!(merge_cursor_probes(Some(c), None).is_none());
+        assert!(merge_cursor_probes(None, None).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn capture_with_cursor_stays_consistent_under_streaming_load() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_race");
+        // A pane that scrolls as fast as tmux can ingest.
+        let out = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "bash -c 'i=0; while true; do echo line-$((i++)); done'",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        refresh_session_cache();
+        let session = Session::from_name(guard.name());
+        std::thread::sleep(Duration::from_millis(300));
+
+        // tmux dispatches the chained probe/capture/probe in one event-loop
+        // turn, so locally every frame is consistent and the suppression
+        // never fires; the guard exists for loaded/remote tmux servers
+        // where output processing can interleave. Under load the call must
+        // never error, and a reported cursor must always have matching
+        // probes by construction. (The idle-pane Some-cursor case is
+        // covered by capture_pane_with_cursor_returns_content_and_cursor.)
+        for _ in 0..30 {
+            let (content, _cursor) = session
+                .capture_pane_with_cursor(50)
+                .expect("capture should not error under load");
+            assert!(!content.is_empty(), "streaming pane captures content");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn size_owner_lock_claims_rejects_steals_and_releases() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_owner");
+        let out = Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                guard.name(),
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sleep 30",
+            ])
+            .output()
+            .expect("tmux new-session");
+        assert!(out.status.success());
+        // The session was created behind the existence cache's back; an
+        // earlier test may have warmed the cache without it, which would
+        // make every exists()-guarded lock call a false no-op.
+        refresh_session_cache();
+        let session = Session::from_name(guard.name());
+
+        // Vacant -> first claimer wins and is recorded.
+        assert!(session.claim_size_owner("a", Duration::from_secs(10)));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("a".to_string())
+        );
+        // Re-claiming as the same owner is idempotent (stays true).
+        assert!(session.claim_size_owner("a", Duration::from_secs(10)));
+
+        // A different client cannot claim while the owner's heartbeat is fresh.
+        assert!(!session.claim_size_owner("b", Duration::from_secs(10)));
+        assert!(session.refresh_size_owner("a"));
+        assert!(!session.refresh_size_owner("b"));
+
+        // A stale heartbeat is stealable through the normal claim path.
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(session.claim_size_owner("c", Duration::from_millis(1)));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("c".to_string())
+        );
+
+        // An explicit take-over steals even a fresh lock.
+        assert!(session.steal_size_owner("d"));
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("d".to_string())
+        );
+
+        // A non-owner release is a no-op; the owner's release clears the lock.
+        session.release_size_owner("not-d");
+        assert_eq!(
+            session.size_owner().map(|(id, _)| id),
+            Some("d".to_string())
+        );
+        session.release_size_owner("d");
+        assert!(session.size_owner().is_none());
     }
 
     #[test]

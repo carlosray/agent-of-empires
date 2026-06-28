@@ -22,6 +22,7 @@ pub mod aggregate;
 pub mod events;
 pub mod features;
 pub mod form_factor;
+pub mod plugins;
 pub mod sanitize;
 mod state;
 pub mod usage_signals;
@@ -415,6 +416,12 @@ pub fn build_usage_snapshot(
     snapshot.data_schema_version = crate::migrations::current_schema_version();
     snapshot.update_status = update_status;
     snapshot.update_releases_behind = update_releases_behind;
+    // Plugin census reads the loaded registry (disk-backed), so it is layered
+    // here rather than in the disk-free assembler, like the version-health
+    // fields above. Both the TUI and serve surfaces route through here.
+    let (plugins_by_source, plugins_active) = plugins::census(crate::plugin::registry().all());
+    snapshot.plugins_by_source = plugins_by_source;
+    snapshot.plugins_active = plugins_active;
     Some(snapshot)
 }
 
@@ -486,9 +493,12 @@ fn assemble_usage_snapshot(
         approvals_resolved: acp_counts.approvals_resolved(),
         approvals_by_decision: acp_counts.approvals_by_decision(),
         agent_switches: acp_counts.agent_switches,
-        view_toggles: acp_counts.view_toggles,
         plan_mode_seen: acp_counts.plan_mode_seen,
         prompts_queued: acp_counts.prompts_queued,
+        // Plugin census reads the disk-backed registry; the disk-free assembler
+        // leaves these empty and `build_usage_snapshot` fills them.
+        plugins_by_source: BTreeMap::new(),
+        plugins_active: BTreeMap::new(),
     }
 }
 
@@ -582,7 +592,7 @@ pub fn build_cli_usage() -> Option<CliUsage> {
 /// Record one CLI subcommand invocation and flush the accumulated `cli_usage`
 /// event if a send is due. Called once per `aoe <subcommand>` run.
 ///
-/// Side-effect-free unless the install is opted in: the [`app_dir_exists`] gate
+/// Side-effect-free unless the install is opted in: the [`crate::session::app_dir_exists`] gate
 /// is a non-creating check, so app-data-free commands (`aoe completion`,
 /// `aoe init`, ...) on a not-opted-in install never materialize the app dir and
 /// keep working in read-only / sandboxed environments. The daily slot is claimed
@@ -693,15 +703,6 @@ pub async fn send_snapshot(snapshot: UsageSnapshot) -> bool {
     confirmed
 }
 
-/// Send a pre-built usage snapshot, detached. Returns immediately and never
-/// blocks the caller; the fingerprint is recorded inside the spawned task only
-/// on a confirmed send.
-pub fn spawn_snapshot(snapshot: UsageSnapshot) {
-    tokio::spawn(async move {
-        send_snapshot(snapshot).await;
-    });
-}
-
 /// Send the best-effort snapshot on graceful exit, awaiting delivery with a
 /// hard timeout so the final snapshot can flush without risking a hang, but
 /// skipping the send when the snapshot is identical (ignoring `sent_at`) to the
@@ -800,9 +801,10 @@ mod tests {
             approvals_resolved: 0,
             approvals_by_decision: BTreeMap::new(),
             agent_switches: 0,
-            view_toggles: 0,
             plan_mode_seen: false,
             prompts_queued: 0,
+            plugins_by_source: BTreeMap::new(),
+            plugins_active: BTreeMap::new(),
         }
     }
 

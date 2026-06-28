@@ -14,6 +14,7 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe remove`↴](#aoe-remove)
 * [`aoe send`↴](#aoe-send)
 * [`aoe status`↴](#aoe-status)
+* [`aoe killall`↴](#aoe-killall)
 * [`aoe session`↴](#aoe-session)
 * [`aoe session start`↴](#aoe-session-start)
 * [`aoe session stop`↴](#aoe-session-stop)
@@ -32,11 +33,25 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe session unfavorite`↴](#aoe-session-unfavorite)
 * [`aoe session archive`↴](#aoe-session-archive)
 * [`aoe session unarchive`↴](#aoe-session-unarchive)
+* [`aoe session restore`↴](#aoe-session-restore)
+* [`aoe session list-trash`↴](#aoe-session-list-trash)
+* [`aoe session empty-trash`↴](#aoe-session-empty-trash)
 * [`aoe group`↴](#aoe-group)
 * [`aoe group list`↴](#aoe-group-list)
 * [`aoe group create`↴](#aoe-group-create)
 * [`aoe group delete`↴](#aoe-group-delete)
 * [`aoe group move`↴](#aoe-group-move)
+* [`aoe plugin`↴](#aoe-plugin)
+* [`aoe plugin list`↴](#aoe-plugin-list)
+* [`aoe plugin info`↴](#aoe-plugin-info)
+* [`aoe plugin enable`↴](#aoe-plugin-enable)
+* [`aoe plugin disable`↴](#aoe-plugin-disable)
+* [`aoe plugin install`↴](#aoe-plugin-install)
+* [`aoe plugin update`↴](#aoe-plugin-update)
+* [`aoe plugin uninstall`↴](#aoe-plugin-uninstall)
+* [`aoe plugin hash`↴](#aoe-plugin-hash)
+* [`aoe plugin discover`↴](#aoe-plugin-discover)
+* [`aoe plugin outdated`↴](#aoe-plugin-outdated)
 * [`aoe profile`↴](#aoe-profile)
 * [`aoe profile list`↴](#aoe-profile-list)
 * [`aoe profile create`↴](#aoe-profile-create)
@@ -61,6 +76,8 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe theme list`↴](#aoe-theme-list)
 * [`aoe theme export`↴](#aoe-theme-export)
 * [`aoe theme dir`↴](#aoe-theme-dir)
+* [`aoe settings`↴](#aoe-settings)
+* [`aoe settings explain`↴](#aoe-settings-explain)
 * [`aoe telemetry`↴](#aoe-telemetry)
 * [`aoe telemetry status`↴](#aoe-telemetry-status)
 * [`aoe telemetry enable`↴](#aoe-telemetry-enable)
@@ -109,14 +126,17 @@ Run without arguments to launch the TUI dashboard.
 * `remove` — Remove a session
 * `send` — Send a message to a running agent session
 * `status` — Show session status summary
+* `killall` — Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
 * `session` — Manage session lifecycle (start, stop, attach, etc.)
 * `group` — Manage groups for organizing sessions
+* `plugin` — Manage plugins (list, info, enable, disable, install, update, uninstall)
 * `profile` — Manage profiles (separate workspaces)
 * `project` — Manage the project registry used by multi-repo session pickers
 * `worktree` — Manage git worktrees for parallel development
 * `tmux` — tmux integration utilities
 * `sounds` — Manage sound effects for agent state transitions
 * `theme` — Manage color themes (list, export, customize)
+* `settings` — Inspect resolved settings and their provenance
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
 * `serve` — Start a web dashboard for remote session access
@@ -255,6 +275,7 @@ Remove a session
 * `--force` — Force worktree removal even with untracked/modified files
 * `--keep-container` — Keep container instead of deleting it (default: delete per config)
 * `--keep-scratch` — For scratch sessions, keep the scratch directory on disk instead of removing it. The session record is still deleted; the kept path is logged so you can find the files later. No effect on non-scratch sessions
+* `--purge` — Permanently delete instead of moving to trash. By default `rm` moves the session to the trash (when `session.delete_to_trash` is enabled, the default) so it can be restored; `--purge` forces the irreversible teardown (worktree/branch/container cleanup per the other flags, plus transcript removal)
 
 
 
@@ -289,6 +310,21 @@ Show session status summary
 
 
 
+## `aoe killall`
+
+Force-stop everything aoe is running: the serve daemon, all agent workers, and all aoe tmux sessions. Destructive and unprompted
+
+**Usage:** `aoe killall [OPTIONS]`
+
+###### **Options:**
+
+* `--timeout-secs <TIMEOUT_SECS>` — Grace period in seconds before force-killing agent workers. tmux sessions and the daemon use their own built-in grace
+
+  Default value: `5`
+* `--keep-daemon` — Leave the `aoe serve` daemon running; stop only workers and tmux sessions
+
+
+
 ## `aoe session`
 
 Manage session lifecycle (start, stop, attach, etc.)
@@ -312,8 +348,11 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `unsnooze` — Wake a snoozed session immediately
 * `favorite` — Mark a session as a favorite. Favorited rows pin to the top of their status tier in the Attention sort and render with a leading `* ` glyph plus bold + underline
 * `unfavorite` — Clear the favorite flag on a session
-* `archive` — Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+* `archive` — Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 * `unarchive` — Unarchive a session (restores it to its tier in the Attention sort)
+* `restore` — Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+* `list-trash` — List the sessions currently in the trash
+* `empty-trash` — Permanently purge every trashed session in the profile (irreversible)
 
 
 
@@ -540,7 +579,7 @@ Clear the favorite flag on a session
 
 ## `aoe session archive`
 
-Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux pane unless `--no-kill` is passed. The worktree, branch, and container are preserved; use `aoe remove` (optionally with `--delete-worktree` / `--delete-branch`) to fully destroy a session
+Archive a session: sink it in the Attention sort and tear down its tmux sessions. Worktree, branch, container preserved. `--no-kill` skips tmux teardown. See #1868
 
 **Usage:** `aoe session archive [OPTIONS] <IDENTIFIER>`
 
@@ -550,7 +589,7 @@ Archive a session (sinks it to the bottom of the Attention sort). Kills the tmux
 
 ###### **Options:**
 
-* `--no-kill` — Skip killing the tmux pane. By default archiving stops the running agent so the row renders as truly parked; pass this to keep the pane alive while still marking the session archived
+* `--no-kill` — Skip tmux teardown on archive
 
 
 
@@ -563,6 +602,34 @@ Unarchive a session (restores it to its tier in the Attention sort)
 ###### **Arguments:**
 
 * `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session restore`
+
+Restore a trashed session, returning it to its prior bucket with its transcript and metadata intact. See #2489
+
+**Usage:** `aoe session restore <IDENTIFIER>`
+
+###### **Arguments:**
+
+* `<IDENTIFIER>` — Session ID or title
+
+
+
+## `aoe session list-trash`
+
+List the sessions currently in the trash
+
+**Usage:** `aoe session list-trash`
+
+
+
+## `aoe session empty-trash`
+
+Permanently purge every trashed session in the profile (irreversible)
+
+**Usage:** `aoe session empty-trash`
 
 
 
@@ -635,6 +702,143 @@ Move session to group
 
 * `<IDENTIFIER>` — Session ID or title
 * `<GROUP>` — Target group
+
+
+
+## `aoe plugin`
+
+Manage plugins (list, info, enable, disable, install, update, uninstall)
+
+**Usage:** `aoe plugin <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List every known plugin with version, validation, and state
+* `info` — Show one plugin's manifest details
+* `enable` — Enable a plugin's contributions
+* `disable` — Disable a plugin; its settings stay on disk for re-enabling
+* `install` — Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
+* `update` — Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+* `uninstall` — Uninstall an external plugin, removing its files and capability grant
+* `hash` — Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
+* `discover` — Search GitHub's `aoe-plugin` topic for installable plugins
+* `outdated` — List installed external plugins that have an update available
+
+
+
+## `aoe plugin list`
+
+List every known plugin with version, validation, and state
+
+**Usage:** `aoe plugin list`
+
+
+
+## `aoe plugin info`
+
+Show one plugin's manifest details
+
+**Usage:** `aoe plugin info <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id, e.g. `aoe.web`
+
+
+
+## `aoe plugin enable`
+
+Enable a plugin's contributions
+
+**Usage:** `aoe plugin enable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin disable`
+
+Disable a plugin; its settings stay on disk for re-enabling
+
+**Usage:** `aoe plugin disable <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin install`
+
+Install an external plugin from a `gh:owner/repo[@ref]` slug or a local directory. With no `@ref`, installs the repo's latest release; an explicit `@ref` installs unverified, un-audited code. Community plugins run at your own risk
+
+**Usage:** `aoe plugin install [OPTIONS] <SOURCE>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — `gh:owner/repo` (latest release) or `gh:owner/repo@ref` (unverified) or a local directory path
+
+###### **Options:**
+
+* `--yes` — Grant all requested capabilities without prompting
+
+
+
+## `aoe plugin update`
+
+Update an installed external plugin from its recorded source. Prompts to re-approve capabilities if the update changes the capability set
+
+**Usage:** `aoe plugin update <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin uninstall`
+
+Uninstall an external plugin, removing its files and capability grant
+
+**Usage:** `aoe plugin uninstall <ID>`
+
+###### **Arguments:**
+
+* `<ID>` — Plugin id
+
+
+
+## `aoe plugin hash`
+
+Print the deterministic source tree hash for a plugin directory, the value a maintainer pins in the featured index
+
+**Usage:** `aoe plugin hash <PATH>`
+
+###### **Arguments:**
+
+* `<PATH>` — Path to the plugin directory
+
+
+
+## `aoe plugin discover`
+
+Search GitHub's `aoe-plugin` topic for installable plugins
+
+**Usage:** `aoe plugin discover [QUERY]`
+
+###### **Arguments:**
+
+* `<QUERY>` — Optional free-text term to narrow the search
+
+
+
+## `aoe plugin outdated`
+
+List installed external plugins that have an update available
+
+**Usage:** `aoe plugin outdated`
 
 
 
@@ -751,7 +955,7 @@ Add a project to the registry
 
 ###### **Arguments:**
 
-* `<PATH>` — Path to the git repository
+* `<PATH>` — Path to the project directory: a git repository, or any directory to run sessions in place
 
 ###### **Options:**
 
@@ -943,6 +1147,30 @@ Export a built-in theme as a TOML file for customization
 Show the custom themes directory path
 
 **Usage:** `aoe theme dir`
+
+
+
+## `aoe settings`
+
+Inspect resolved settings and their provenance
+
+**Usage:** `aoe settings <COMMAND>`
+
+###### **Subcommands:**
+
+* `explain` — Explain where a setting's effective value comes from. KEY is a core `section.field` (e.g. `acp.default_agent`) or a plugin `plugin:<id>.<field>` (e.g. `plugin:acme.kit.retries`)
+
+
+
+## `aoe settings explain`
+
+Explain where a setting's effective value comes from. KEY is a core `section.field` (e.g. `acp.default_agent`) or a plugin `plugin:<id>.<field>` (e.g. `plugin:acme.kit.retries`)
+
+**Usage:** `aoe settings explain <KEY>`
+
+###### **Arguments:**
+
+* `<KEY>` — The setting key to explain
 
 
 
