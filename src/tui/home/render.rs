@@ -2753,7 +2753,7 @@ impl HomeView {
                 Span::styled(" to delete permanently.", Style::default().fg(theme.dimmed)),
             ])
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::from(""),
             Line::from(Span::styled(
                 "Trash",
@@ -2761,9 +2761,27 @@ impl HomeView {
             )),
             Line::from(""),
             Line::from(Span::styled(body, Style::default().fg(theme.dimmed))),
-            Line::from(""),
-            hint,
         ];
+        // The trash placeholder replaces the whole preview, info header
+        // included, so surface the tool session summary here too: a trashed
+        // row should still say what the session was about. Mirrors
+        // `render_archived_preview` / `render_stopped_preview`.
+        let summary = self
+            .selected_session
+            .as_ref()
+            .and_then(|id| self.get_instance(id))
+            .filter(|inst| crate::session::tool_session::tracking_enabled(inst))
+            .and_then(|inst| inst.tool_session_summary.as_ref())
+            .map(|summary| summary.text.clone());
+        if let Some(text) = summary {
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled("Summary: ", Style::default().fg(theme.dimmed)),
+                Span::styled(text, Style::default().fg(theme.text)),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(hint);
         let para = Paragraph::new(lines).alignment(Alignment::Center);
         frame.render_widget(para, area);
     }

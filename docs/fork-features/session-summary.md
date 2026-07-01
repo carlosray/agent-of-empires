@@ -21,6 +21,8 @@ Fully stopped sessions (tmux session gone) replace the preview with a "Stopped" 
 
 Archived sessions (sunk with `z`) get their own "Archived" placeholder, and the summary line renders inside it as well, so an archived row still says what the session was about without unarchiving it.
 
+Trashed sessions (upstream's delete-to-trash) get a "Trash" placeholder, and the summary line renders inside it too, so a trashed row still says what the session was about before you restore or permanently delete it.
+
 ## How Summaries Are Computed
 
 A summary is computed once per resolved tool session display ID and is never recomputed for the same ID. Once evaluated it persists on the instance record, so the summary survives AoE restarts and remains visible after the pane has died.
